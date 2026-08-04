@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app;
+mod egui_term_vendored;
+mod term;
 
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {

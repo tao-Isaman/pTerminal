@@ -4,10 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# src/egui_term_vendored is a patched copy of egui_term 0.1.0; these three are its
+# dependencies. It is written against egui 0.31, which is why eframe is pinned to
+# 0.31.x — `cargo tree -i egui` must keep showing exactly one egui version.
+alacritty_terminal = "0.25.1"
 anyhow = "1.0.104"
 dirs = "6.0.0"
-eframe = "0.35.0"
+eframe = "0.31.1"
+egui = "0.31.1"
 notify = "8.2.0"
+open = "5.3.2"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
