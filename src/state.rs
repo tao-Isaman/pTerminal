@@ -36,15 +36,29 @@ fn state_file(base: &Path) -> PathBuf { base.join("state.json") }
 pub fn load(base: &Path) -> (AppState, Option<String>) {
     let file = state_file(base);
     match std::fs::read_to_string(&file) {
-        Err(_) => (AppState::default(), None),
+        Err(e) => {
+            // FINDING 2: distinguish NotFound (first-run) from other read errors
+            if e.kind() == std::io::ErrorKind::NotFound {
+                (AppState::default(), None)
+            } else {
+                (AppState::default(), Some(format!(
+                    "could not read state.json ({e}); starting with empty state (file left in place)"
+                )))
+            }
+        },
         Ok(text) => match serde_json::from_str(&text) {
             Ok(s) => (s, None),
             Err(e) => {
+                // FINDING 1: check rename result and report backup failures
                 let bak = base.join("state.json.bak");
-                let _ = std::fs::rename(&file, &bak);
-                (AppState::default(), Some(format!(
-                    "state.json was corrupt ({e}); backed up to state.json.bak, starting fresh"
-                )))
+                match std::fs::rename(&file, &bak) {
+                    Ok(_) => (AppState::default(), Some(format!(
+                        "state.json was corrupt ({e}); backed up to state.json.bak, starting fresh"
+                    ))),
+                    Err(rename_err) => (AppState::default(), Some(format!(
+                        "state.json was corrupt ({e}); failed to back up ({rename_err}), corrupt file left in place, starting fresh"
+                    ))),
+                }
             }
         },
     }
@@ -96,5 +110,17 @@ mod tests {
         assert!(msg.is_some());
         assert!(dir.path().join("state.json.bak").exists());
         assert!(!dir.path().join("state.json").exists());
+    }
+
+    #[test]
+    fn read_error_not_found_is_default() {
+        // Test that non-NotFound read errors (like is-a-directory) return default + message
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("state.json")).unwrap();
+        let (loaded, msg) = load(dir.path());
+        assert_eq!(loaded, AppState::default());
+        assert!(msg.is_some());
+        // Directory should still exist (not touched by load)
+        assert!(dir.path().join("state.json").is_dir());
     }
 }
