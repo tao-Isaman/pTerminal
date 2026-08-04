@@ -23,6 +23,11 @@ pub fn gitignore_needs_entry(repo: &Path) -> bool {
 }
 
 pub fn add_gitignore_entry(repo: &Path) -> anyhow::Result<()> {
+    // Only append if entry is not already present
+    if !gitignore_needs_entry(repo) {
+        return Ok(());
+    }
+
     let gi = repo.join(".gitignore");
     let mut text = std::fs::read_to_string(&gi).unwrap_or_default();
     if !text.is_empty() && !text.ends_with('\n') { text.push('\n'); }
@@ -60,5 +65,17 @@ mod tests {
         add_gitignore_entry(dir.path()).unwrap();
         let gi = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         assert!(gi.contains("target\n.pterminal/\n"));
+    }
+
+    #[test]
+    fn add_gitignore_entry_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        // Call add_gitignore_entry twice without checking gitignore_needs_entry between
+        add_gitignore_entry(dir.path()).unwrap();
+        add_gitignore_entry(dir.path()).unwrap();
+        // Verify only one entry exists
+        let gi = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert_eq!(gi.matches(".pterminal/").count(), 1);
+        assert!(!gitignore_needs_entry(dir.path()));
     }
 }
