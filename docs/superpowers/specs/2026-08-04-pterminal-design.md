@@ -40,8 +40,9 @@ Tab       { kind: Agent | Shell, pty, grid, status: Working|NeedsYou|Idle|Exited
 WorktreeInfo { path, branch }
 ```
 
-Persistence stores workspaces + per-workspace settings only. Open tabs are NOT restored
-across restarts (agent processes die with the app; ghost tabs are fake state).
+Persistence stores workspaces, per-workspace settings, and `kept_worktrees` (worktrees
+outlive the app). Open tabs are NOT restored across restarts (agent processes die with
+the app; ghost tabs are fake state).
 
 ## Threading
 
