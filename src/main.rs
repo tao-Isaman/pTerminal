@@ -2,6 +2,8 @@
 mod app;
 mod egui_term_vendored;
 #[allow(dead_code)]
+mod git;
+#[allow(dead_code)]
 mod state;
 mod term;
 
