@@ -187,6 +187,26 @@ pub struct Tab {
 /// of this tab id, then launches `claude` inside `cmd.exe` (it is an npm
 /// shim on Windows and cannot be exec'd directly) with the prompt as an
 /// argument.
+///
+/// **Direct-mode (`isolate: false`) hook takeover.** `hooks::write_settings`
+/// overwrites `.claude/settings.local.json` at `cwd` unconditionally. When
+/// two direct (non-isolated) agent tabs share the same checkout, the second
+/// `spawn_agent` call repoints all four hook entries at ITS
+/// `hooks::events_file` — last writer wins, and the older tab's events stop
+/// arriving. This function has no way to detect or prevent that (it only
+/// sees its own call). The app-level rule, enforced by the caller
+/// (Task 10/11), is: when a direct-mode spawn targets a `cwd` where another
+/// live direct-mode agent tab is already running, the app must degrade that
+/// older tab's `status` to `AgentStatus::Unknown` at the moment of the new
+/// spawn, since its hook routing has just been silently taken over.
+///
+/// **Partial-failure rollback.** Once `git::worktree_add` has created a
+/// worktree (`isolate: true`), a later failure (`hooks::write_settings` or
+/// `TabTerm::spawn`) does not leak it: the worktree and its `pt/<slug>`
+/// branch are removed best-effort before the error is returned, and the
+/// error explains whether that rollback succeeded — if it didn't, it names
+/// the path that needs manual cleanup. The direct-mode (`isolate: false`)
+/// path has nothing to roll back.
 #[allow(dead_code)]
 pub fn spawn_agent(
     ctx: &eframe::egui::Context,
@@ -201,29 +221,56 @@ pub fn spawn_agent(
         (spec.workspace_repo.clone(), None)
     };
 
-    hooks::write_settings(&cwd, id, spec.main_repo_shared_md.as_deref())?;
-    // truncate any stale event file from a previous run of this id
-    let _ = std::fs::write(hooks::events_file(id), "");
+    // Everything past this point can fail after the worktree already exists
+    // on disk. Run it as a unit so any error can trigger rollback below
+    // instead of leaking the worktree + branch via a bare `?`.
+    let build: anyhow::Result<Tab> = (|| {
+        hooks::write_settings(&cwd, id, spec.main_repo_shared_md.as_deref())?;
+        // truncate any stale event file from a previous run of this id
+        let _ = std::fs::write(hooks::events_file(id), "");
 
-    // claude is an npm shim on Windows -> run through cmd; strip quotes from prompt
-    let mut args: Vec<String> = vec!["/c".into(), "claude".into()];
-    let prompt = spec.prompt.replace('"', "");
-    if !prompt.is_empty() { args.push(prompt); }
+        // claude is an npm shim on Windows -> run through cmd; strip quotes from prompt
+        let mut args: Vec<String> = vec!["/c".into(), "claude".into()];
+        let prompt = spec.prompt.replace('"', "");
+        if !prompt.is_empty() { args.push(prompt); }
 
-    let term = TabTerm::spawn(ctx, id, "cmd.exe", &args, &cwd)?;
-    Ok(Tab {
-        id,
-        title: slug,
-        kind: TabKind::Agent,
-        term,
-        status: AgentStatus::Unknown,
-        worktree,
-        cwd,
-        root_pids: vec![],
-        spawned_at: std::time::Instant::now(),
-        cpu: 0.0,
-        mem: 0,
-    })
+        let term = TabTerm::spawn(ctx, id, "cmd.exe", &args, &cwd)?;
+        Ok(Tab {
+            id,
+            title: slug.clone(),
+            kind: TabKind::Agent,
+            term,
+            status: AgentStatus::Unknown,
+            worktree: worktree.clone(),
+            cwd: cwd.clone(),
+            root_pids: vec![],
+            spawned_at: std::time::Instant::now(),
+            cpu: 0.0,
+            mem: 0,
+        })
+    })();
+
+    match build {
+        Ok(tab) => Ok(tab),
+        Err(err) => match &worktree {
+            // Nothing was created for the direct-mode path; propagate as-is.
+            None => Err(err),
+            Some(wt) => {
+                let rollback = git::worktree_remove(&spec.workspace_repo, &wt.path, true)
+                    .and_then(|_| git::delete_branch(&spec.workspace_repo, &wt.branch));
+                match rollback {
+                    Ok(()) => Err(err.context(
+                        "spawn failed after worktree creation; worktree rolled back",
+                    )),
+                    Err(rollback_err) => Err(err.context(format!(
+                        "spawn failed after worktree creation; rollback also failed: \
+                         {rollback_err}, clean up manually: {}",
+                        wt.path.display(),
+                    ))),
+                }
+            },
+        },
+    }
 }
 
 /// Spawns a plain shell tab (`powershell.exe`) rooted at `cwd`. No worktree,
