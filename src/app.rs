@@ -48,7 +48,18 @@ pub struct PendingClaim {
 
 /// Draft state for the "new tab" dialog. Populated by shortcuts/buttons in
 /// this task; rendered and acted on by `dialogs::show_dialogs`.
+///
+/// **Identity-tracked by `ws_index`**, recorded when the draft is created —
+/// exactly like [`CloseDraft`], and for the same reason. This dialog's
+/// `egui::Window` is not modal either, so the sidebar's workspace rows stay
+/// clickable while it is open. Reading `self.active_ws` at Open-click time
+/// meant a mid-dialog workspace switch redirected the whole spawn — worktree
+/// creation, `.claude/settings.local.json` hook routing, `shared.md`, and the
+/// auto-added `.gitignore` entry — into a repo the user never chose. The
+/// dialog body and `open_tab` both resolve the workspace by this index and
+/// drop the draft if it no longer resolves, rather than guessing.
 pub struct NewTabDraft {
+    pub ws_index: usize,
     pub prompt: String,
     pub isolate: bool,
     pub shell: bool,
@@ -512,6 +523,7 @@ impl PtApp {
         let Some(ws) = self.workspaces.get_mut(self.active_ws) else { return };
         if t {
             self.new_tab = Some(NewTabDraft {
+                ws_index: self.active_ws,
                 prompt: String::new(),
                 isolate: ws.meta.default_isolate && ws.meta.is_git,
                 shell: false,
@@ -537,13 +549,33 @@ impl PtApp {
         }
     }
 
-    fn glyph(status: AgentStatus) -> &'static str {
+    /// The tab strip's per-status marker: `(character, color)`.
+    ///
+    /// **Character choice is constrained by egui's bundled fonts.** pTerminal
+    /// deliberately ships no font files (see the design doc's "no bundled
+    /// assets" rule), so a tab label can only use code points covered by
+    /// egui's built-ins. The acceptance run (Task 13, screenshots
+    /// `t13-32`/`t13-33`) caught the original `●` (U+25CF) and `◉` (U+25C9)
+    /// rendering as empty tofu boxes on Windows — which made Working and
+    /// NeedsYou not just ugly but *indistinguishable*, defeating the point of
+    /// the whole app. Verified live (`fr-1-glyphs.png`): ASCII, `○` (U+25CB)
+    /// and `⚠` (U+26A0) render; `✕` (U+2715) does NOT — it was tofu too, and
+    /// is why Exited is a plain red `X`. Anything outside that set needs a
+    /// screenshot before it goes in.
+    ///
+    /// The statuses are separated on **two** axes on purpose — character AND
+    /// color — so neither a font gap nor a colorblind palette can collapse
+    /// two of them into the same thing. NeedsYou (the one status that wants
+    /// the user to actually do something) additionally tints the whole tab
+    /// title amber, see the caller: a colored glyph alone was too easy to
+    /// miss in a strip of tabs, which is the failure mode the review flagged.
+    fn glyph(status: AgentStatus) -> (&'static str, egui::Color32) {
         match status {
-            AgentStatus::Working => "●",
-            AgentStatus::NeedsYou => "◉",
-            AgentStatus::Idle => "○",
-            AgentStatus::Exited => "✕",
-            AgentStatus::Unknown => "?",
+            AgentStatus::Working => ("*", egui::Color32::from_rgb(90, 200, 120)),
+            AgentStatus::NeedsYou => ("!", egui::Color32::from_rgb(255, 170, 40)),
+            AgentStatus::Idle => ("○", egui::Color32::from_rgb(150, 150, 150)),
+            AgentStatus::Exited => ("X", egui::Color32::from_rgb(235, 95, 95)),
+            AgentStatus::Unknown => ("?", egui::Color32::from_rgb(125, 155, 205)),
         }
     }
 
@@ -726,7 +758,10 @@ impl eframe::App for PtApp {
                     .fold((0.0, 0), |(c, m), t| (c + t.cpu, m + t.mem));
                 let label = format!(
                     "{} {}\n   {} agents  {:.1}G {:>3.0}%",
-                    if i == self.active_ws { "▸" } else { " " },
+                    // ">" not "▸": same font-coverage rule as `glyph` — the
+                    // triangle rendered as a tofu box on Windows (seen live
+                    // in the sidebar, screenshot `fr-1-glyphs.png`).
+                    if i == self.active_ws { ">" } else { " " },
                     ws.meta.name,
                     agent_count,
                     mem as f64 / 1e9,
@@ -742,7 +777,10 @@ impl eframe::App for PtApp {
                     // a click sense) — adaptation from the brief's
                     // display-only snippet: sense the click explicitly.
                     let resp = ui.add(
-                        egui::Label::new(egui::RichText::new(format!("  ⌂ {}", wt.branch)).small())
+                        // "[wt]" not "⌂" (U+2302): same font-coverage rule as
+                        // `glyph` — no bundled fonts, so stay inside what
+                        // egui's built-ins cover.
+                        egui::Label::new(egui::RichText::new(format!("  [wt] {}", wt.branch)).small())
                             .sense(egui::Sense::click()),
                     );
                     if resp.clicked() {
@@ -771,9 +809,11 @@ impl eframe::App for PtApp {
         // must not silently replace `self.closing` with a fresh draft, and
         // `+` must not stack a second "New tab" dialog on top of an
         // unresolved one. Sidebar workspace/kept-row clicks are NOT
-        // guarded — they stay live because `CloseDraft`/`PendingClaim` are
-        // now identity-tracked (`ws_index` + `tab_id`), not index-based, so
-        // switching workspaces can no longer misdirect them.
+        // guarded — they stay live because every in-flight draft is now
+        // identity-tracked: `CloseDraft`/`PendingClaim` by (`ws_index` +
+        // `tab_id`), `NewTabDraft` by the `ws_index` captured when it was
+        // created. Switching workspaces mid-dialog can no longer misdirect
+        // any of them.
         let dialog_open = self.error.is_some() || self.new_tab.is_some() || self.closing.is_some();
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -800,12 +840,43 @@ impl eframe::App for PtApp {
                         && ws.tabs.iter().enumerate().any(|(j, other)| {
                             j != i && other.kind == TabKind::Agent && other.cwd == tab.cwd
                         });
-                    let text = if tab.kind == TabKind::Agent {
-                        format!("{} {}", Self::glyph(tab.status), tab.title)
+                    // Two-section label: the status marker keeps its own
+                    // color while the title stays in the theme's text color,
+                    // which a plain `RichText` (one color for the whole
+                    // string) can't express — hence the `LayoutJob`. The
+                    // exception is NeedsYou, which tints the title too: that
+                    // is the "needs you" highlight, and it is the difference
+                    // between a monitoring app you can scan and one you have
+                    // to squint at. Shell tabs get `>` in the plain text
+                    // color — a marker, not a status.
+                    let (marker, marker_color, title_color) = if tab.kind == TabKind::Agent {
+                        let (g, c) = Self::glyph(tab.status);
+                        let title_c = if tab.status == AgentStatus::NeedsYou {
+                            Some(c)
+                        } else {
+                            None
+                        };
+                        (g, Some(c), title_c)
                     } else {
-                        format!("▷ {}", tab.title)
+                        (">", None, None)
                     };
-                    let text = if shared_dir_warning { format!("{text} ⚠") } else { text };
+                    let font = egui::TextStyle::Button.resolve(ui.style());
+                    let base = ui.visuals().text_color();
+                    let mut text = egui::text::LayoutJob::default();
+                    let mut fmt = |s: &str, color: egui::Color32| {
+                        text.append(
+                            s,
+                            0.0,
+                            egui::TextFormat { font_id: font.clone(), color, ..Default::default() },
+                        );
+                    };
+                    fmt(marker, marker_color.unwrap_or(base));
+                    let title = if shared_dir_warning {
+                        format!(" {} ⚠", tab.title)
+                    } else {
+                        format!(" {}", tab.title)
+                    };
+                    fmt(&title, title_color.unwrap_or(base));
                     let mut hover = format!(
                         "{}\ncpu {:.0}%  ram {:.0} MB",
                         tab.cwd.display(),
@@ -830,7 +901,12 @@ impl eframe::App for PtApp {
                 }
                 if ui.add_enabled(!dialog_open, egui::Button::new("+")).clicked() {
                     let isolate = ws.meta.default_isolate && ws.meta.is_git;
-                    self.new_tab = Some(NewTabDraft { prompt: String::new(), isolate, shell: false });
+                    self.new_tab = Some(NewTabDraft {
+                        ws_index: active_ws,
+                        prompt: String::new(),
+                        isolate,
+                        shell: false,
+                    });
                 }
             });
         });

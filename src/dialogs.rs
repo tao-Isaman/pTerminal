@@ -47,11 +47,18 @@ impl PtApp {
         if let Some(draft) = &mut self.new_tab {
             let mut open_now = false;
             let mut cancel = false;
-            let is_git = self
-                .workspaces
-                .get(self.active_ws)
-                .map(|w| w.meta.is_git)
-                .unwrap_or(false);
+            // Resolved by IDENTITY (`ws_index`, captured at draft creation),
+            // not `self.active_ws` — this `egui::Window` isn't modal, so the
+            // sidebar stays clickable behind it and the active workspace can
+            // change while the dialog sits open. Same rule as the close
+            // dialog below: if the workspace no longer resolves, drop the
+            // draft rather than spawn into a guess (see `NewTabDraft`'s doc
+            // comment in app.rs).
+            let Some(ws) = self.workspaces.get(draft.ws_index) else {
+                self.new_tab = None;
+                return;
+            };
+            let is_git = ws.meta.is_git;
             egui::Window::new("New tab").collapsible(false).show(ctx, |ui| {
                 ui.checkbox(&mut draft.shell, "plain shell (no agent)");
                 if !draft.shell {
@@ -171,7 +178,12 @@ impl PtApp {
             .map(|p| p.pid)
             .collect();
 
-        let Some(ws) = self.workspaces.get_mut(self.active_ws) else { return };
+        // Same identity resolution as the dialog body: the draft's own
+        // `ws_index`, never `self.active_ws`. A sidebar workspace switch
+        // between the dialog opening and Open being clicked must not land the
+        // worktree/hook/gitignore side effects in a different repo.
+        let ws_index = draft.ws_index;
+        let Some(ws) = self.workspaces.get_mut(ws_index) else { return };
         let repo = ws.meta.repo_path.clone();
 
         let result = if draft.shell {
@@ -231,14 +243,10 @@ impl PtApp {
 
         match result {
             Ok(tab) => {
-                let ws = &mut self.workspaces[self.active_ws];
+                let ws = &mut self.workspaces[ws_index];
                 ws.tabs.push(tab);
                 ws.active_tab = ws.tabs.len() - 1;
-                self.pending_claim = Some(PendingClaim {
-                    ws_index: self.active_ws,
-                    tab_id: id,
-                    before,
-                });
+                self.pending_claim = Some(PendingClaim { ws_index, tab_id: id, before });
             }
             Err(e) => self.error = Some(e.to_string()),
         }
