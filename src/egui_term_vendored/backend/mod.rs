@@ -161,6 +161,20 @@ impl TerminalBackend {
         settings: BackendSettings,
         visible: Arc<AtomicBool>,
     ) -> Result<Self> {
+        // pTerminal delta: `tty::Options::default()` leaves `escape_args` false, so on
+        // Windows a multi-word arg (e.g. an agent's initial prompt) is written into the
+        // child's command line with no quoting and the child sees only its first word —
+        // reproduced live in Task 13's acceptance run (`cmd /c claude Reply with ...`
+        // reached Claude Code as just `Reply`). Escaping is a no-op for single-word args,
+        // so this is safe to always set.
+        #[cfg(target_os = "windows")]
+        let pty_config = tty::Options {
+            shell: Some(tty::Shell::new(settings.shell, settings.args)),
+            working_directory: settings.working_directory,
+            escape_args: true,
+            ..tty::Options::default()
+        };
+        #[cfg(not(target_os = "windows"))]
         let pty_config = tty::Options {
             shell: Some(tty::Shell::new(settings.shell, settings.args)),
             working_directory: settings.working_directory,

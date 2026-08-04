@@ -25,6 +25,10 @@
 //!    `Arc<AtomicBool>` visibility flag; off-screen terminals get
 //!    `request_repaint_after(250ms)` instead, which is enough for the app loop
 //!    to keep draining them.
+//! 5. `backend/mod.rs` — `tty::Options::escape_args` (Windows-only) defaulted to
+//!    `false`, so a multi-word arg (an agent's initial prompt) reached the child
+//!    process with only its first word — the rest was unquoted and split on
+//!    whitespace by the shell. Now set to `true` on Windows.
 
 // This is library code kept as close to upstream as possible; not every item it
 // exports is used by pTerminal (yet).
