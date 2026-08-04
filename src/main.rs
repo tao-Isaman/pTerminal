@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app;
 mod egui_term_vendored;
+#[allow(dead_code)]
+mod state;
 mod term;
 
 fn main() -> eframe::Result<()> {
