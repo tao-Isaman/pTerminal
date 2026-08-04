@@ -6,6 +6,8 @@ mod git;
 #[allow(dead_code)]
 mod hooks;
 #[allow(dead_code)]
+mod shared_ctx;
+#[allow(dead_code)]
 mod state;
 mod term;
 
