@@ -46,6 +46,15 @@ pub fn spawn_sampler() -> std::sync::mpsc::Receiver<(Vec<ProcSample>, MachineSta
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut sys = sysinfo::System::new();
+
+        // Warm up CPU measurements: sysinfo requires two refreshes separated by an interval
+        // to calculate accurate CPU usage. The first refresh populates baseline, the second
+        // measures the delta. Without this warmup, the first snapshot contains ~0/garbage
+        // CPU values. We use a conservative 200ms interval.
+        sys.refresh_cpu_usage();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
         loop {
             sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
             sys.refresh_memory();
@@ -108,5 +117,6 @@ mod tests {
         let (snap, machine) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
         assert!(snap.iter().any(|s| s.pid == std::process::id())); // we see ourselves
         assert!(machine.mem_total > 0);
+        assert!(machine.mem_used > 0);
     }
 }
