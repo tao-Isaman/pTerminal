@@ -6,8 +6,10 @@ pub fn spawn_watcher(dirs: Vec<PathBuf>) -> anyhow::Result<(RecommendedWatcher, 
     let (tx, rx) = channel();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = res {
-            for path in ev.paths {
-                let _ = tx.send(path);
+            if matches!(ev.kind, notify::EventKind::Create(_) | notify::EventKind::Modify(_)) {
+                for path in ev.paths {
+                    let _ = tx.send(path);
+                }
             }
         }
     })?;
