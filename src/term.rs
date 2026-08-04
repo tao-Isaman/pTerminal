@@ -42,8 +42,12 @@ use std::collections::HashSet;
 pub const SCROLLBACK_LINES: usize = 10_000;
 
 pub struct TabTerm {
-    // `Tab::id` (which app.rs does read) mirrors this value; Task 12's exit
-    // banner is expected to read `TabTerm::id` directly.
+    // `Tab::id` (which app.rs does read) mirrors this value. Task 12's exit
+    // banner and `Tab::respawn` ended up going through `Tab::id` instead
+    // (it's already in scope everywhere a `Tab` is handled), so this field
+    // is still unread outside this struct's own construction — left in
+    // place since it may still find a caller, but the attribute stays
+    // honest about that.
     #[allow(dead_code)]
     pub id: u64,
     backend: TerminalBackend,
@@ -319,6 +323,40 @@ impl Tab {
         if self.spawned_at.elapsed() > std::time::Duration::from_secs(5) { return; }
         self.root_pids =
             crate::resources::new_children(before, snap, std::process::id());
+    }
+
+    /// Rebuilds `self.term` in place after the child process has exited,
+    /// reusing the tab's own identity (`id`, `cwd`, `kind`) — this is
+    /// Task 12's "Restart" button. Agent tabs rerun `cmd.exe /c claude`
+    /// with **no initial prompt**: a restart is "bring the session back",
+    /// not a re-run of whatever prompt the tab originally opened with, and
+    /// the events file is truncated the same way `spawn_agent` does on
+    /// first spawn (a fresh child means a fresh event history — leaving
+    /// stale events in place could make `status_from_events` report a
+    /// leftover status from the dead process). Hook settings in
+    /// `.claude/settings.local.json` are left untouched: `spawn_agent`
+    /// already wrote them once and nothing about them changes on restart
+    /// (same tab id, same events file path, same shared.md). Shell tabs
+    /// just rerun `powershell.exe`.
+    ///
+    /// Also resets `root_pids` and `spawned_at` so the resource-rollup PID
+    /// claim runs again for the new child. This does NOT arm a fresh PID
+    /// claim by itself — the caller (`app.rs`) must snapshot its own
+    /// children *before* calling `respawn` and hand that snapshot to a new
+    /// `PendingClaim`, the same dance `open_tab` does for a brand-new tab.
+    pub fn respawn(&mut self, ctx: &eframe::egui::Context) -> anyhow::Result<()> {
+        let term = match self.kind {
+            TabKind::Agent => {
+                let _ = std::fs::write(hooks::events_file(self.id), "");
+                TabTerm::spawn(ctx, self.id, "cmd.exe", &["/c".to_string(), "claude".to_string()], &self.cwd)?
+            }
+            TabKind::Shell => TabTerm::spawn(ctx, self.id, "powershell.exe", &[], &self.cwd)?,
+        };
+        self.term = term;
+        self.status = AgentStatus::Unknown;
+        self.root_pids = vec![];
+        self.spawned_at = std::time::Instant::now();
+        Ok(())
     }
 }
 

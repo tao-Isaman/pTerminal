@@ -122,8 +122,17 @@ pub struct PtApp {
     /// used to ignore repeat clicks so two dialogs can't open at once.
     pub pending_folder_pick: Option<Receiver<Option<PathBuf>>>,
     pub show_ctx_panel: bool,
-    #[allow(dead_code)] // populated here, rendered by Task 12's show_ctx_panel_ui
     pub ctx_panel_text: String,
+    /// Set from the F2 panel's `TextEdit` response (`response.has_focus()`)
+    /// every frame the panel is shown. Two consumers: (1) the terminal
+    /// focus computation in `update` ANDs `!ctx_panel_has_focus` into
+    /// `focused`, so typing in the panel doesn't fight the active
+    /// terminal for keyboard focus (the same FOCUS bug `term::TabTerm::ui`'s
+    /// docs warn about); (2) `drain_events`' shared.md live-reload skips
+    /// clobbering the field while the user is actively editing it. Reset to
+    /// `false` implicitly by simply not being written the frame the panel
+    /// is closed — nothing reads it while `show_ctx_panel` is `false`.
+    pub ctx_panel_has_focus: bool,
     pub error: Option<String>,
     pub new_tab: Option<NewTabDraft>,
     pub closing: Option<CloseDraft>,
@@ -133,14 +142,18 @@ impl PtApp {
     pub fn new(_cc: &eframe::CreationContext) -> Self {
         let base = state::default_base();
         let (st, corrupt_msg) = state::load(&base);
-        let watcher = watcher::spawn_watcher(vec![hooks::events_dir()]).ok();
+        let workspaces: Vec<WsRt> = st
+            .workspaces
+            .into_iter()
+            .map(|meta| WsRt { meta, tabs: vec![], active_tab: 0 })
+            .collect();
+        // Watch the hooks events dir (tab status) plus every workspace's
+        // `.pterminal` dir (F2 panel live-reload of shared.md). Rebuilt
+        // whenever a workspace is added — see `rebuild_watcher`.
+        let watcher = watcher::spawn_watcher(Self::watcher_dirs(&workspaces)).ok();
         PtApp {
             base,
-            workspaces: st
-                .workspaces
-                .into_iter()
-                .map(|meta| WsRt { meta, tabs: vec![], active_tab: 0 })
-                .collect(),
+            workspaces,
             active_ws: 0,
             next_tab_id: st.next_tab_id,
             sampler: crate::resources::spawn_sampler(),
@@ -151,10 +164,37 @@ impl PtApp {
             pending_folder_pick: None,
             show_ctx_panel: false,
             ctx_panel_text: String::new(),
+            ctx_panel_has_focus: false,
             error: corrupt_msg,
             new_tab: None,
             closing: None,
         }
+    }
+
+    /// Directories the filesystem watcher should cover: the hooks events
+    /// dir (tab status glyphs) plus every workspace's `.pterminal` dir
+    /// (F2 shared-context panel live-reload). `spawn_watcher` creates each
+    /// directory if it doesn't exist yet, so adding a workspace eagerly
+    /// creates its `.pterminal` folder even before any agent has spawned
+    /// there — a small side effect of watching it up front (previously that
+    /// directory only appeared on first agent spawn, via
+    /// `shared_ctx::ensure_shared_md`).
+    fn watcher_dirs(workspaces: &[WsRt]) -> Vec<PathBuf> {
+        let mut dirs = vec![hooks::events_dir()];
+        dirs.extend(workspaces.iter().map(|w| w.meta.repo_path.join(".pterminal")));
+        dirs
+    }
+
+    /// Rebuilds the watcher so it covers the current workspace list.
+    /// Reassigning `self.watcher` drops the old `(RecommendedWatcher,
+    /// Receiver<PathBuf>)` tuple together — the old watcher and its channel
+    /// both go away in the same statement, which is what stops it from
+    /// forwarding events into a receiver nothing drains anymore. Called
+    /// from `finish_add_workspace`; a failure to rebuild degrades to no
+    /// live-reload/status-watching at all (`self.watcher = None`) rather
+    /// than panicking, same as the original construction in `new`.
+    fn rebuild_watcher(&mut self) {
+        self.watcher = watcher::spawn_watcher(Self::watcher_dirs(&self.workspaces)).ok();
     }
 
     pub fn persist(&mut self) {
@@ -214,6 +254,7 @@ impl PtApp {
             active_tab: 0,
         });
         self.active_ws = self.workspaces.len() - 1;
+        self.rebuild_watcher();
         self.persist();
     }
 
@@ -281,6 +322,28 @@ impl PtApp {
             .unwrap_or_default();
         for path in changed {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            // F2 panel live-reload: a workspace's shared.md changed on disk
+            // (edited externally, e.g. in Notepad, or by an agent's
+            // SessionStart hook appending to it). Only act while the panel
+            // is open, and — the "don't clobber mid-typing" policy — never
+            // while the panel's TextEdit currently has keyboard focus, so a
+            // background file change can't overwrite an in-progress edit.
+            // Always reload from the ACTIVE workspace's own canonical path
+            // (`shared_ctx::shared_md_path`), not from `path` itself: since
+            // every workspace's `.pterminal` dir is watched, a change in a
+            // *different* workspace's shared.md also reaches this branch,
+            // but re-reading the active workspace's own (unchanged) file is
+            // idempotent — a harmless redundant reload, not a cross-
+            // workspace clobber.
+            if name == "shared.md" {
+                if self.show_ctx_panel && !self.ctx_panel_has_focus {
+                    if let Some(ws) = self.workspaces.get(self.active_ws) {
+                        let active_path = crate::shared_ctx::shared_md_path(&ws.meta.repo_path);
+                        self.ctx_panel_text = std::fs::read_to_string(&active_path).unwrap_or_default();
+                    }
+                }
+                continue;
+            }
             if let Some(idstr) = name.strip_prefix("tab-").and_then(|s| s.strip_suffix(".events")) {
                 if let Ok(id) = idstr.parse::<u64>() {
                     let contents = std::fs::read_to_string(&path).unwrap_or_default();
@@ -418,8 +481,102 @@ impl PtApp {
         }
     }
 
-    // Task 12.
-    fn show_ctx_panel_ui(&mut self, _ctx: &egui::Context) {}
+    /// The F2 shared-context panel: shows/edits the active workspace's
+    /// `shared.md`. Adapted from the brief's reference snippet in two ways:
+    ///
+    /// 1. **Focus tracking (the FOCUS fix `term::TabTerm::ui`'s docs call
+    ///    for).** The `TextEdit`'s response is captured into
+    ///    `self.ctx_panel_has_focus` every frame the panel is open, and
+    ///    `update` ANDs `!ctx_panel_has_focus` into the terminal's
+    ///    `focused` bool — otherwise the active terminal would fight this
+    ///    `TextEdit` for keyboard focus exactly the way the dialog-vs-
+    ///    terminal bug worked before Task 11's fix.
+    /// 2. **Save creates the file/dir if missing.** The brief's snippet
+    ///    saves with a bare `std::fs::write`, which fails if
+    ///    `<repo>/.pterminal/` doesn't exist yet (e.g. a workspace where no
+    ///    agent has ever been spawned, so `shared_ctx::ensure_shared_md`
+    ///    was never called). Save now creates the parent directory first.
+    fn show_ctx_panel_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_ctx_panel {
+            // BUG FOUND IN MANUAL VERIFICATION: without this reset,
+            // closing the panel (F2) while its TextEdit still holds
+            // keyboard focus leaves `ctx_panel_has_focus` stuck at `true`
+            // forever — this function returns before ever reaching the
+            // line that would refresh it, since that line only runs while
+            // the panel is shown. The active terminal's `focused` bool
+            // ANDs in `!ctx_panel_has_focus` (see `update`), so the stale
+            // `true` permanently blocks the terminal from ever requesting
+            // keyboard focus again, silently swallowing all further
+            // keystrokes with no visible error. Reproduced live: opened
+            // the panel, focused the TextEdit, closed with F2, then typed
+            // into the active shell tab — nothing reached it. Resetting
+            // here, on the very first frame the panel is no longer shown,
+            // fixes it.
+            self.ctx_panel_has_focus = false;
+            return;
+        }
+        let Some(ws) = self.workspaces.get(self.active_ws) else { return };
+        let path = crate::shared_ctx::shared_md_path(&ws.meta.repo_path);
+        let mut has_focus = false;
+        egui::SidePanel::right("shared_ctx").default_width(360.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("shared.md");
+                if ui.button("reload").clicked() || self.ctx_panel_text.is_empty() {
+                    self.ctx_panel_text = std::fs::read_to_string(&path).unwrap_or_default();
+                }
+                if ui.button("save").clicked() {
+                    // Adaptation 2 (see doc comment above): ensure the
+                    // parent dir exists before writing, since the brief's
+                    // bare `std::fs::write` would fail on a workspace whose
+                    // `.pterminal` dir was never created.
+                    let mut dir_ok = true;
+                    if let Some(parent) = path.parent() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            self.error = Some(format!("could not save shared.md: {e}"));
+                            dir_ok = false;
+                        }
+                    }
+                    if dir_ok {
+                        if let Err(e) = std::fs::write(&path, &self.ctx_panel_text) {
+                            self.error = Some(format!("could not save shared.md: {e}"));
+                        }
+                    }
+                }
+            });
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                let resp = ui.add_sized(ui.available_size(),
+                    egui::TextEdit::multiline(&mut self.ctx_panel_text).code_editor());
+                has_focus = resp.has_focus();
+            });
+        });
+        self.ctx_panel_has_focus = has_focus;
+    }
+
+    /// Restarts the active tab's process after it exited (Task 12's
+    /// "Restart" button). Captures a before-snapshot of our own child PIDs
+    /// *before* calling `Tab::respawn` — the old child's PID must already
+    /// be in `before`, or the sampler's next snapshot would mistake it for
+    /// the new one — then arms a fresh `PendingClaim` so `drain_events`
+    /// claims the new child's PIDs, the same dance `open_tab` runs for a
+    /// brand-new tab.
+    fn restart_active_tab(&mut self, ctx: &egui::Context) {
+        let before: HashSet<u32> = self
+            .last_snap
+            .iter()
+            .filter(|p| p.parent == Some(std::process::id()))
+            .map(|p| p.pid)
+            .collect();
+        let ws_index = self.active_ws;
+        let Some(ws) = self.workspaces.get_mut(ws_index) else { return };
+        let Some(tab) = ws.tabs.get_mut(ws.active_tab) else { return };
+        let tab_id = tab.id;
+        match tab.respawn(ctx) {
+            Ok(()) => {
+                self.pending_claim = Some(PendingClaim { ws_index, tab_id, before });
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
 }
 
 impl eframe::App for PtApp {
@@ -513,19 +670,40 @@ impl eframe::App for PtApp {
                 };
                 let mut close_req = None;
                 for (i, tab) in ws.tabs.iter().enumerate() {
+                    // Shared-dir warning marker (Step 3). Only Agent tabs
+                    // with no worktree (i.e. working directly in a shared
+                    // checkout, not an isolated one) can collide with each
+                    // other's hook routing (see `spawn_agent`'s doc comment
+                    // on direct-mode hook takeover) — so the marker only
+                    // ever appears on those. "Another tab working directly
+                    // in this directory" is scoped to OTHER AGENT tabs at
+                    // the same `cwd`, not shells: a shell is passive (no
+                    // hooks, no `.claude/settings.local.json` writes), so it
+                    // can't take over another tab's status routing the way
+                    // a second direct-mode agent spawn does.
+                    let shared_dir_warning = tab.kind == TabKind::Agent
+                        && tab.worktree.is_none()
+                        && ws.tabs.iter().enumerate().any(|(j, other)| {
+                            j != i && other.kind == TabKind::Agent && other.cwd == tab.cwd
+                        });
                     let text = if tab.kind == TabKind::Agent {
                         format!("{} {}", Self::glyph(tab.status), tab.title)
                     } else {
                         format!("▷ {}", tab.title)
                     };
+                    let text = if shared_dir_warning { format!("{text} ⚠") } else { text };
+                    let mut hover = format!(
+                        "{}\ncpu {:.0}%  ram {:.0} MB",
+                        tab.cwd.display(),
+                        tab.cpu,
+                        tab.mem as f64 / 1e6
+                    );
+                    if shared_dir_warning {
+                        hover.push_str("\nanother tab is working directly in this directory");
+                    }
                     let resp = ui
                         .selectable_label(i == ws.active_tab, text)
-                        .on_hover_text(format!(
-                            "{}\ncpu {:.0}%  ram {:.0} MB",
-                            tab.cwd.display(),
-                            tab.cpu,
-                            tab.mem as f64 / 1e6
-                        ));
+                        .on_hover_text(hover);
                     if resp.clicked() {
                         ws.active_tab = i;
                     }
@@ -580,14 +758,37 @@ impl eframe::App for PtApp {
         // widgets can't hold egui's single keyboard focus at once, and the
         // terminal claimed it unconditionally every frame. `focused` is
         // `false` whenever any dialog is showing, so the dialog wins
-        // instead. Task 12's own text-editing UI (the F2 shared-context
-        // panel) must AND its own "am I editing" state into this bool too,
-        // or it will have the same problem the moment it adds a TextEdit.
-        let focused = self.new_tab.is_none() && self.closing.is_none() && self.error.is_none();
+        // instead. Task 12's F2 shared-context panel ANDs its own
+        // `ctx_panel_has_focus` (set from the panel's `TextEdit` response
+        // in `show_ctx_panel_ui`) into this bool for the same reason: with
+        // the panel open, typing in it must not also feed the terminal.
+        let focused = self.new_tab.is_none()
+            && self.closing.is_none()
+            && self.error.is_none()
+            && !self.ctx_panel_has_focus;
         egui::CentralPanel::default().show(ctx, |ui| {
+            let mut restart = false;
             if let Some(ws) = self.workspaces.get_mut(self.active_ws) {
                 if let Some(tab) = ws.tabs.get_mut(ws.active_tab) {
+                    // Exit banner + Restart (Step 2). Drawn above the
+                    // terminal so it's visible even though the dead
+                    // terminal view still renders below it (its last
+                    // on-screen frame, frozen).
+                    if let Some(code) = tab.term.exited() {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                egui::Color32::LIGHT_RED,
+                                format!("process exited with code {code}"),
+                            );
+                            if ui.button("Restart").clicked() {
+                                restart = true;
+                            }
+                        });
+                    }
                     tab.term.ui(ui, focused); // only the ACTIVE tab renders — spec perf requirement
+                    if restart {
+                        self.restart_active_tab(ctx);
+                    }
                     return;
                 }
             }
