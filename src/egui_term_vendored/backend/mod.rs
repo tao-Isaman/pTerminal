@@ -357,9 +357,14 @@ impl TerminalBackend {
                 }
             }
 
-            open::that(url).unwrap_or_else(|_| {
-                panic!("link opening is failed");
-            })
+            // pTerminal delta: 6 — upstream did
+            // `open::that(url).unwrap_or_else(|_| panic!("link opening is failed"))`.
+            // This runs on the UI thread, so a Ctrl+click on any link the OS
+            // has no handler for (`mailto:` with no mail client, an unknown
+            // scheme, a false-positive URL match in terminal output) took the
+            // whole app down with it. A link that won't open is not worth a
+            // crash: ignore the failure and leave the terminal alone.
+            let _ = open::that(url);
         }
     }
 

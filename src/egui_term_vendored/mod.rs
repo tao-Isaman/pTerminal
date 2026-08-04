@@ -29,6 +29,10 @@
 //!    `false`, so a multi-word arg (an agent's initial prompt) reached the child
 //!    process with only its first word — the rest was unquoted and split on
 //!    whitespace by the shell. Now set to `true` on Windows.
+//! 6. `backend/mod.rs` — `open_link` panicked (`unwrap_or_else(|| panic!(..))`)
+//!    when `open::that` failed. It runs on the UI thread, so Ctrl+clicking a
+//!    `mailto:`/unknown-scheme link with no registered handler crashed the
+//!    whole app. The failure is now ignored (`let _ = open::that(url);`).
 
 // This is library code kept as close to upstream as possible; not every item it
 // exports is used by pTerminal (yet).
