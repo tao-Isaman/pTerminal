@@ -1,0 +1,304 @@
+//! Dialogs: "new tab" (spawn agent/shell), "close tab" (merge/keep/discard a
+//! worktree), and the always-on-top error dialog. All three share `PtApp`'s
+//! per-frame [`PtApp::show_dialogs`] entry point (called once from
+//! `app.rs::update`), rendered in strict priority order — error, then
+//! new-tab, then close — with an early `return` after whichever one draws,
+//! so at most one dialog is ever on screen at a time. The error dialog wins
+//! over the rest because it means something already went wrong; stacking a
+//! new decision on top of an unacknowledged error would only be confusing.
+
+use crate::app::{NewTabDraft, PendingClaim, PtApp};
+use crate::hooks::AgentStatus;
+use crate::term::{self, SpawnSpec, TabKind};
+use crate::{git, shared_ctx};
+use eframe::egui;
+use std::collections::HashSet;
+
+/// What to do with a closing tab's worktree, decided by the close dialog.
+/// `Plain` covers tabs with nothing to merge/keep/discard — a shell tab, or
+/// a direct-mode (non-isolated) agent tab — where closing just removes it.
+pub enum CloseAction {
+    Merge,
+    Keep,
+    Discard,
+    Plain,
+}
+
+impl PtApp {
+    /// Renders whichever dialog is currently pending. Called once per frame
+    /// from `app.rs::update`, after the sidebar/tab-strip/status panels (so
+    /// it draws on top of them) but before the central panel — `app.rs`
+    /// reads `self.new_tab`/`self.closing`/`self.error` right after this to
+    /// decide whether the terminal should receive keyboard focus this frame
+    /// (the FOCUS fix: see `term::TabTerm::ui`'s doc comment).
+    pub fn show_dialogs(&mut self, ctx: &egui::Context) {
+        // ---- error dialog (always wins) ----
+        if let Some(msg) = self.error.clone() {
+            egui::Window::new("Error").collapsible(false).show(ctx, |ui| {
+                ui.label(egui::RichText::new(&msg).monospace());
+                if ui.button("OK").clicked() {
+                    self.error = None;
+                }
+            });
+            return;
+        }
+
+        // ---- new tab dialog ----
+        if let Some(draft) = &mut self.new_tab {
+            let mut open_now = false;
+            let mut cancel = false;
+            let is_git = self
+                .workspaces
+                .get(self.active_ws)
+                .map(|w| w.meta.is_git)
+                .unwrap_or(false);
+            egui::Window::new("New tab").collapsible(false).show(ctx, |ui| {
+                ui.checkbox(&mut draft.shell, "plain shell (no agent)");
+                if !draft.shell {
+                    ui.label("initial prompt (optional):");
+                    ui.text_edit_singleline(&mut draft.prompt);
+                    ui.add_enabled(is_git, egui::Checkbox::new(&mut draft.isolate, "isolate in worktree"));
+                    if !is_git {
+                        ui.small("not a git repo — worktrees unavailable");
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Open").clicked() {
+                        open_now = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if cancel {
+                self.new_tab = None;
+            }
+            if open_now {
+                let draft = self.new_tab.take().unwrap();
+                self.open_tab(ctx, draft);
+            }
+            return;
+        }
+
+        // ---- close dialog ----
+        if let Some(closing) = &self.closing {
+            let idx = closing.tab_index;
+            let confirm_discard = closing.confirm_discard;
+            let Some(ws) = self.workspaces.get(self.active_ws) else {
+                self.closing = None;
+                return;
+            };
+            let Some(tab) = ws.tabs.get(idx) else {
+                self.closing = None;
+                return;
+            };
+            let has_wt = tab.worktree.is_some();
+            let branch = tab.worktree.as_ref().map(|w| w.branch.clone()).unwrap_or_default();
+            // Dirty check for the Discard double-confirm below. Runs once
+            // per frame the dialog is open (one `git status --porcelain`)
+            // — cheap enough not to matter for a modal confirmation the
+            // user is actively looking at, and it's `None`/skipped
+            // entirely for tabs with no worktree.
+            let dirty = tab
+                .worktree
+                .as_ref()
+                .map(|w| git::is_dirty(&w.path).unwrap_or(false))
+                .unwrap_or(false);
+            let mut action = None;
+            let mut set_confirm = false;
+            egui::Window::new("Close tab").collapsible(false).show(ctx, |ui| {
+                if has_wt {
+                    ui.label(format!("This tab has worktree branch `{branch}`."));
+                    ui.horizontal(|ui| {
+                        if ui.button("Merge into main checkout").clicked() {
+                            action = Some(CloseAction::Merge);
+                        }
+                        if ui.button("Keep worktree").clicked() {
+                            action = Some(CloseAction::Keep);
+                        }
+                        // spec: double-confirm Discard when the worktree is
+                        // dirty — first click (not yet confirmed) just arms
+                        // the second gate and relabels the button; a second
+                        // click, or any click when it's not dirty, proceeds.
+                        let discard_label = if dirty && confirm_discard {
+                            "Really discard uncommitted changes?"
+                        } else {
+                            "Discard"
+                        };
+                        if ui.button(discard_label).clicked() {
+                            if dirty && !confirm_discard {
+                                set_confirm = true;
+                            } else {
+                                action = Some(CloseAction::Discard);
+                            }
+                        }
+                    });
+                } else if ui.button("Close").clicked() {
+                    action = Some(CloseAction::Plain);
+                }
+                if ui.button("Cancel").clicked() {
+                    self.closing = None;
+                }
+            });
+            if set_confirm {
+                if let Some(c) = &mut self.closing {
+                    c.confirm_discard = true;
+                }
+            }
+            if let Some(a) = action {
+                self.finish_close(ctx, a);
+            }
+        }
+    }
+
+    /// Spawns a new tab from a completed "new tab" dialog draft: a plain
+    /// shell, or an agent (optionally isolated in a worktree, with the
+    /// shared-context file wired in and `.gitignore` kept in sync).
+    pub fn open_tab(&mut self, ctx: &egui::Context, draft: NewTabDraft) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.persist();
+
+        // Snapshot our own children *before* spawning so `drain_events` in
+        // app.rs can tell, from the sampler's next snapshot, which new PID
+        // belongs to this tab (see `Tab::claim_pids`).
+        let before: HashSet<u32> = self
+            .last_snap
+            .iter()
+            .filter(|p| p.parent == Some(std::process::id()))
+            .map(|p| p.pid)
+            .collect();
+
+        let Some(ws) = self.workspaces.get_mut(self.active_ws) else { return };
+        let repo = ws.meta.repo_path.clone();
+
+        let result = if draft.shell {
+            term::spawn_shell(ctx, id, &repo)
+        } else {
+            // CARRIED FINDING (documented on `term::spawn_agent`): a direct
+            // (isolate=false) agent spawn overwrites
+            // `.claude/settings.local.json` at `repo` unconditionally, so it
+            // silently steals hook routing from any other live direct-mode
+            // agent tab already running there. Degrade that older tab's
+            // status now, at the moment of takeover, rather than leaving it
+            // stuck showing a status that will never update again.
+            if !draft.isolate {
+                for other in ws.tabs.iter_mut() {
+                    if other.kind == TabKind::Agent
+                        && other.worktree.is_none()
+                        && other.cwd == repo
+                        && other.status != AgentStatus::Exited
+                    {
+                        other.status = AgentStatus::Unknown;
+                    }
+                }
+            }
+            // shared.md + gitignore entry, once per workspace. Gitignore
+            // ruling (user-approved pre-flight decision): auto-add without
+            // a confirmation prompt; any failure surfaces through the error
+            // dialog like everything else, but doesn't block the spawn.
+            let shared = if ws.meta.is_git {
+                match shared_ctx::ensure_shared_md(&repo) {
+                    Ok(p) => {
+                        if shared_ctx::gitignore_needs_entry(&repo) {
+                            if let Err(e) = shared_ctx::add_gitignore_entry(&repo) {
+                                self.error = Some(format!("could not update .gitignore: {e}"));
+                            }
+                        }
+                        Some(p)
+                    }
+                    Err(e) => {
+                        self.error = Some(e.to_string());
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            term::spawn_agent(
+                ctx,
+                id,
+                &SpawnSpec {
+                    workspace_repo: repo,
+                    main_repo_shared_md: shared,
+                    prompt: draft.prompt,
+                    isolate: draft.isolate,
+                },
+            )
+        };
+
+        match result {
+            Ok(tab) => {
+                let ws = &mut self.workspaces[self.active_ws];
+                ws.tabs.push(tab);
+                ws.active_tab = ws.tabs.len() - 1;
+                self.pending_claim = Some(PendingClaim {
+                    ws_index: self.active_ws,
+                    tab_id: id,
+                    before,
+                });
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Carries out a close-dialog decision: merge the worktree branch back
+    /// into the main checkout, park it in `kept_worktrees` for later,
+    /// discard it outright, or (no worktree) just close the tab. On any git
+    /// failure the tab is left open and the error dialog takes over — the
+    /// spec is to never lose a tab silently on failure.
+    pub fn finish_close(&mut self, _ctx: &egui::Context, action: CloseAction) {
+        let Some(closing) = self.closing.take() else { return };
+        let Some(ws) = self.workspaces.get_mut(self.active_ws) else { return };
+        let Some(tab) = ws.tabs.get(closing.tab_index) else { return };
+        let repo = ws.meta.repo_path.clone();
+        let wt = tab.worktree.clone();
+
+        let outcome: Result<(), String> = match (&action, &wt) {
+            (CloseAction::Merge, Some(wt)) => (|| {
+                if git::is_dirty(&wt.path).map_err(|e| e.to_string())? {
+                    return Err(format!(
+                        "worktree has uncommitted changes:\n{}\ncommit or discard them in the tab first",
+                        wt.path.display()
+                    ));
+                }
+                git::merge_branch(&repo, &wt.branch).map_err(|e| format!(
+                    "{e}\n\nMerge stopped. Open a shell tab in the main checkout to resolve, then close this tab again."
+                ))?;
+                git::worktree_remove(&repo, &wt.path, false).map_err(|e| e.to_string())?;
+                git::delete_branch(&repo, &wt.branch).map_err(|e| e.to_string())?;
+                Ok(())
+            })(),
+            (CloseAction::Discard, Some(wt)) => match git::is_dirty(&wt.path) {
+                Ok(true) => git::worktree_remove(&repo, &wt.path, true)
+                    .and_then(|_| git::delete_branch(&repo, &wt.branch))
+                    .map_err(|e| e.to_string()),
+                Ok(false) => git::worktree_remove(&repo, &wt.path, false)
+                    .and_then(|_| git::delete_branch(&repo, &wt.branch))
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            (CloseAction::Keep, Some(wt)) => {
+                ws.meta.kept_worktrees.push(wt.clone());
+                Ok(())
+            }
+            _ => Ok(()),
+        };
+
+        match outcome {
+            Ok(()) => {
+                let ws = &mut self.workspaces[self.active_ws];
+                ws.tabs.remove(closing.tab_index);
+                if ws.active_tab >= ws.tabs.len() && !ws.tabs.is_empty() {
+                    ws.active_tab = ws.tabs.len() - 1;
+                }
+                self.persist();
+            }
+            Err(msg) => {
+                self.error = Some(msg);
+                // tab stays open — spec: never lose the tab on failure
+            }
+        }
+    }
+}

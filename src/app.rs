@@ -16,7 +16,7 @@
 use crate::hooks::{self, AgentStatus};
 use crate::resources::{MachineStats, ProcSample};
 use crate::state;
-use crate::term::{Tab, TabKind};
+use crate::term::{self, Tab, TabKind};
 use crate::watcher;
 use eframe::egui;
 use notify::RecommendedWatcher;
@@ -46,19 +46,24 @@ pub struct PendingClaim {
 }
 
 /// Draft state for the "new tab" dialog. Populated by shortcuts/buttons in
-/// this task; actually rendered and acted on by Task 11's `show_dialogs`.
-#[allow(dead_code)] // fields are written here, read by Task 11
+/// this task; rendered and acted on by `dialogs::show_dialogs`.
 pub struct NewTabDraft {
     pub prompt: String,
     pub isolate: bool,
     pub shell: bool,
 }
 
-/// Draft state for the "close tab" confirmation. Same story as
-/// [`NewTabDraft`]: populated here, consumed by Task 11.
-#[allow(dead_code)] // field is written here, read by Task 11
+/// Draft state for the "close tab" confirmation. Populated here, consumed
+/// by `dialogs::show_dialogs`/`finish_close`.
+///
+/// `confirm_discard` gates the dirty-worktree double-confirm on Discard
+/// (Task 11 spec): starts `false` on every fresh close request; the
+/// dialog's first click on a dirty worktree's Discard button sets it to
+/// `true` and relabels the button, and only a second click (with it
+/// already `true`) actually proceeds.
 pub struct CloseDraft {
     pub tab_index: usize,
+    pub confirm_discard: bool,
 }
 
 pub struct PtApp {
@@ -172,6 +177,40 @@ impl PtApp {
         self.persist();
     }
 
+    /// Opens a plain shell tab rooted at a worktree the user previously
+    /// chose to "Keep" from the close dialog (Task 11), and drops it from
+    /// `kept_worktrees` — the worktree stays on disk exactly as before,
+    /// only the sidebar reminder to revisit it goes away. Also switches to
+    /// `ws_idx` so the new tab is immediately visible, matching what
+    /// clicking a workspace row already does.
+    ///
+    /// Runs the same PID-claim dance as `dialogs::open_tab` (snapshot our
+    /// children before spawning, hand the delta to `drain_events` via
+    /// `pending_claim`) so this tab's CPU/mem rollup doesn't stay stuck at
+    /// zero forever.
+    fn open_kept_worktree(&mut self, ctx: &egui::Context, ws_idx: usize, wt: state::WorktreeInfo) {
+        let id = self.next_tab_id;
+        let before: HashSet<u32> = self
+            .last_snap
+            .iter()
+            .filter(|p| p.parent == Some(std::process::id()))
+            .map(|p| p.pid)
+            .collect();
+        match term::spawn_shell(ctx, id, &wt.path) {
+            Ok(tab) => {
+                self.next_tab_id += 1;
+                let ws = &mut self.workspaces[ws_idx];
+                ws.tabs.push(tab);
+                ws.active_tab = ws.tabs.len() - 1;
+                ws.meta.kept_worktrees.retain(|w| w != &wt);
+                self.active_ws = ws_idx;
+                self.pending_claim = Some(PendingClaim { ws_index: ws_idx, tab_id: id, before });
+                self.persist();
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
     /// Per-frame event pump: drains the resource sampler, applies hook-event
     /// status changes, picks up a completed folder dialog, claims PIDs for a
     /// freshly spawned tab, and — for every tab of every workspace — drains
@@ -280,6 +319,17 @@ impl PtApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        // A dialog (error / new-tab / close) owns the keyboard while it's
+        // open: without this guard, a repeated Ctrl+T would silently
+        // replace a half-filled `new_tab` draft, and Ctrl+W while `closing`
+        // is already set would retarget the confirmation at whatever tab is
+        // active *now* rather than the one the user is deciding about.
+        // Simplest correct fix — skip every shortcut (including
+        // F2/Ctrl+Tab/Ctrl+1..9) while any dialog is showing; the dialog's
+        // own buttons are the only way to act on it until it's dismissed.
+        if self.error.is_some() || self.new_tab.is_some() || self.closing.is_some() {
+            return;
+        }
         let (t, w, cycle) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::T),
@@ -299,7 +349,7 @@ impl PtApp {
             });
         }
         if w && !ws.tabs.is_empty() {
-            self.closing = Some(CloseDraft { tab_index: ws.active_tab });
+            self.closing = Some(CloseDraft { tab_index: ws.active_tab, confirm_discard: false });
         }
         if cycle && !ws.tabs.is_empty() {
             ws.active_tab = (ws.active_tab + 1) % ws.tabs.len();
@@ -328,8 +378,6 @@ impl PtApp {
         }
     }
 
-    // Task 11.
-    fn show_dialogs(&mut self, _ctx: &egui::Context) {}
     // Task 12.
     fn show_ctx_panel_ui(&mut self, _ctx: &egui::Context) {}
 }
@@ -353,6 +401,12 @@ impl eframe::App for PtApp {
             ui.heading("WORKSPACES");
             ui.separator();
             let mut clicked = None;
+            // Collected outside the loop, same borrow pattern as `clicked`
+            // above: `ws.meta.kept_worktrees` is borrowed immutably by the
+            // `for` loop over `self.workspaces`, so acting on a click (which
+            // needs a mutable borrow to spawn a tab and remove the entry)
+            // has to wait until the loop is done.
+            let mut kept_clicked: Option<(usize, state::WorktreeInfo)> = None;
             for (i, ws) in self.workspaces.iter().enumerate() {
                 let agent_count = ws.tabs.iter().filter(|t| t.kind == TabKind::Agent).count();
                 let (cpu, mem): (f32, u64) = ws
@@ -370,9 +424,26 @@ impl eframe::App for PtApp {
                 if ui.selectable_label(i == self.active_ws, label).clicked() {
                     clicked = Some(i);
                 }
+                for wt in &ws.meta.kept_worktrees {
+                    // `ui.small(text)` alone doesn't reliably sense clicks
+                    // (a plain `Label`'s default sense is hover-only unless
+                    // egui's text-selection interaction happens to union in
+                    // a click sense) — adaptation from the brief's
+                    // display-only snippet: sense the click explicitly.
+                    let resp = ui.add(
+                        egui::Label::new(egui::RichText::new(format!("  ⌂ {}", wt.branch)).small())
+                            .sense(egui::Sense::click()),
+                    );
+                    if resp.clicked() {
+                        kept_clicked = Some((i, wt.clone()));
+                    }
+                }
             }
             if let Some(i) = clicked {
                 self.active_ws = i;
+            }
+            if let Some((ws_idx, wt)) = kept_clicked {
+                self.open_kept_worktree(ctx, ws_idx, wt);
             }
             ui.separator();
             if ui.button("+ workspace").clicked() {
@@ -409,7 +480,7 @@ impl eframe::App for PtApp {
                     }
                 }
                 if let Some(i) = close_req {
-                    self.closing = Some(CloseDraft { tab_index: i });
+                    self.closing = Some(CloseDraft { tab_index: i, confirm_discard: false });
                 }
                 if ui.button("+").clicked() {
                     let isolate = ws.meta.default_isolate && ws.meta.is_git;
@@ -449,10 +520,20 @@ impl eframe::App for PtApp {
         self.show_dialogs(ctx);
         self.show_ctx_panel_ui(ctx);
 
+        // FOCUS: `TabTerm::ui` used to hardcode `.set_focus(true)`, so an
+        // open dialog's `TextEdit` (the new-tab prompt field, in
+        // particular) would fight the terminal for every keystroke — both
+        // widgets can't hold egui's single keyboard focus at once, and the
+        // terminal claimed it unconditionally every frame. `focused` is
+        // `false` whenever any dialog is showing, so the dialog wins
+        // instead. Task 12's own text-editing UI (the F2 shared-context
+        // panel) must AND its own "am I editing" state into this bool too,
+        // or it will have the same problem the moment it adds a TextEdit.
+        let focused = self.new_tab.is_none() && self.closing.is_none() && self.error.is_none();
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(ws) = self.workspaces.get_mut(self.active_ws) {
                 if let Some(tab) = ws.tabs.get_mut(ws.active_tab) {
-                    tab.term.ui(ui); // only the ACTIVE tab renders — spec perf requirement
+                    tab.term.ui(ui, focused); // only the ACTIVE tab renders — spec perf requirement
                     return;
                 }
             }

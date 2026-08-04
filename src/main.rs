@@ -1,10 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app;
+mod dialogs;
 mod egui_term_vendored;
 mod git;
 mod hooks;
 mod resources;
-#[allow(dead_code)]
 mod shared_ctx;
 mod state;
 mod term;

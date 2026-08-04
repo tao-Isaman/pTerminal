@@ -119,12 +119,23 @@ impl TabTerm {
         self.visible.store(visible, Ordering::Relaxed);
     }
 
-    /// Renders the terminal filling `ui`'s available rect and gives it keyboard focus.
-    pub fn ui(&mut self, ui: &mut eframe::egui::Ui) {
+    /// Renders the terminal filling `ui`'s available rect. `focused` controls
+    /// whether *this frame* gives the terminal keyboard focus.
+    ///
+    /// **API change (Task 11, FOCUS finding).** This used to hardcode
+    /// `.set_focus(true)` unconditionally, which meant an open dialog's own
+    /// `TextEdit` (e.g. the new-tab prompt field) would lose every
+    /// keystroke to the terminal fighting for the same single keyboard
+    /// focus egui hands out per frame. The caller (`app.rs`) now passes
+    /// `false` whenever a dialog is showing. A later task adding its own
+    /// text-editing UI (Task 12's shared-context panel) must AND its own
+    /// "am I editing" state into whatever it passes here, or it will hit
+    /// the exact same bug the moment it adds a `TextEdit`.
+    pub fn ui(&mut self, ui: &mut eframe::egui::Ui, focused: bool) {
         self.poll();
         // `TerminalView::new` borrows `ui` only to derive the widget id, so the view
         // has to be bound to a local before `ui` is borrowed again by `add`.
-        let view = TerminalView::new(ui, &mut self.backend).set_focus(true);
+        let view = TerminalView::new(ui, &mut self.backend).set_focus(focused);
         ui.add(view);
     }
 
@@ -141,11 +152,9 @@ impl TabTerm {
 // worktree (if isolated), its status glyph, and the PIDs claimed for CPU/mem
 // rollup. `spawn_agent`/`spawn_shell` are the only ways to build one.
 //
-// Task 10 wires `TabKind`, `Tab`, and `Tab::claim_pids` into app.rs; the rest
-// (`SpawnSpec`, `spawn_agent`, `spawn_shell`, and the fields only a later
-// task's UI reads) stays unused until Task 11 adds the new-tab dialog that
-// actually calls them, so those items keep individual `#[allow(dead_code)]`
-// rather than silencing the whole module.
+// Task 10 wired `TabKind`, `Tab`, and `Tab::claim_pids` into app.rs; Task 11's
+// new-tab dialog (`dialogs::open_tab`) now calls `spawn_agent`/`spawn_shell`
+// too, so none of this module's items are dead code anymore.
 
 /// What a [`Tab`] runs: an agent (Claude Code via `cmd.exe`) or a plain shell.
 #[derive(Clone, Copy, PartialEq)]
@@ -157,7 +166,6 @@ pub enum TabKind { Agent, Shell }
 /// single coordination point for every agent working on the repo, not one per
 /// worktree. The app computes it once via `shared_ctx::ensure_shared_md`
 /// before building this spec.
-#[allow(dead_code)]
 pub struct SpawnSpec {
     pub workspace_repo: PathBuf,
     pub main_repo_shared_md: Option<PathBuf>,
@@ -175,8 +183,7 @@ pub struct Tab {
     /// Shell tabs stay `AgentStatus::Unknown` and render no status glyph —
     /// only agent tabs receive Claude Code hook events.
     pub status: AgentStatus,
-    /// Consumed by a later task's worktree UI (badge/merge flow), not Task 10.
-    #[allow(dead_code)]
+    /// Read by Task 11's close dialog (worktree badge, merge/keep/discard).
     pub worktree: Option<WorktreeInfo>,
     pub cwd: PathBuf,
     /// PIDs claimed for resource rollup; see [`Tab::claim_pids`].
@@ -212,7 +219,6 @@ pub struct Tab {
 /// error explains whether that rollback succeeded — if it didn't, it names
 /// the path that needs manual cleanup. The direct-mode (`isolate: false`)
 /// path has nothing to roll back.
-#[allow(dead_code)]
 pub fn spawn_agent(
     ctx: &eframe::egui::Context,
     id: u64,
@@ -280,7 +286,6 @@ pub fn spawn_agent(
 
 /// Spawns a plain shell tab (`powershell.exe`) rooted at `cwd`. No worktree,
 /// no hooks, no status tracking beyond `AgentStatus::Unknown`.
-#[allow(dead_code)]
 pub fn spawn_shell(
     ctx: &eframe::egui::Context,
     id: u64,
