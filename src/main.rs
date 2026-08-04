@@ -12,6 +12,8 @@ mod shared_ctx;
 #[allow(dead_code)]
 mod state;
 mod term;
+#[allow(dead_code)]
+mod watcher;
 
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
