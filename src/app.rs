@@ -13,6 +13,7 @@
 //! modal call there would stall `update` for as long as the dialog is open,
 //! and with it every tab's poll — see that function's docs.
 
+use crate::git;
 use crate::hooks::{self, AgentStatus};
 use crate::resources::{MachineStats, ProcSample};
 use crate::state;
@@ -56,14 +57,53 @@ pub struct NewTabDraft {
 /// Draft state for the "close tab" confirmation. Populated here, consumed
 /// by `dialogs::show_dialogs`/`finish_close`.
 ///
+/// **Identity-tracked by `(ws_index, tab_id)`, not a bare tab index.** The
+/// close dialog's `egui::Window` is not modal — nothing stops the sidebar's
+/// workspace rows from being clicked while it's open. If this draft carried
+/// only an index (resolved against whatever `self.active_ws` happens to be
+/// when the dialog body/`finish_close` run), switching workspaces mid-dialog
+/// would silently retarget an already-armed Discard at a different
+/// workspace's tab sitting at that same index — a one-click destructive
+/// `worktree remove --force` + `branch -D` against the wrong tab. Both the
+/// dialog body and `finish_close` re-resolve the target by scanning
+/// `workspaces[ws_index].tabs` for `tab_id`; if the workspace is out of
+/// range or no tab with that id exists any more, the draft is dropped
+/// (`self.closing = None`) rather than falling back to a guess.
+///
+/// `dirty` is precomputed **once, at draft construction**, via
+/// `git::is_dirty` on the tab's worktree path (`false` for tabs with no
+/// worktree) — not recomputed every frame the dialog is open. This removes
+/// a per-frame `git status --porcelain` subprocess and the TOCTOU where a
+/// worktree could flip clean→dirty while the dialog sits open, silently
+/// disarming the double-confirm gate the user is relying on. A `git::is_dirty`
+/// error fails toward safety (`unwrap_or(true)`), arming the double-confirm.
+///
 /// `confirm_discard` gates the dirty-worktree double-confirm on Discard
 /// (Task 11 spec): starts `false` on every fresh close request; the
 /// dialog's first click on a dirty worktree's Discard button sets it to
 /// `true` and relabels the button, and only a second click (with it
 /// already `true`) actually proceeds.
 pub struct CloseDraft {
-    pub tab_index: usize,
+    pub ws_index: usize,
+    pub tab_id: u64,
+    pub dirty: bool,
     pub confirm_discard: bool,
+}
+
+/// Builds a `CloseDraft` for the tab at `ws.tabs[tab_idx]` in workspace
+/// `ws_index`, precomputing `dirty` once (see `CloseDraft` docs) instead of
+/// leaving it to be recomputed every frame the dialog is open. Shared by
+/// both construction sites (`shortcuts()`'s Ctrl+W and the tab strip's
+/// middle-click handler) so they can't drift out of sync on how `dirty`
+/// (or the identity fields) get filled in.
+fn close_draft_for(ws: &WsRt, ws_index: usize, tab_idx: usize) -> Option<CloseDraft> {
+    let tab = ws.tabs.get(tab_idx)?;
+    let dirty = tab
+        .worktree
+        .as_ref()
+        .map(|wt| git::is_dirty(&wt.path).unwrap_or(true))
+        .unwrap_or(false);
+    Some(CloseDraft { ws_index, tab_id: tab.id, dirty, confirm_discard: false })
 }
 
 pub struct PtApp {
@@ -349,7 +389,7 @@ impl PtApp {
             });
         }
         if w && !ws.tabs.is_empty() {
-            self.closing = Some(CloseDraft { tab_index: ws.active_tab, confirm_discard: false });
+            self.closing = close_draft_for(ws, self.active_ws, ws.active_tab);
         }
         if cycle && !ws.tabs.is_empty() {
             ws.active_tab = (ws.active_tab + 1) % ws.tabs.len();
@@ -451,9 +491,23 @@ impl eframe::App for PtApp {
             }
         });
 
+        // Guard mouse-driven draft stacking: a dialog (error / new-tab /
+        // close) already owns the decision in flight, same rationale as
+        // shortcuts()'s keyboard guard above. Computed once here (before
+        // `show_dialogs` runs later this frame) and used to make the `+`
+        // button and tab middle-click inert while any dialog is open — a
+        // middle-click on a DIFFERENT tab while a close dialog is showing
+        // must not silently replace `self.closing` with a fresh draft, and
+        // `+` must not stack a second "New tab" dialog on top of an
+        // unresolved one. Sidebar workspace/kept-row clicks are NOT
+        // guarded — they stay live because `CloseDraft`/`PendingClaim` are
+        // now identity-tracked (`ws_index` + `tab_id`), not index-based, so
+        // switching workspaces can no longer misdirect them.
+        let dialog_open = self.error.is_some() || self.new_tab.is_some() || self.closing.is_some();
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let Some(ws) = self.workspaces.get_mut(self.active_ws) else {
+                let active_ws = self.active_ws;
+                let Some(ws) = self.workspaces.get_mut(active_ws) else {
                     ui.label("add a workspace to begin");
                     return;
                 };
@@ -475,14 +529,14 @@ impl eframe::App for PtApp {
                     if resp.clicked() {
                         ws.active_tab = i;
                     }
-                    if resp.middle_clicked() {
+                    if resp.middle_clicked() && !dialog_open {
                         close_req = Some(i);
                     }
                 }
                 if let Some(i) = close_req {
-                    self.closing = Some(CloseDraft { tab_index: i, confirm_discard: false });
+                    self.closing = close_draft_for(ws, active_ws, i);
                 }
-                if ui.button("+").clicked() {
+                if ui.add_enabled(!dialog_open, egui::Button::new("+")).clicked() {
                     let isolate = ws.meta.default_isolate && ws.meta.is_git;
                     self.new_tab = Some(NewTabDraft { prompt: String::new(), isolate, shell: false });
                 }

@@ -83,28 +83,29 @@ impl PtApp {
 
         // ---- close dialog ----
         if let Some(closing) = &self.closing {
-            let idx = closing.tab_index;
+            // Resolved by IDENTITY (ws_index + tab_id), not against
+            // `self.active_ws`/a bare index — this `egui::Window` isn't
+            // modal, so the sidebar stays clickable behind it. If the
+            // lookup missed this workspace switch, or the tab was already
+            // closed, drop the draft rather than act on the wrong tab (see
+            // `CloseDraft`'s doc comment in app.rs for the full rationale).
+            let ws_index = closing.ws_index;
+            let tab_id = closing.tab_id;
             let confirm_discard = closing.confirm_discard;
-            let Some(ws) = self.workspaces.get(self.active_ws) else {
+            // Precomputed once at draft creation (see `CloseDraft`'s doc
+            // comment) — no per-frame `git status` call, and no
+            // clean->dirty TOCTOU while the dialog sits open.
+            let dirty = closing.dirty;
+            let Some(ws) = self.workspaces.get(ws_index) else {
                 self.closing = None;
                 return;
             };
-            let Some(tab) = ws.tabs.get(idx) else {
+            let Some(tab) = ws.tabs.iter().find(|t| t.id == tab_id) else {
                 self.closing = None;
                 return;
             };
             let has_wt = tab.worktree.is_some();
             let branch = tab.worktree.as_ref().map(|w| w.branch.clone()).unwrap_or_default();
-            // Dirty check for the Discard double-confirm below. Runs once
-            // per frame the dialog is open (one `git status --porcelain`)
-            // — cheap enough not to matter for a modal confirmation the
-            // user is actively looking at, and it's `None`/skipped
-            // entirely for tabs with no worktree.
-            let dirty = tab
-                .worktree
-                .as_ref()
-                .map(|w| git::is_dirty(&w.path).unwrap_or(false))
-                .unwrap_or(false);
             let mut action = None;
             let mut set_confirm = false;
             egui::Window::new("Close tab").collapsible(false).show(ctx, |ui| {
@@ -250,8 +251,13 @@ impl PtApp {
     /// spec is to never lose a tab silently on failure.
     pub fn finish_close(&mut self, _ctx: &egui::Context, action: CloseAction) {
         let Some(closing) = self.closing.take() else { return };
-        let Some(ws) = self.workspaces.get_mut(self.active_ws) else { return };
-        let Some(tab) = ws.tabs.get(closing.tab_index) else { return };
+        // Same identity resolution as the dialog body above: `ws_index` +
+        // `tab_id`, never `self.active_ws`. A sidebar workspace switch
+        // between the dialog opening and this action firing must not
+        // retarget a destructive close at a different workspace's tab.
+        let Some(ws) = self.workspaces.get_mut(closing.ws_index) else { return };
+        let Some(tab_idx) = ws.tabs.iter().position(|t| t.id == closing.tab_id) else { return };
+        let tab = &ws.tabs[tab_idx];
         let repo = ws.meta.repo_path.clone();
         let wt = tab.worktree.clone();
 
@@ -288,8 +294,8 @@ impl PtApp {
 
         match outcome {
             Ok(()) => {
-                let ws = &mut self.workspaces[self.active_ws];
-                ws.tabs.remove(closing.tab_index);
+                let ws = &mut self.workspaces[closing.ws_index];
+                ws.tabs.remove(tab_idx);
                 if ws.active_tab >= ws.tabs.len() && !ws.tabs.is_empty() {
                     ws.active_tab = ws.tabs.len() - 1;
                 }
