@@ -22,12 +22,20 @@ use std::borrow::Cow;
 use std::cmp::min;
 use std::io::Result;
 use std::ops::{Index, RangeInclusive};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 pub type TerminalMode = TermMode;
 pub type PtyEvent = Event;
 pub type SelectionType = AlacrittySelectionType;
+
+/// pTerminal delta: how often a terminal that is *not* on screen asks for a
+/// repaint while its child is producing output. Long enough that a chatty
+/// background tab costs ~nothing, short enough that its event channel keeps
+/// getting drained and its exit is noticed promptly.
+const HIDDEN_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub enum BackendCommand {
@@ -143,11 +151,15 @@ pub struct TerminalBackend {
 }
 
 impl TerminalBackend {
+    /// pTerminal delta: `visible` is new. It is shared with the caller
+    /// (`term::TabTerm`) and tells the PTY event forwarding thread whether this
+    /// terminal is currently on screen — see the thread body below.
     pub fn new(
         id: u64,
         app_context: egui::Context,
         pty_event_proxy_sender: Sender<(u64, PtyEvent)>,
         settings: BackendSettings,
+        visible: Arc<AtomicBool>,
     ) -> Result<Self> {
         let pty_config = tty::Options {
             shell: Some(tty::Shell::new(settings.shell, settings.args)),
@@ -189,7 +201,18 @@ impl TerminalBackend {
                     if pty_event_proxy_sender.send((id, event.clone())).is_err() {
                         break;
                     }
-                    app_context.request_repaint();
+                    // pTerminal delta: upstream requested an immediate repaint for
+                    // every event, so one background tab printing output pinned the
+                    // whole app at frame rate — and every frame deep-clones the
+                    // *visible* terminal's grid in `sync()`. Off-screen terminals now
+                    // only ask for a lazy repaint; that still wakes the app loop often
+                    // enough to drain this channel (which is unbounded and carries
+                    // owned payloads) and to notice the child exiting.
+                    if visible.load(Ordering::Relaxed) {
+                        app_context.request_repaint();
+                    } else {
+                        app_context.request_repaint_after(HIDDEN_REPAINT_INTERVAL);
+                    }
                     if let Event::Exit = event {
                         break;
                     }

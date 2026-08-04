@@ -18,6 +18,13 @@
 //! 3. `view.rs` — keyboard input required the mouse pointer to be inside the
 //!    terminal rect, so typing stopped whenever the pointer moved away. Keyboard
 //!    input now follows focus; only mouse input still requires the pointer.
+//! 4. `backend/mod.rs` — the forwarding thread called `request_repaint()` for
+//!    every PTY event, so a single *background* tab producing output drove the
+//!    whole app at full frame rate (and each frame deep-clones the visible
+//!    terminal's grid). `TerminalBackend::new` now takes a shared
+//!    `Arc<AtomicBool>` visibility flag; off-screen terminals get
+//!    `request_repaint_after(250ms)` instead, which is enough for the app loop
+//!    to keep draining them.
 
 // This is library code kept as close to upstream as possible; not every item it
 // exports is used by pTerminal (yet).
