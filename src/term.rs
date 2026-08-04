@@ -42,6 +42,9 @@ use std::collections::HashSet;
 pub const SCROLLBACK_LINES: usize = 10_000;
 
 pub struct TabTerm {
+    // `Tab::id` (which app.rs does read) mirrors this value; Task 12's exit
+    // banner is expected to read `TabTerm::id` directly.
+    #[allow(dead_code)]
     pub id: u64,
     backend: TerminalBackend,
     pty_rx: Receiver<(u64, PtyEvent)>,
@@ -138,12 +141,13 @@ impl TabTerm {
 // worktree (if isolated), its status glyph, and the PIDs claimed for CPU/mem
 // rollup. `spawn_agent`/`spawn_shell` are the only ways to build one.
 //
-// Everything below is unused until Task 10 wires it into app.rs, so items are
-// individually `#[allow(dead_code)]` rather than silencing the whole module —
-// `TabTerm` above is already consumed by app.rs's spike wiring.
+// Task 10 wires `TabKind`, `Tab`, and `Tab::claim_pids` into app.rs; the rest
+// (`SpawnSpec`, `spawn_agent`, `spawn_shell`, and the fields only a later
+// task's UI reads) stays unused until Task 11 adds the new-tab dialog that
+// actually calls them, so those items keep individual `#[allow(dead_code)]`
+// rather than silencing the whole module.
 
 /// What a [`Tab`] runs: an agent (Claude Code via `cmd.exe`) or a plain shell.
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq)]
 pub enum TabKind { Agent, Shell }
 
@@ -163,7 +167,6 @@ pub struct SpawnSpec {
 
 /// A running tab: its terminal plus everything the app needs to render tab
 /// chrome and roll up resource usage without re-deriving it every frame.
-#[allow(dead_code)]
 pub struct Tab {
     pub id: u64,
     pub title: String,
@@ -172,6 +175,8 @@ pub struct Tab {
     /// Shell tabs stay `AgentStatus::Unknown` and render no status glyph —
     /// only agent tabs receive Claude Code hook events.
     pub status: AgentStatus,
+    /// Consumed by a later task's worktree UI (badge/merge flow), not Task 10.
+    #[allow(dead_code)]
     pub worktree: Option<WorktreeInfo>,
     pub cwd: PathBuf,
     /// PIDs claimed for resource rollup; see [`Tab::claim_pids`].
@@ -304,7 +309,6 @@ impl Tab {
     /// sampler snapshot until `root_pids` is non-empty or 5s have passed —
     /// covers the delay between the ConPTY child appearing and the sampler's
     /// next ~2s poll picking it up.
-    #[allow(dead_code)]
     pub fn claim_pids(&mut self, before: &HashSet<u32>, snap: &[ProcSample]) {
         if !self.root_pids.is_empty() { return; }
         if self.spawned_at.elapsed() > std::time::Duration::from_secs(5) { return; }

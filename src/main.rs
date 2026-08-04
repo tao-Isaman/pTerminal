@@ -1,18 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app;
 mod egui_term_vendored;
-#[allow(dead_code)]
 mod git;
-#[allow(dead_code)]
 mod hooks;
-#[allow(dead_code)]
 mod resources;
 #[allow(dead_code)]
 mod shared_ctx;
-#[allow(dead_code)]
 mod state;
 mod term;
-#[allow(dead_code)]
 mod watcher;
 
 fn main() -> eframe::Result<()> {
@@ -25,6 +20,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "pTerminal",
         opts,
-        Box::new(|_cc| Ok(Box::new(app::PtApp::default()))),
+        Box::new(|cc| Ok(Box::new(app::PtApp::new(cc)))),
     )
 }

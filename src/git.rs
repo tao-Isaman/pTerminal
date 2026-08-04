@@ -35,6 +35,7 @@ pub fn is_git_repo(dir: &Path) -> bool {
             .map(|s| s.trim() == "true").unwrap_or(false)
 }
 
+#[allow(dead_code)] // consumed by a later task's close/merge flow, not Task 10
 pub fn is_dirty(dir: &Path) -> Result<bool, GitError> {
     Ok(!run(&c(dir, &["status", "--porcelain"]))?.trim().is_empty())
 }
@@ -72,6 +73,7 @@ pub fn worktree_remove(repo: &Path, wt: &Path, force: bool) -> Result<(), GitErr
     run(&c(repo, &rest)).map(|_| ())
 }
 
+#[allow(dead_code)] // consumed by a later task's close/merge flow, not Task 10
 pub fn merge_branch(repo: &Path, branch: &str) -> Result<String, GitError> {
     run(&c(repo, &["merge", branch]))
 }
