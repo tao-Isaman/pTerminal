@@ -24,7 +24,7 @@
 //! Each fix is a few lines, marked `pTerminal delta:` in the vendored source and
 //! listed in `egui_term_vendored/mod.rs`. Terminal emulation itself is untouched.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -32,6 +32,11 @@ use std::sync::Arc;
 use crate::egui_term_vendored::{
     BackendSettings, PtyEvent, TerminalBackend, TerminalView,
 };
+use crate::hooks::{self, AgentStatus};
+use crate::resources::ProcSample;
+use crate::state::WorktreeInfo;
+use crate::git;
+use std::collections::HashSet;
 
 /// Scrollback retained per terminal, in lines.
 pub const SCROLLBACK_LINES: usize = 10_000;
@@ -123,6 +128,141 @@ impl TabTerm {
     /// `Some(code)` once the child process has exited.
     pub fn exited(&self) -> Option<i32> {
         self.exited
+    }
+}
+
+// --- Task 9: tab runtime — spawning agents and shells -----------------------
+//
+// `Tab` wraps a `TabTerm` with the bookkeeping the app (Task 10/11) needs to
+// render tab chrome and roll up resource usage: what kind of tab it is, its
+// worktree (if isolated), its status glyph, and the PIDs claimed for CPU/mem
+// rollup. `spawn_agent`/`spawn_shell` are the only ways to build one.
+//
+// Everything below is unused until Task 10 wires it into app.rs, so items are
+// individually `#[allow(dead_code)]` rather than silencing the whole module —
+// `TabTerm` above is already consumed by app.rs's spike wiring.
+
+/// What a [`Tab`] runs: an agent (Claude Code via `cmd.exe`) or a plain shell.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq)]
+pub enum TabKind { Agent, Shell }
+
+/// Parameters for [`spawn_agent`]. `main_repo_shared_md` always points at the
+/// MAIN checkout's shared context file — even when `isolate` is true and the
+/// agent actually runs in a worktree — because that file is meant to be a
+/// single coordination point for every agent working on the repo, not one per
+/// worktree. The app computes it once via `shared_ctx::ensure_shared_md`
+/// before building this spec.
+#[allow(dead_code)]
+pub struct SpawnSpec {
+    pub workspace_repo: PathBuf,
+    pub main_repo_shared_md: Option<PathBuf>,
+    pub prompt: String,
+    pub isolate: bool,
+}
+
+/// A running tab: its terminal plus everything the app needs to render tab
+/// chrome and roll up resource usage without re-deriving it every frame.
+#[allow(dead_code)]
+pub struct Tab {
+    pub id: u64,
+    pub title: String,
+    pub kind: TabKind,
+    pub term: TabTerm,
+    /// Shell tabs stay `AgentStatus::Unknown` and render no status glyph —
+    /// only agent tabs receive Claude Code hook events.
+    pub status: AgentStatus,
+    pub worktree: Option<WorktreeInfo>,
+    pub cwd: PathBuf,
+    /// PIDs claimed for resource rollup; see [`Tab::claim_pids`].
+    pub root_pids: Vec<u32>,
+    pub spawned_at: std::time::Instant,
+    pub cpu: f32,
+    pub mem: u64,
+}
+
+/// Spawns an agent tab: optionally creates an isolated worktree, writes the
+/// Claude Code hook settings that report status back through
+/// `hooks::events_file`, truncates any stale event file from a previous run
+/// of this tab id, then launches `claude` inside `cmd.exe` (it is an npm
+/// shim on Windows and cannot be exec'd directly) with the prompt as an
+/// argument.
+#[allow(dead_code)]
+pub fn spawn_agent(
+    ctx: &eframe::egui::Context,
+    id: u64,
+    spec: &SpawnSpec,
+) -> anyhow::Result<Tab> {
+    let slug = git::slug(&spec.prompt, id);
+    let (cwd, worktree) = if spec.isolate {
+        let wt = git::worktree_add(&spec.workspace_repo, &slug)?;
+        (wt.path.clone(), Some(wt))
+    } else {
+        (spec.workspace_repo.clone(), None)
+    };
+
+    hooks::write_settings(&cwd, id, spec.main_repo_shared_md.as_deref())?;
+    // truncate any stale event file from a previous run of this id
+    let _ = std::fs::write(hooks::events_file(id), "");
+
+    // claude is an npm shim on Windows -> run through cmd; strip quotes from prompt
+    let mut args: Vec<String> = vec!["/c".into(), "claude".into()];
+    let prompt = spec.prompt.replace('"', "");
+    if !prompt.is_empty() { args.push(prompt); }
+
+    let term = TabTerm::spawn(ctx, id, "cmd.exe", &args, &cwd)?;
+    Ok(Tab {
+        id,
+        title: slug,
+        kind: TabKind::Agent,
+        term,
+        status: AgentStatus::Unknown,
+        worktree,
+        cwd,
+        root_pids: vec![],
+        spawned_at: std::time::Instant::now(),
+        cpu: 0.0,
+        mem: 0,
+    })
+}
+
+/// Spawns a plain shell tab (`powershell.exe`) rooted at `cwd`. No worktree,
+/// no hooks, no status tracking beyond `AgentStatus::Unknown`.
+#[allow(dead_code)]
+pub fn spawn_shell(
+    ctx: &eframe::egui::Context,
+    id: u64,
+    cwd: &Path,
+) -> anyhow::Result<Tab> {
+    let term = TabTerm::spawn(ctx, id, "powershell.exe", &[], cwd)?;
+    Ok(Tab {
+        id,
+        title: "shell".into(),
+        kind: TabKind::Shell,
+        term,
+        status: AgentStatus::Unknown,
+        worktree: None,
+        cwd: cwd.to_path_buf(),
+        root_pids: vec![],
+        spawned_at: std::time::Instant::now(),
+        cpu: 0.0,
+        mem: 0,
+    })
+}
+
+impl Tab {
+    /// Claims the PIDs spawned as a direct result of this tab's launch, for
+    /// resource rollup. The caller (app.rs, Task 10) snapshots the set of our
+    /// own child PIDs *before* spawning, then calls this with each new
+    /// sampler snapshot until `root_pids` is non-empty or 5s have passed —
+    /// covers the delay between the ConPTY child appearing and the sampler's
+    /// next ~2s poll picking it up.
+    #[allow(dead_code)]
+    pub fn claim_pids(&mut self, before: &HashSet<u32>, snap: &[ProcSample]) {
+        if !self.root_pids.is_empty() { return; }
+        if self.spawned_at.elapsed() > std::time::Duration::from_secs(5) { return; }
+        self.root_pids =
+            crate::resources::new_children(before, snap, std::process::id());
     }
 }
 
