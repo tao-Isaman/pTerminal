@@ -9,13 +9,38 @@ pub fn events_file(tab_id: u64) -> PathBuf {
     events_dir().join(format!("tab-{tab_id}.events"))
 }
 
-pub fn status_from_events(contents: &str) -> AgentStatus {
-    match contents.lines().rev().find(|l| !l.trim().is_empty()).map(str::trim) {
-        Some("UserPromptSubmit") => AgentStatus::Working,
-        Some("Notification") => AgentStatus::NeedsYou,
-        Some("Stop") | Some("SessionStart") => AgentStatus::Idle,
+fn status_from_event_name(name: &str) -> AgentStatus {
+    match name {
+        "UserPromptSubmit" => AgentStatus::Working,
+        "Notification" => AgentStatus::NeedsYou,
+        "Stop" | "SessionStart" => AgentStatus::Idle,
         _ => AgentStatus::Unknown,
     }
+}
+
+pub fn status_from_events(contents: &str) -> AgentStatus {
+    let fast_path = contents.lines().rev().find(|l| !l.trim().is_empty()).map(str::trim);
+    if let Some(name) = fast_path {
+        let status = status_from_event_name(name);
+        if status != AgentStatus::Unknown {
+            return status;
+        }
+    }
+    // FINDING (Task 13 acceptance run): on this Windows/Claude Code combination, hook
+    // invocation doesn't run our `cmd /c echo EVENT>>file` command as a plain command —
+    // it interleaves cmd.exe startup banners and the hook's raw JSON payload into the
+    // file instead, so the bare-line fast path above never matches and the glyph was
+    // observed stuck on Unknown ("?") for an entire agent turn (live-verified: repro'd
+    // spawning a real agent tab, dumping the resulting events file, and confirming no
+    // line ever equals a bare event name). The JSON payload always carries
+    // `"hook_event_name":"X"` though, so fall back to recovering status from the last
+    // such marker in the file — same event set, same precedence (last wins).
+    contents
+        .rmatch_indices("\"hook_event_name\":\"")
+        .next()
+        .and_then(|(i, m)| contents[i + m.len()..].split('"').next())
+        .map(status_from_event_name)
+        .unwrap_or(AgentStatus::Unknown)
 }
 
 fn append_event_cmd(event: &str, file: &Path) -> String {
@@ -78,6 +103,32 @@ mod tests {
         assert_eq!(status_from_events("UserPromptSubmit\nStop\n"), AgentStatus::Idle);
         assert_eq!(status_from_events("Stop\ngarbage\n"), AgentStatus::Unknown);
         assert_eq!(status_from_events("Stop\n\n  \n"), AgentStatus::Idle); // trailing blanks ignored
+    }
+
+    /// FINDING (Task 13 acceptance run, live-repro'd against real `claude` v2.1.221 on
+    /// Windows): the hook runner never actually executes our `echo EVENT>>file` command
+    /// as configured — the events file instead fills up with interleaved cmd.exe startup
+    /// banners and the raw hook JSON payload (`{"...","hook_event_name":"X",...}`), so no
+    /// line is ever the bare event name the fast path above matches. These fixtures are
+    /// trimmed excerpts of an actually-captured events file.
+    #[test]
+    fn status_recovered_from_embedded_json_when_bare_line_never_appears() {
+        let session_start = concat!(
+            "Microsoft Windows [Version 10.0.26200.8875]\r\n",
+            "(c) Microsoft Corporation. All rights reserved.\r\n\r\n",
+            "C:\\wt\\a>{\"session_id\":\"x\",\"cwd\":\"C:\\\\wt\\\\a\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\"}\r\n\r\n",
+            "C:\\wt\\a>",
+        );
+        assert_eq!(status_from_events(session_start), AgentStatus::Idle);
+
+        let working = format!("{session_start}Microsoft Windows [Version 10.0.26200.8875]\r\n(c) Microsoft Corporation. All rights reserved.\r\n\r\nC:\\wt\\a>{{\"prompt_id\":\"p\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"hi\"}}\r\n\r\nC:\\wt\\a>");
+        assert_eq!(status_from_events(&working), AgentStatus::Working);
+
+        let needs_you = format!("{working}Microsoft Windows [Version 10.0.26200.8875]\r\n(c) Microsoft Corporation. All rights reserved.\r\n\r\nC:\\wt\\a>{{\"hook_event_name\":\"Notification\",\"message\":\"Claude is waiting\"}}\r\n\r\nC:\\wt\\a>");
+        assert_eq!(status_from_events(&needs_you), AgentStatus::NeedsYou);
+
+        let idle_again = format!("{working}Microsoft Windows [Version 10.0.26200.8875]\r\n(c) Microsoft Corporation. All rights reserved.\r\n\r\nC:\\wt\\a>{{\"hook_event_name\":\"Stop\",\"last_assistant_message\":\"done\"}}\r\n\r\nC:\\wt\\a>");
+        assert_eq!(status_from_events(&idle_again), AgentStatus::Idle);
     }
 
     #[test]
