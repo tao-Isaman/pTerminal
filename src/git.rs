@@ -2,24 +2,67 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use crate::state::WorktreeInfo;
 
+/// A failed `git` invocation. `stderr` is the raw stderr; `stdout` is the raw
+/// stdout, kept because **git does not put every failure reason on stderr**.
+/// The one that matters most here is `git merge`: a conflicting merge exits
+/// non-zero but prints the `CONFLICT (content): Merge conflict in <file>` /
+/// `Automatic merge failed` lines to *stdout*, leaving stderr empty. The
+/// close-tab merge flow renders this error verbatim in the "Merge stopped"
+/// dialog, so with stderr alone the user got a dialog that said nothing about
+/// what conflicted. [`Display`] therefore shows both.
 #[derive(Debug)]
-pub struct GitError { pub cmd: String, pub stderr: String }
+pub struct GitError { pub cmd: String, pub stderr: String, pub stdout: String }
+
+impl GitError {
+    /// stderr and stdout joined (in that order), skipping whichever is empty.
+    /// This is the whole reason `stdout` is carried — see the type's docs.
+    pub fn detail(&self) -> String {
+        let (e, o) = (self.stderr.trim_end(), self.stdout.trim_end());
+        match (e.is_empty(), o.is_empty()) {
+            (false, false) => format!("{e}\n{o}"),
+            (false, true) => e.to_string(),
+            (true, false) => o.to_string(),
+            (true, true) => String::new(),
+        }
+    }
+}
 
 impl std::fmt::Display for GitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "`{}` failed:\n{}", self.cmd, self.stderr)
+        write!(f, "`{}` failed:\n{}", self.cmd, self.detail())
     }
 }
 impl std::error::Error for GitError {}
 
+/// Builds the `git` child process. On Windows this adds `CREATE_NO_WINDOW`:
+/// the release binary is built with `windows_subsystem = "windows"` (no
+/// console of its own), so without the flag every single `git` call — the
+/// per-tab `is_dirty` checks included — pops a conhost window on screen for
+/// as long as git runs. Cheap to keep cross-platform, hence the cfg block.
+fn git_cmd(args: &[String]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 pub fn run(args: &[String]) -> Result<String, GitError> {
     let cmd = format!("git {}", args.join(" "));
-    let out = Command::new("git").args(args).output()
-        .map_err(|e| GitError { cmd: cmd.clone(), stderr: e.to_string() })?;
+    let out = git_cmd(args).output()
+        .map_err(|e| GitError { cmd: cmd.clone(), stderr: e.to_string(), stdout: String::new() })?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
-        Err(GitError { cmd, stderr: String::from_utf8_lossy(&out.stderr).into_owned() })
+        Err(GitError {
+            cmd,
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        })
     }
 }
 
@@ -35,8 +78,54 @@ pub fn is_git_repo(dir: &Path) -> bool {
             .map(|s| s.trim() == "true").unwrap_or(false)
 }
 
+/// The one file pTerminal writes into a worktree itself (see
+/// `term::spawn_agent`): the per-worktree hook routing Claude Code reads.
+/// It is pTerminal's own bookkeeping, never the user's work.
+const OUR_SETTINGS: &str = ".claude/settings.local.json";
+
+/// Extracts the path a `git status --porcelain` (v1) line refers to:
+/// two status chars, a space, then the path — with `old -> new` for renames
+/// (we want `new`), and the whole path wrapped in `"` when `core.quotePath`
+/// kicks in. Returns `None` for a line too short to be a status entry.
+fn porcelain_path(line: &str) -> Option<&str> {
+    let rest = line.get(3..)?.trim_start();
+    let path = match rest.rsplit_once(" -> ") {
+        Some((_, new)) => new,
+        None => rest,
+    };
+    Some(path.trim_matches('"'))
+}
+
+/// Whether `dir` has anything the user would call uncommitted work.
+///
+/// **pTerminal's own `.claude/settings.local.json` does not count.**
+/// `term::spawn_agent` writes that file into every isolated worktree to route
+/// Claude Code's hooks back to us; Claude Code normally adds it to
+/// `.git/info/exclude` itself, but that hasn't necessarily happened by the
+/// time we look (and never happens for a worktree Claude never opened). Left
+/// unfiltered, our own file made every fresh worktree permanently "dirty":
+/// merges refused with "worktree has uncommitted changes", and Discard always
+/// demanded the double-confirm meant for real unsaved work.
+///
+/// `--untracked-files=all` is deliberate: with git's default the untracked
+/// `.claude/` directory collapses into a single `?? .claude/` line, which
+/// can't be told apart from a `.claude/` holding real user files. Asking for
+/// per-file entries keeps the filter exact — anything else under `.claude/`
+/// still counts as dirt.
 pub fn is_dirty(dir: &Path) -> Result<bool, GitError> {
-    Ok(!run(&c(dir, &["status", "--porcelain"]))?.trim().is_empty())
+    let out = run(&c(dir, &["status", "--porcelain", "--untracked-files=all"]))?;
+    Ok(out.lines().any(|line| {
+        if line.trim().is_empty() {
+            return false;
+        }
+        match porcelain_path(line) {
+            // `.claude/` is the directory form, only reachable if some config
+            // overrode `-uall`; treated the same way rather than silently
+            // reporting dirt that is probably just our own file.
+            Some(p) => p != OUR_SETTINGS && p != ".claude/",
+            None => true,
+        }
+    }))
 }
 
 pub fn slug(prompt: &str, fallback_n: u64) -> String {
@@ -85,20 +174,22 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// `git -C <repo> -c <identity..> <args>`, panicking on failure.
+    fn g(repo: &Path, args: &[&str]) -> String {
+        let mut v: Vec<String> = vec!["-C".into(), repo.display().to_string(),
+            "-c".into(), "user.email=t@t".into(), "-c".into(), "user.name=t".into()];
+        v.extend(args.iter().map(|s| s.to_string()));
+        run(&v).unwrap()
+    }
+
     fn temp_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
-        let g = |args: &[&str]| {
-            let mut v: Vec<String> = vec!["-C".into(), repo.display().to_string(),
-                "-c".into(), "user.email=t@t".into(), "-c".into(), "user.name=t".into()];
-            v.extend(args.iter().map(|s| s.to_string()));
-            run(&v).unwrap();
-        };
-        g(&["init"]);
+        g(&repo, &["init"]);
         std::fs::write(repo.join("a.txt"), "hello").unwrap();
-        g(&["add", "."]);
-        g(&["commit", "-m", "init"]);
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "-m", "init"]);
         dir
     }
 
@@ -156,5 +247,62 @@ mod tests {
     fn errors_carry_stderr() {
         let e = run(&["definitely-not-a-command".into()]).unwrap_err();
         assert!(!e.stderr.is_empty());
+        // whatever landed on stderr must survive into what the user sees
+        assert!(e.detail().contains(e.stderr.trim_end()));
+        assert!(e.to_string().contains(e.stderr.trim_end()));
+    }
+
+    /// git prints merge conflicts to STDOUT, not stderr — without carrying
+    /// stdout the "Merge stopped" dialog showed an empty reason.
+    #[test]
+    fn merge_conflict_detail_comes_from_stdout() {
+        let dir = temp_repo();
+        let repo = dir.path().join("repo");
+        let base = g(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim().to_string();
+
+        g(&repo, &["checkout", "-b", "other"]);
+        std::fs::write(repo.join("a.txt"), "their side").unwrap();
+        g(&repo, &["commit", "-am", "theirs"]);
+
+        g(&repo, &["checkout", &base]);
+        std::fs::write(repo.join("a.txt"), "our side").unwrap();
+        g(&repo, &["commit", "-am", "ours"]);
+
+        let e = merge_branch(&repo, "other").unwrap_err();
+        assert!(e.stdout.contains("CONFLICT"), "stdout was {:?}", e.stdout);
+        assert!(e.detail().contains("CONFLICT"), "detail was {:?}", e.detail());
+        assert!(e.to_string().contains("a.txt"), "display was {}", e);
+    }
+
+    #[test]
+    fn porcelain_paths_parse() {
+        assert_eq!(porcelain_path("?? .claude/settings.local.json"), Some(".claude/settings.local.json"));
+        assert_eq!(porcelain_path(" M src/app.rs"), Some("src/app.rs"));
+        assert_eq!(porcelain_path("R  old.txt -> new.txt"), Some("new.txt"));
+        assert_eq!(porcelain_path("?? \".claude/settings.local.json\""), Some(".claude/settings.local.json"));
+        assert_eq!(porcelain_path("??"), None);
+    }
+
+    /// pTerminal's own hook-routing file must not read as the user's dirt,
+    /// or merges get refused and Discard always double-confirms.
+    #[test]
+    fn own_settings_file_is_not_dirt() {
+        let dir = temp_repo();
+        let repo = dir.path().join("repo");
+        assert!(!is_dirty(&repo).unwrap());
+
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(repo.join(".claude").join("settings.local.json"), "{}").unwrap();
+        assert!(!is_dirty(&repo).unwrap(), "our own settings file counted as dirt");
+
+        // the filter is exact — anything else under .claude/ is still dirt
+        let other = repo.join(".claude").join("notes.md");
+        std::fs::write(&other, "user work").unwrap();
+        assert!(is_dirty(&repo).unwrap(), "other .claude/ files must still count");
+        std::fs::remove_file(&other).unwrap();
+        assert!(!is_dirty(&repo).unwrap());
+
+        std::fs::write(repo.join("b.txt"), "real work").unwrap();
+        assert!(is_dirty(&repo).unwrap());
     }
 }
