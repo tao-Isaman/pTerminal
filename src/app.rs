@@ -133,6 +133,20 @@ pub struct PtApp {
     /// `false` implicitly by simply not being written the frame the panel
     /// is closed — nothing reads it while `show_ctx_panel` is `false`.
     pub ctx_panel_has_focus: bool,
+    /// Which workspace's `shared.md` `ctx_panel_text` currently holds,
+    /// independent of `self.active_ws` (recomputed every frame in
+    /// `show_ctx_panel_ui` from the active workspace's `repo_path`).
+    /// FINDING 1 fix: without this, switching the active workspace via the
+    /// sidebar while the F2 panel stayed open left the buffer showing the
+    /// OLD workspace's text while the save path silently followed the NEW
+    /// active workspace — clicking "save" would overwrite the wrong
+    /// workspace's `shared.md` with the wrong content. `show_ctx_panel_ui`
+    /// compares the active workspace's path against this field every frame
+    /// and reloads from disk on any mismatch (including the very first
+    /// frame the panel is shown, when this is `None`); the reload and save
+    /// paths both keep it in sync with whatever `ctx_panel_text` actually
+    /// reflects on disk.
+    pub ctx_panel_loaded_for: Option<PathBuf>,
     pub error: Option<String>,
     pub new_tab: Option<NewTabDraft>,
     pub closing: Option<CloseDraft>,
@@ -149,9 +163,15 @@ impl PtApp {
             .collect();
         // Watch the hooks events dir (tab status) plus every workspace's
         // `.pterminal` dir (F2 panel live-reload of shared.md). Rebuilt
-        // whenever a workspace is added — see `rebuild_watcher`.
-        let watcher = watcher::spawn_watcher(Self::watcher_dirs(&workspaces)).ok();
-        PtApp {
+        // whenever a workspace is added — see `rebuild_watcher`. Best-effort
+        // per directory (FINDING 2 fix) — see `watcher::spawn_watcher`'s
+        // docs: a single stale workspace path no longer takes down watching
+        // for every other, healthy workspace.
+        let (watcher, watch_err) = match watcher::spawn_watcher(Self::watcher_dirs(&workspaces)) {
+            Ok((w, rx, skipped)) => (Some((w, rx)), Self::describe_watch_skips(&skipped)),
+            Err(e) => (None, Some(format!("filesystem watcher failed to start: {e}"))),
+        };
+        let mut app = PtApp {
             base,
             workspaces,
             active_ws: 0,
@@ -165,10 +185,18 @@ impl PtApp {
             show_ctx_panel: false,
             ctx_panel_text: String::new(),
             ctx_panel_has_focus: false,
+            ctx_panel_loaded_for: None,
             error: corrupt_msg,
             new_tab: None,
             closing: None,
+        };
+        // Don't let a watcher-skip notice clobber a state-corruption error
+        // (set above via `corrupt_msg`) — that one is the more actionable /
+        // severe of the two if both happen to fire on the same launch.
+        if app.error.is_none() {
+            app.error = watch_err;
         }
+        app
     }
 
     /// Directories the filesystem watcher should cover: the hooks events
@@ -192,9 +220,47 @@ impl PtApp {
     /// forwarding events into a receiver nothing drains anymore. Called
     /// from `finish_add_workspace`; a failure to rebuild degrades to no
     /// live-reload/status-watching at all (`self.watcher = None`) rather
-    /// than panicking, same as the original construction in `new`.
+    /// than panicking, same as the original construction in `new`. Any
+    /// per-directory skips (FINDING 2) are surfaced via `self.error`, same
+    /// as `new`, so a stale workspace path added later in the session is
+    /// reported instead of silently going dark.
     fn rebuild_watcher(&mut self) {
-        self.watcher = watcher::spawn_watcher(Self::watcher_dirs(&self.workspaces)).ok();
+        match watcher::spawn_watcher(Self::watcher_dirs(&self.workspaces)) {
+            Ok((w, rx, skipped)) => {
+                self.watcher = Some((w, rx));
+                if let Some(msg) = Self::describe_watch_skips(&skipped) {
+                    self.error = Some(msg);
+                }
+            }
+            Err(e) => {
+                self.watcher = None;
+                self.error = Some(format!("filesystem watcher failed to restart: {e}"));
+            }
+        }
+    }
+
+    /// Formats a one-line summary of directories `spawn_watcher` couldn't
+    /// watch, for `self.error`, or `None` if nothing was skipped. Documented
+    /// choice (FINDING 2): surfaced through the existing `self.error` banner
+    /// rather than a new UI element — it's the same mechanism already used
+    /// for every other non-fatal, session-wide degradation in this module
+    /// (save failures, corrupt state, folder-pick errors), so it doesn't
+    /// need a second notification path, and it fires once per
+    /// spawn/rebuild rather than spamming every frame.
+    fn describe_watch_skips(skipped: &[(PathBuf, String)]) -> Option<String> {
+        if skipped.is_empty() {
+            return None;
+        }
+        let detail = skipped
+            .iter()
+            .map(|(p, e)| format!("{} ({e})", p.display()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let noun = if skipped.len() == 1 { "directory" } else { "directories" };
+        Some(format!(
+            "watcher: could not watch {} {noun}, status glyphs / shared.md live-reload will not update for them: {detail}",
+            skipped.len()
+        ))
     }
 
     pub fn persist(&mut self) {
@@ -482,7 +548,8 @@ impl PtApp {
     }
 
     /// The F2 shared-context panel: shows/edits the active workspace's
-    /// `shared.md`. Adapted from the brief's reference snippet in two ways:
+    /// `shared.md`. Adapted from the brief's reference snippet in three
+    /// ways:
     ///
     /// 1. **Focus tracking (the FOCUS fix `term::TabTerm::ui`'s docs call
     ///    for).** The `TextEdit`'s response is captured into
@@ -496,6 +563,20 @@ impl PtApp {
     ///    `<repo>/.pterminal/` doesn't exist yet (e.g. a workspace where no
     ///    agent has ever been spawned, so `shared_ctx::ensure_shared_md`
     ///    was never called). Save now creates the parent directory first.
+    /// 3. **Per-workspace buffer tracking (FINDING 1 fix).** `path` below is
+    ///    recomputed from `self.active_ws` every frame, but
+    ///    `ctx_panel_text` used to only be refilled on an explicit reload
+    ///    click, an empty buffer, or a watcher event — NOT on an active-
+    ///    workspace switch. With the panel open, clicking a different
+    ///    workspace row in the sidebar (still clickable — the panel doesn't
+    ///    grab exclusive input) left the buffer showing the OLD workspace's
+    ///    text while `path` already pointed at the NEW one; clicking "save"
+    ///    then silently overwrote the wrong workspace's `shared.md` with
+    ///    the wrong content (data loss, no error). `ctx_panel_loaded_for`
+    ///    now tracks which workspace's path the buffer was last loaded
+    ///    from/saved to; every frame, a mismatch against the current
+    ///    `path` forces a reload from disk before anything else (a save,
+    ///    in particular) can act on stale content.
     fn show_ctx_panel_ui(&mut self, ctx: &egui::Context) {
         if !self.show_ctx_panel {
             // BUG FOUND IN MANUAL VERIFICATION: without this reset,
@@ -517,12 +598,29 @@ impl PtApp {
         }
         let Some(ws) = self.workspaces.get(self.active_ws) else { return };
         let path = crate::shared_ctx::shared_md_path(&ws.meta.repo_path);
+
+        // FINDING 1 fix: reload whenever the active workspace's path no
+        // longer matches what the buffer was last loaded from — including
+        // the very first frame the panel is ever shown, when
+        // `ctx_panel_loaded_for` is still `None`. This replaces the brief's
+        // `self.ctx_panel_text.is_empty()` heuristic (which also had the
+        // latent problem of re-reading from disk on every frame the user
+        // had legitimately deleted all the text, clobbering an intentional
+        // empty buffer) with a check that's precise about *why* a reload is
+        // needed.
+        let switched = self.ctx_panel_loaded_for.as_deref() != Some(path.as_path());
+        if switched {
+            self.ctx_panel_text = std::fs::read_to_string(&path).unwrap_or_default();
+            self.ctx_panel_loaded_for = Some(path.clone());
+        }
+
         let mut has_focus = false;
         egui::SidePanel::right("shared_ctx").default_width(360.0).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("shared.md");
-                if ui.button("reload").clicked() || self.ctx_panel_text.is_empty() {
+                if ui.button("reload").clicked() {
                     self.ctx_panel_text = std::fs::read_to_string(&path).unwrap_or_default();
+                    self.ctx_panel_loaded_for = Some(path.clone());
                 }
                 if ui.button("save").clicked() {
                     // Adaptation 2 (see doc comment above): ensure the
@@ -539,6 +637,8 @@ impl PtApp {
                     if dir_ok {
                         if let Err(e) = std::fs::write(&path, &self.ctx_panel_text) {
                             self.error = Some(format!("could not save shared.md: {e}"));
+                        } else {
+                            self.ctx_panel_loaded_for = Some(path.clone());
                         }
                     }
                 }
@@ -549,6 +649,20 @@ impl PtApp {
                 has_focus = resp.has_focus();
             });
         });
+        // The TextEdit above is the same widget (same call site / auto id)
+        // every frame, so egui persists its focus by id across frames
+        // regardless of content — if it held focus in the OLD workspace's
+        // buffer, `resp.has_focus()` can still read `true` this frame even
+        // though the content just got swapped out from under the cursor
+        // for a workspace switch. Force our own tracking bool false in
+        // that case (same fix in spirit as the panel-close case above):
+        // `update`'s `focused` bool ANDs in `!ctx_panel_has_focus`, so an
+        // incorrectly-true value here would keep the active terminal
+        // permanently starved of focus after a workspace switch made while
+        // the panel was open.
+        if switched {
+            has_focus = false;
+        }
         self.ctx_panel_has_focus = has_focus;
     }
 
