@@ -8,6 +8,10 @@
 //! [`term::TabTerm::set_visible`] must likewise be kept in sync every frame
 //! (true only for the active tab of the active workspace) so background tabs
 //! only request lazy repaints. Both happen together in [`PtApp::drain_events`].
+//! The same invariant is why the native folder-picker dialog in
+//! [`PtApp::add_workspace`] is never opened on the UI thread: a blocking
+//! modal call there would stall `update` for as long as the dialog is open,
+//! and with it every tab's poll — see that function's docs.
 
 use crate::hooks::{self, AgentStatus};
 use crate::resources::{MachineStats, ProcSample};
@@ -18,12 +22,27 @@ use eframe::egui;
 use notify::RecommendedWatcher;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 pub struct WsRt {
     pub meta: state::Workspace,
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
+}
+
+/// Identity of a resource-rollup PID claim in flight, for a tab that was just
+/// spawned. Tracked by **id**, not by `(workspace index, tab index)`
+/// coordinates: a workspace switch or a tab close during the ≤5s claim
+/// window would otherwise misdirect the claim onto whatever now sits at that
+/// index, or silently drop it. `ws_index` is kept only as a fast-path hint —
+/// [`PtApp::drain_events`] falls back to searching every workspace by
+/// `tab_id` when the hint misses (e.g. an earlier workspace was removed,
+/// shifting indices). Fields are `pub`: Task 11 constructs this the moment it
+/// spawns a tab.
+pub struct PendingClaim {
+    pub ws_index: usize,
+    pub tab_id: u64,
+    pub before: HashSet<u32>,
 }
 
 /// Draft state for the "new tab" dialog. Populated by shortcuts/buttons in
@@ -51,7 +70,12 @@ pub struct PtApp {
     pub last_snap: Vec<ProcSample>,
     pub machine: MachineStats,
     pub watcher: Option<(RecommendedWatcher, Receiver<PathBuf>)>,
-    pub pending_claim: Option<HashSet<u32>>,
+    pub pending_claim: Option<PendingClaim>,
+    /// Result channel for an in-flight "+ workspace" folder pick, run on a
+    /// worker thread so the modal native dialog never blocks the UI thread
+    /// (see [`PtApp::add_workspace`]). `Some` while a pick is outstanding;
+    /// used to ignore repeat clicks so two dialogs can't open at once.
+    pub pending_folder_pick: Option<Receiver<Option<PathBuf>>>,
     pub show_ctx_panel: bool,
     #[allow(dead_code)] // populated here, rendered by Task 12's show_ctx_panel_ui
     pub ctx_panel_text: String,
@@ -79,6 +103,7 @@ impl PtApp {
             machine: MachineStats::default(),
             watcher,
             pending_claim: None,
+            pending_folder_pick: None,
             show_ctx_panel: false,
             ctx_panel_text: String::new(),
             error: corrupt_msg,
@@ -97,38 +122,77 @@ impl PtApp {
         }
     }
 
+    /// Opens the native "pick a folder" dialog on a worker thread and
+    /// returns immediately. `rfd::FileDialog::pick_folder` is a blocking
+    /// modal call — running it on the UI thread would freeze `update`, and
+    /// with it every tab's `poll()`/`set_visible()` (the perf-critical
+    /// invariant this module's docs open with): no terminal would drain its
+    /// PTY channel for as long as the dialog stayed open. The result is
+    /// picked up in [`PtApp::drain_events`] via `pending_folder_pick`.
+    ///
+    /// Ignores the request if a pick is already outstanding, so clicking
+    /// "+ workspace" twice can't open two native dialogs at once.
     fn add_workspace(&mut self) {
-        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-            let name = folder
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| folder.display().to_string());
-            let is_git = crate::git::is_git_repo(&folder);
-            self.workspaces.push(WsRt {
-                meta: state::Workspace {
-                    name,
-                    repo_path: folder,
-                    is_git,
-                    default_isolate: is_git,
-                    kept_worktrees: vec![],
-                },
-                tabs: vec![],
-                active_tab: 0,
-            });
-            self.active_ws = self.workspaces.len() - 1;
-            self.persist();
+        if self.pending_folder_pick.is_some() {
+            return;
         }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let folder = rfd::FileDialog::new().pick_folder();
+            let _ = tx.send(folder); // app may have exited; a dropped receiver is fine
+        });
+        self.pending_folder_pick = Some(rx);
+    }
+
+    /// Finishes the flow started by [`PtApp::add_workspace`] once the picked
+    /// folder is known: builds the `Workspace` record and persists it.
+    /// `git::is_git_repo` shells out to `git`, but it's a one-shot check run
+    /// exactly once at pick-completion (not per-frame), so doing it here on
+    /// the UI thread rather than in the worker thread is cheap enough not to
+    /// matter — kept here because `add_workspace` never has to touch
+    /// `self.workspaces`/`persist` from the worker thread this way.
+    fn finish_add_workspace(&mut self, folder: PathBuf) {
+        let name = folder
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| folder.display().to_string());
+        let is_git = crate::git::is_git_repo(&folder);
+        self.workspaces.push(WsRt {
+            meta: state::Workspace {
+                name,
+                repo_path: folder,
+                is_git,
+                default_isolate: is_git,
+                kept_worktrees: vec![],
+            },
+            tabs: vec![],
+            active_tab: 0,
+        });
+        self.active_ws = self.workspaces.len() - 1;
+        self.persist();
     }
 
     /// Per-frame event pump: drains the resource sampler, applies hook-event
-    /// status changes, claims PIDs for a freshly spawned tab, and — for every
-    /// tab of every workspace — drains its PTY channel, notices exit, syncs
-    /// visibility, and rolls up CPU/mem.
+    /// status changes, picks up a completed folder dialog, claims PIDs for a
+    /// freshly spawned tab, and — for every tab of every workspace — drains
+    /// its PTY channel, notices exit, syncs visibility, and rolls up CPU/mem.
     fn drain_events(&mut self) {
         // resource snapshots
         while let Ok((snap, machine)) = self.sampler.try_recv() {
             self.last_snap = snap;
             self.machine = machine;
+        }
+        // pick up a completed (or cancelled) "+ workspace" folder dialog
+        if let Some(rx) = &self.pending_folder_pick {
+            match rx.try_recv() {
+                Ok(Some(folder)) => {
+                    self.pending_folder_pick = None;
+                    self.finish_add_workspace(folder);
+                }
+                Ok(None) => self.pending_folder_pick = None, // user cancelled the dialog
+                Err(TryRecvError::Empty) => {} // still waiting on the worker thread
+                Err(TryRecvError::Disconnected) => self.pending_folder_pick = None, // thread died
+            }
         }
         // hook event files -> tab statuses
         let changed: Vec<PathBuf> = self
@@ -155,20 +219,46 @@ impl PtApp {
                 }
             }
         }
-        // claim pids for freshly spawned tabs, update per-tab resource numbers
-        if let Some(before) = self.pending_claim.clone() {
-            let snap = self.last_snap.clone();
-            let mut done = false;
-            if let Some(tab) = self
+        // Claim PIDs for a freshly spawned tab, tracked by identity (not by
+        // `(workspace index, tab index)`) so a workspace switch or a tab
+        // close during the ≤5s claim window can't misdirect the claim onto
+        // whatever now sits at that index, or silently drop it.
+        if let Some(claim) = self.pending_claim.take() {
+            // Locate the tab by id: try the recorded workspace index first
+            // (the common, fast path — nothing moved), then fall back to
+            // scanning every workspace in case indices shifted since the
+            // claim was recorded (e.g. an earlier workspace was removed).
+            // Immutable lookup first so there's never more than one mutable
+            // borrow of `self.workspaces` in flight at a time.
+            let location = self
                 .workspaces
-                .get_mut(self.active_ws)
-                .and_then(|w| w.tabs.last_mut())
-            {
-                tab.claim_pids(&before, &snap);
-                done = !tab.root_pids.is_empty() || tab.spawned_at.elapsed().as_secs() > 5;
-            }
-            if done {
-                self.pending_claim = None;
+                .get(claim.ws_index)
+                .and_then(|ws| ws.tabs.iter().position(|t| t.id == claim.tab_id))
+                .map(|tab_idx| (claim.ws_index, tab_idx))
+                .or_else(|| {
+                    self.workspaces.iter().enumerate().find_map(|(wi, ws)| {
+                        ws.tabs.iter().position(|t| t.id == claim.tab_id).map(|ti| (wi, ti))
+                    })
+                });
+            match location {
+                Some((wi, ti)) => {
+                    let snap = self.last_snap.clone();
+                    let tab = &mut self.workspaces[wi].tabs[ti];
+                    tab.claim_pids(&claim.before, &snap);
+                    let done = !tab.root_pids.is_empty() || tab.spawned_at.elapsed().as_secs() > 5;
+                    if !done {
+                        // still pending: put it back, refreshing the index hint
+                        self.pending_claim = Some(PendingClaim {
+                            ws_index: wi,
+                            tab_id: claim.tab_id,
+                            before: claim.before,
+                        });
+                    }
+                }
+                // Tab closed (or its workspace closed) during the claim
+                // window — nothing left to claim for; drop it rather than
+                // spin on a target that no longer exists.
+                None => {}
             }
         }
         // Every tab of every workspace: drain its PTY channel (poll), notice
