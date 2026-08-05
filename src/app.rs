@@ -959,6 +959,15 @@ impl PtApp {
         }
 
         let ws_index = match self.workspaces.iter().position(|ws| paths_match(&ws.meta.repo_path, &cmd.dir)) {
+            // Final-review finding 5: never resume INTO the reserved
+            // orchestrator workspace — its tabs are unclosable by construction,
+            // so a `pterminal resume --dir <orch dir>` would otherwise graft a
+            // permanent, undeletable duplicate agent tab onto it. Surface the
+            // reason and skip rather than spawn.
+            Some(i) if self.workspaces[i].meta.is_orchestrator => {
+                self.error = Some("resume: cannot resume into the orchestrator workspace".to_string());
+                return;
+            }
             Some(i) => i,
             None => {
                 self.finish_add_workspace(cmd.dir.clone());
@@ -986,6 +995,7 @@ impl PtApp {
         let Some(ws) = self.workspaces.get_mut(ws_index) else { return };
         let repo = ws.meta.repo_path.clone();
         let is_git = ws.meta.is_git;
+        let is_orchestrator = ws.meta.is_orchestrator;
 
         // Direct-mode hook takeover (see `dialogs::open_tab`'s doc comment
         // for the full rationale): this resume is always a direct
@@ -1002,8 +1012,8 @@ impl PtApp {
             }
         }
 
-        let (shared, agent_readme) = if is_git {
-            let shared = match shared_ctx::ensure_shared_md(&repo) {
+        let shared = if is_git {
+            match shared_ctx::ensure_shared_md(&repo) {
                 Ok(p) => {
                     if shared_ctx::gitignore_needs_entry(&repo) {
                         if let Err(e) = shared_ctx::add_gitignore_entry(&repo) {
@@ -1016,11 +1026,16 @@ impl PtApp {
                     self.error = Some(e.to_string());
                     None
                 }
-            };
-            (shared, shared_ctx::write_agent_readme(&repo).ok())
+            }
         } else {
-            (None, None)
+            None
         };
+        // Final-review finding 5: route the README choice through the shared
+        // helper so an orchestrator-dir tab gets its orchestrator README rather
+        // than none. (This resume path already refuses the orchestrator above,
+        // so `is_orchestrator` is `false` here in practice — kept for a single
+        // spawn-time source of truth across every spawn site.)
+        let agent_readme = agent_readme_for_spawn(is_orchestrator, is_git, &repo);
 
         let existing_titles: Vec<String> =
             ws.tabs.iter().filter(|t| t.kind == TabKind::Agent).map(|t| t.title.clone()).collect();
@@ -2680,12 +2695,16 @@ impl PtApp {
         let kind = old.kind;
         let repo = ws.meta.repo_path.clone();
         let is_git = ws.meta.is_git;
+        let is_orchestrator = ws.meta.is_orchestrator;
 
         let result = match kind {
             TabKind::Shell => term::spawn_shell(ctx, id, &repo),
             TabKind::Agent => {
                 let shared = if is_git { shared_ctx::ensure_shared_md(&repo).ok() } else { None };
-                let agent_readme = if is_git { shared_ctx::write_agent_readme(&repo).ok() } else { None };
+                // Final-review finding 5: choose the README via the shared
+                // helper so an orchestrator-dir tab respawns with its
+                // orchestrator README instead of none.
+                let agent_readme = agent_readme_for_spawn(is_orchestrator, is_git, &repo);
                 term::spawn_agent(
                     ctx,
                     id,
