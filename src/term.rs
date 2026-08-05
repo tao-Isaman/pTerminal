@@ -30,7 +30,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 use crate::egui_term_vendored::{
-    BackendSettings, PtyEvent, TerminalBackend, TerminalView,
+    BackendCommand, BackendSettings, PtyEvent, TerminalBackend, TerminalView,
 };
 use crate::hooks::{self, AgentStatus};
 use crate::resources::ProcSample;
@@ -147,6 +147,17 @@ impl TabTerm {
     pub fn exited(&self) -> Option<i32> {
         self.exited
     }
+
+    /// Writes raw bytes to the child's stdin, the same path `view.rs` uses
+    /// for keystrokes (`BackendCommand::Write`) — this is how Task 5's
+    /// message delivery and any future programmatic input reach the PTY.
+    /// The caller is responsible for appending `\r` (ConPTY Enter) when a
+    /// submission — not just text sitting on the input line — is intended.
+    #[allow(dead_code)] // consumed in Task 5
+    pub fn write_input(&mut self, text: &str) {
+        self.backend
+            .process_command(BackendCommand::Write(text.as_bytes().to_vec()));
+    }
 }
 
 // --- Task 9: tab runtime — spawning agents and shells -----------------------
@@ -170,11 +181,48 @@ pub enum TabKind { Agent, Shell }
 /// single coordination point for every agent working on the repo, not one per
 /// worktree. The app computes it once via `shared_ctx::ensure_shared_md`
 /// before building this spec.
+///
+/// **Resume fields (Task 3; wired end-to-end by Task 5).** `resume_session`,
+/// `title`, and `worktree` only matter together: when `resume_session` is
+/// `Some`, `spawn_agent` runs `claude --resume <sid>` with no prompt, reuses
+/// `worktree` verbatim if its path still exists on disk (the saved worktree
+/// from the tab's first spawn) instead of creating a new one, and ignores
+/// `isolate` entirely — a resumed session must land back in the exact cwd it
+/// last ran in, never a fresh isolated worktree. `title`, when `Some`,
+/// overrides the slugged-prompt title (used as-is for both the tab title and
+/// `HookSetup::agent_name`); Task 5 pre-computes it with [`unique_title`] so
+/// a resumed or duplicate-prompt tab never collides with a live one.
 pub struct SpawnSpec {
     pub workspace_repo: PathBuf,
     pub main_repo_shared_md: Option<PathBuf>,
     pub prompt: String,
     pub isolate: bool,
+    /// Per-agent README (`shared_ctx::write_agent_readme`), threaded into
+    /// `HookSetup::agent_readme`. `None` when the workspace isn't a git repo
+    /// or the README couldn't be written (best-effort, same as `shared_md`).
+    pub agent_readme: Option<PathBuf>,
+    /// `claude --resume <sid>` instead of a fresh prompt-driven launch.
+    pub resume_session: Option<String>,
+    /// Pre-computed unique tab title; `None` means "slug the prompt as
+    /// today" (fresh, non-resume spawns from the new-tab dialog).
+    pub title: Option<String>,
+    /// A worktree to reuse (resume path) rather than create. Ignored for a
+    /// fresh spawn unless its path happens to exist and `resume_session` is
+    /// also `Some` — see the struct doc above.
+    pub worktree: Option<WorktreeInfo>,
+}
+
+/// A virtual child tab for one subagent invocation (Claude Code's `Task`
+/// tool) inside a parent agent tab, tracked from `PreToolUse`/`SubagentStop`
+/// hook events — not a real ConPTY child of its own, just bookkeeping for the
+/// tab strip's `└ <desc>` row. Consumed by Task 5 (child-tab UI + lifecycle:
+/// pushed on `PreToolUse`, `done_at` set on `SubagentStop`, pruned a few
+/// seconds after completion).
+#[allow(dead_code)] // consumed in Task 5
+pub struct SubTab {
+    pub desc: String,
+    pub started: std::time::Instant,
+    pub done_at: Option<std::time::Instant>,
 }
 
 /// A running tab: its terminal plus everything the app needs to render tab
@@ -195,6 +243,66 @@ pub struct Tab {
     pub spawned_at: std::time::Instant,
     pub cpu: f32,
     pub mem: u64,
+    /// Most recently observed Claude Code session id for this tab, read from
+    /// `SessionStart`/etc. hook events (`hooks::latest_session_id`). Persisted
+    /// (`state::SavedTab::session_id`) so a restart can `--resume` it.
+    #[allow(dead_code)] // consumed in Task 5
+    pub session_id: Option<String>,
+    /// `Some(saved cwd)` when this tab is the missing-directory placeholder
+    /// built on restart for a saved tab whose cwd no longer exists.
+    #[allow(dead_code)] // consumed in Task 5
+    pub missing_dir: Option<PathBuf>,
+    /// Live subagent children, oldest first; see [`SubTab`].
+    #[allow(dead_code)] // consumed in Task 5
+    pub children: Vec<SubTab>,
+    /// How many parsed `EventRecord`s (`hooks::parse_events`) have already
+    /// been consumed for `children` bookkeeping — the drain loop only looks
+    /// at `records[events_seen..]` each frame.
+    #[allow(dead_code)] // consumed in Task 5
+    pub events_seen: usize,
+}
+
+/// Builds the `cmd /c claude ...` argv for an agent tab: a fresh prompt-driven
+/// launch when `resume` is `None` (existing behavior — quotes stripped from
+/// the prompt since Windows' unescaped `cmd /c` would otherwise choke on
+/// them, and the prompt arg is omitted entirely when empty), or
+/// `--resume <sid>` with no prompt at all when `resume` is `Some`. `prompt`
+/// is ignored in the resume case — a resumed session continues where it left
+/// off, it isn't re-primed.
+pub fn agent_args(prompt: &str, resume: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec!["/c".into(), "claude".into()];
+    match resume {
+        Some(sid) => {
+            args.push("--resume".into());
+            args.push(sid.into());
+        }
+        None => {
+            let prompt = prompt.replace('"', "");
+            if !prompt.is_empty() {
+                args.push(prompt);
+            }
+        }
+    }
+    args
+}
+
+/// Returns `base` if it isn't in `taken`, else the first `base-2`, `base-3`,
+/// … suffix that is. Used to keep agent tab titles unique within a
+/// workspace (message delivery in Task 5 addresses agents by title, so a
+/// collision would make `to: "<title>"` ambiguous).
+#[allow(dead_code)] // consumed in Task 5
+pub fn unique_title(base: &str, taken: &[String]) -> String {
+    if !taken.iter().any(|t| t == base) {
+        return base.to_string();
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !taken.iter().any(|t| t == &candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Spawns an agent tab: optionally creates an isolated worktree, writes the
@@ -216,25 +324,39 @@ pub struct Tab {
 /// older tab's `status` to `AgentStatus::Unknown` at the moment of the new
 /// spawn, since its hook routing has just been silently taken over.
 ///
-/// **Partial-failure rollback.** Once `git::worktree_add` has created a
-/// worktree (`isolate: true`), a later failure (`hooks::write_settings` or
-/// `TabTerm::spawn`) does not leak it: the worktree and its `pt/<slug>`
-/// branch are removed best-effort before the error is returned, and the
-/// error explains whether that rollback succeeded — if it didn't, it names
-/// the path that needs manual cleanup. The direct-mode (`isolate: false`)
-/// path has nothing to roll back.
+/// **Partial-failure rollback.** When THIS call creates a worktree (the
+/// fresh, non-resume `isolate: true` path via `git::worktree_add`), a later
+/// failure (`hooks::write_settings` or `TabTerm::spawn`) does not leak it:
+/// the worktree and its `pt/<slug>` branch are removed best-effort before the
+/// error is returned, and the error explains whether that rollback succeeded
+/// — if it didn't, it names the path that needs manual cleanup. Direct-mode
+/// (`isolate: false`) spawns and resumed spawns that REUSE an existing
+/// worktree (`spec.worktree`) have nothing of their own to roll back — a
+/// resume failure must never delete the worktree an earlier, successful
+/// spawn created.
 pub fn spawn_agent(
     ctx: &eframe::egui::Context,
     id: u64,
     spec: &SpawnSpec,
 ) -> anyhow::Result<Tab> {
     let slug = git::slug(&spec.prompt, id);
-    let (cwd, worktree) = if spec.isolate {
-        let wt = git::worktree_add(&spec.workspace_repo, &slug)?;
-        (wt.path.clone(), Some(wt))
-    } else {
-        (spec.workspace_repo.clone(), None)
-    };
+    let title = spec.title.clone().unwrap_or_else(|| slug.clone());
+
+    // Resume never creates a worktree — `isolate` is ignored entirely for it
+    // (see the SpawnSpec doc comment): reuse `spec.worktree` when its path is
+    // still present on disk, else fall back to the main checkout (matches
+    // how a direct-mode tab's cwd was originally chosen). A fresh spawn keeps
+    // today's `isolate`-driven creation.
+    let reused_worktree = spec.worktree.as_ref().filter(|wt| wt.path.exists());
+    let (cwd, worktree, created_worktree): (PathBuf, Option<WorktreeInfo>, bool) =
+        match reused_worktree {
+            Some(wt) => (wt.path.clone(), Some(wt.clone()), false),
+            None if spec.resume_session.is_none() && spec.isolate => {
+                let wt = git::worktree_add(&spec.workspace_repo, &slug)?;
+                (wt.path.clone(), Some(wt), true)
+            }
+            None => (spec.workspace_repo.clone(), None, false),
+        };
 
     // Everything past this point can fail after the worktree already exists
     // on disk. Run it as a unit so any error can trigger rollback below
@@ -243,24 +365,20 @@ pub fn spawn_agent(
         let hook_setup = hooks::HookSetup {
             tab_id: id,
             shared_md: spec.main_repo_shared_md.as_deref(),
-            // Task 5 threads the real per-agent README once dialogs.rs
-            // (open_tab) generates one via shared_ctx::write_agent_readme.
-            agent_readme: None,
-            agent_name: &slug,
+            agent_readme: spec.agent_readme.as_deref(),
+            agent_name: &title,
         };
         hooks::write_settings(&cwd, &hook_setup)?;
         // truncate any stale event file from a previous run of this id
         let _ = std::fs::write(hooks::events_file(id), "");
 
-        // claude is an npm shim on Windows -> run through cmd; strip quotes from prompt
-        let mut args: Vec<String> = vec!["/c".into(), "claude".into()];
-        let prompt = spec.prompt.replace('"', "");
-        if !prompt.is_empty() { args.push(prompt); }
+        // claude is an npm shim on Windows -> run through cmd.
+        let args = agent_args(&spec.prompt, spec.resume_session.as_deref());
 
         let term = TabTerm::spawn(ctx, id, "cmd.exe", &args, &cwd)?;
         Ok(Tab {
             id,
-            title: slug.clone(),
+            title: title.clone(),
             kind: TabKind::Agent,
             term,
             status: AgentStatus::Unknown,
@@ -270,28 +388,32 @@ pub fn spawn_agent(
             spawned_at: std::time::Instant::now(),
             cpu: 0.0,
             mem: 0,
+            session_id: None,
+            missing_dir: None,
+            children: vec![],
+            events_seen: 0,
         })
     })();
 
     match build {
         Ok(tab) => Ok(tab),
-        Err(err) => match &worktree {
-            // Nothing was created for the direct-mode path; propagate as-is.
-            None => Err(err),
-            Some(wt) => {
-                let rollback = git::worktree_remove(&spec.workspace_repo, &wt.path, true)
-                    .and_then(|_| git::delete_branch(&spec.workspace_repo, &wt.branch));
-                match rollback {
-                    Ok(()) => Err(err.context(
-                        "spawn failed after worktree creation; worktree rolled back",
-                    )),
-                    Err(rollback_err) => Err(err.context(format!(
-                        "spawn failed after worktree creation; rollback also failed: \
-                         {rollback_err}, clean up manually: {}",
-                        wt.path.display(),
-                    ))),
-                }
-            },
+        Err(err) if !created_worktree => Err(err),
+        Err(err) => {
+            // `created_worktree` is only true when `worktree` is `Some` (see
+            // the match above), so this unwrap can't fail.
+            let wt = worktree.expect("created_worktree implies worktree is Some");
+            let rollback = git::worktree_remove(&spec.workspace_repo, &wt.path, true)
+                .and_then(|_| git::delete_branch(&spec.workspace_repo, &wt.branch));
+            match rollback {
+                Ok(()) => Err(err.context(
+                    "spawn failed after worktree creation; worktree rolled back",
+                )),
+                Err(rollback_err) => Err(err.context(format!(
+                    "spawn failed after worktree creation; rollback also failed: \
+                     {rollback_err}, clean up manually: {}",
+                    wt.path.display(),
+                ))),
+            }
         },
     }
 }
@@ -316,6 +438,10 @@ pub fn spawn_shell(
         spawned_at: std::time::Instant::now(),
         cpu: 0.0,
         mem: 0,
+        session_id: None,
+        missing_dir: None,
+        children: vec![],
+        events_seen: 0,
     })
 }
 
@@ -352,6 +478,17 @@ impl Tab {
     /// claim by itself — the caller (`app.rs`) must snapshot its own
     /// children *before* calling `respawn` and hand that snapshot to a new
     /// `PendingClaim`, the same dance `open_tab` does for a brand-new tab.
+    ///
+    /// **Deliberate no-change (Task 3).** Even though this tab may have a
+    /// known `session_id` by now, restart still reruns a bare `cmd /c claude`
+    /// rather than `agent_args(_, self.session_id.as_deref())` — i.e.
+    /// "Restart" does not `--resume`. Task 5 owns that decision (it also has
+    /// to decide what happens to `session_id`/`children` display mid-restart
+    /// app-wide); this task only guarantees the new bookkeeping fields reset
+    /// to their spawn-time defaults here exactly as `spawn_agent`/
+    /// `spawn_shell` do, same reasoning as the events-file truncation below:
+    /// a fresh child means fresh bookkeeping, not leftover state from the
+    /// dead process.
     pub fn respawn(&mut self, ctx: &eframe::egui::Context) -> anyhow::Result<()> {
         let term = match self.kind {
             TabKind::Agent => {
@@ -364,6 +501,10 @@ impl Tab {
         self.status = AgentStatus::Unknown;
         self.root_pids = vec![];
         self.spawned_at = std::time::Instant::now();
+        self.session_id = None;
+        self.missing_dir = None;
+        self.children = vec![];
+        self.events_seen = 0;
         Ok(())
     }
 }
@@ -505,5 +646,65 @@ mod tests {
             wait_for(|| Arc::strong_count(&visible) == 1),
             "PTY forwarding thread outlived the terminal",
         );
+    }
+
+    // --- Task 3: write_input, agent_args, unique_title ---------------------
+
+    /// The messaging path's core wire (Task 5 delivers messages via
+    /// `write_input`): bytes written reach the real ConPTY child. Spawns a
+    /// bare interactive `cmd.exe` (no `/c`, so it stays alive waiting for
+    /// input) and writes an `exit 7\r` line the same way a keystroke would
+    /// arrive from `view.rs`.
+    #[test]
+    fn write_input_reaches_pty() {
+        let ctx = eframe::egui::Context::default();
+        let mut term = TabTerm::spawn(&ctx, 4, "cmd.exe", &[], Path::new("C:\\"))
+            .expect("spawn cmd.exe");
+
+        term.write_input("exit 7\r");
+
+        assert!(
+            wait_for(|| {
+                term.poll();
+                term.exited().is_some()
+            }),
+            "child never exited after write_input",
+        );
+        assert_eq!(term.exited(), Some(7));
+    }
+
+    #[test]
+    fn unique_title_returns_base_when_free() {
+        assert_eq!(unique_title("alpha", &[]), "alpha");
+    }
+
+    #[test]
+    fn unique_title_appends_dash_2_on_collision() {
+        let taken = vec!["alpha".to_string()];
+        assert_eq!(unique_title("alpha", &taken), "alpha-2");
+    }
+
+    #[test]
+    fn unique_title_appends_dash_3_when_dash_2_also_taken() {
+        let taken = vec!["alpha".to_string(), "alpha-2".to_string()];
+        assert_eq!(unique_title("alpha", &taken), "alpha-3");
+    }
+
+    #[test]
+    fn agent_args_prompt_path_strips_quotes_unchanged() {
+        let args = agent_args("say \"hi\" now", None);
+        assert_eq!(args, vec!["/c", "claude", "say hi now"]);
+    }
+
+    #[test]
+    fn agent_args_empty_prompt_omits_trailing_arg() {
+        let args = agent_args("", None);
+        assert_eq!(args, vec!["/c", "claude"]);
+    }
+
+    #[test]
+    fn agent_args_resume_ignores_prompt() {
+        let args = agent_args("ignored prompt entirely", Some("sess-123"));
+        assert_eq!(args, vec!["/c", "claude", "--resume", "sess-123"]);
     }
 }

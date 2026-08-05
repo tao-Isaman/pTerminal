@@ -237,6 +237,14 @@ impl PtApp {
                     main_repo_shared_md: shared,
                     prompt: draft.prompt,
                     isolate: draft.isolate,
+                    // Behavioral no-ops (Task 3): this dialog only ever opens
+                    // fresh tabs. Task 5 threads real values — a per-agent
+                    // README, a resumed session id, and a pre-computed
+                    // unique title/worktree — for the restart-resume path.
+                    agent_readme: None,
+                    resume_session: None,
+                    title: None,
+                    worktree: None,
                 },
             )
         };
