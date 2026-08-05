@@ -105,13 +105,33 @@ pub fn latest_session_id(records: &[EventRecord]) -> Option<String> {
 /// or anything else `status_from_event_name` doesn't recognize) are skipped
 /// rather than resetting the result to `Unknown` — a subagent starting or
 /// finishing after the last real status event must not blank the glyph.
-pub fn status_from_events(contents: &str) -> AgentStatus {
-    parse_events(contents)
+///
+/// Split out of [`status_from_events`] (final-review finding 6) so
+/// `PtApp::drain_events`, which already needs the parsed records for session
+/// ids and subagent bookkeeping, can derive the status from those instead of
+/// running [`parse_events`] over the same file contents a second time.
+pub fn status_from_records(records: &[EventRecord]) -> AgentStatus {
+    records
         .iter()
         .rev()
         .map(|r| status_from_event_name(&r.event))
         .find(|s| *s != AgentStatus::Unknown)
         .unwrap_or(AgentStatus::Unknown)
+}
+
+/// [`status_from_records`] applied to freshly [`parse_events`]-ed `contents`.
+/// Kept as the string-in entry point for callers that hold raw file contents
+/// rather than parsed records.
+///
+/// After final-review finding 6 that is only this module's own tests — the
+/// one production caller, `PtApp::drain_events`, parses the file once and
+/// goes through [`status_from_records`] directly. The `allow` is scoped to
+/// non-test builds on purpose: if the tests below ever stop exercising this
+/// wrapper, the `cargo test` build starts warning that it is dead, instead of
+/// it rotting silently.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn status_from_events(contents: &str) -> AgentStatus {
+    status_from_records(&parse_events(contents))
 }
 
 fn append_event_cmd(event: &str, file: &Path) -> String {
@@ -507,6 +527,30 @@ mod tests {
     fn latest_session_id_none_when_absent() {
         let records = vec![EventRecord { event: "Stop".into(), session_id: None, tool_desc: None }];
         assert_eq!(latest_session_id(&records), None);
+    }
+
+    /// Final-review finding 6: `drain_events` now derives status from the
+    /// records it already parsed rather than re-parsing the file. Lock in
+    /// that the record-based entry point and the string-based one can't
+    /// drift — same input, same answer, including the "skip records with no
+    /// status meaning" rule.
+    #[test]
+    fn status_from_records_matches_status_from_events() {
+        for contents in [
+            "",
+            "SessionStart\n",
+            "SessionStart\nUserPromptSubmit\n",
+            "UserPromptSubmit\nNotification\n",
+            "Stop\ngarbage\n",
+            "Stop\n{\"pt\":1,\"event\":\"PreToolUse\",\"tool_desc\":\"Run tests\"}\n",
+        ] {
+            assert_eq!(
+                status_from_records(&parse_events(contents)),
+                status_from_events(contents),
+                "{contents:?}",
+            );
+        }
+        assert_eq!(status_from_records(&[]), AgentStatus::Unknown);
     }
 
     #[test]
