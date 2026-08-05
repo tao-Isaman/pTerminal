@@ -1664,6 +1664,12 @@ impl eframe::App for PtApp {
                     if resp.middle_clicked() && !dialog_open {
                         close_req = Some(i);
                     }
+                    // Visible close button — same confirmed-close path as
+                    // middle-click/Ctrl+W (close dialog, then the drop of the
+                    // tab's ConPTY takes the agent process down with it).
+                    if ui.small_button("x").on_hover_text("close tab").clicked() && !dialog_open {
+                        close_req = Some(i);
+                    }
                     // Step 8: subagent child rows, one small selectable
                     // label per live `SubTab`, right after the parent's own
                     // label — amber while running, green once done (same
