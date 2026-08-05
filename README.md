@@ -56,8 +56,9 @@ pterminal resume --id <session-id> [--dir <path>]
 ```
 
 - **`--id`** is the Claude Code session id (as printed by `claude --resume`'s picker, or from
-  `~/.claude/projects/<slug>/*.jsonl`'s filename). Required; anything containing `/`, `\`, or
-  `.` is rejected as invalid before anything else happens.
+  `~/.claude/projects/<slug>/*.jsonl`'s filename). Required; only ASCII alphanumerics and `-`
+  are accepted (session ids are UUID-shaped); anything else is rejected as invalid before
+  anything else happens.
 - **`--dir`** is the directory the session was originally running in — Claude Code sessions are
   per-directory, so `--resume <id>` only reattaches correctly when run from (or pointed at) that
   same directory. Defaults to the current directory if omitted, matching plain `claude --resume`'s

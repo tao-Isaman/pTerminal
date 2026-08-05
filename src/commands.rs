@@ -28,14 +28,13 @@ fn usage() -> String {
     "usage: pterminal resume --id <session-id> [--dir <path>]".to_string()
 }
 
-/// Session ids are UUID-shaped (hyphens + hex), but the real requirement is
-/// narrower: the id ends up embedded in a filename (`write_command`) and
-/// later a resumed command line (Task 2/3), so anything that could act as a
-/// path separator or a `..` traversal component must be rejected. Rejecting
-/// every `.` is stricter than strictly necessary but simple and still well
-/// within what a real session id looks like.
+/// Session ids are UUID-shaped (hyphens + hex): an allowlist of ASCII
+/// alphanumerics and `-` only. The id ends up embedded in a filename
+/// (`write_command`) and later a resumed command line (Task 2/3), so only
+/// safe characters are permitted. This allowlist is stricter than strictly
+/// necessary but simple and safe.
 fn is_valid_id(id: &str) -> bool {
-    !id.is_empty() && !id.contains('/') && !id.contains('\\') && !id.contains('.')
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 /// Parses `std::env::args()`-shaped argv (`args[0]` is the program name).
@@ -77,7 +76,19 @@ pub fn parse_args(args: &[String]) -> Option<Result<ResumeCmd, String>> {
     };
 
     let dir = match dir {
-        Some(d) => d,
+        Some(d) => {
+            // Absolutize relative paths against the invoking process's cwd
+            if d.is_absolute() {
+                d
+            } else {
+                match std::env::current_dir() {
+                    Ok(cwd) => cwd.join(d),
+                    Err(e) => {
+                        return Some(Err(format!("--dir is relative and could not determine current directory: {e}")));
+                    }
+                }
+            }
+        }
         None => match std::env::current_dir() {
             Ok(d) => d,
             Err(e) => {
@@ -147,7 +158,14 @@ fn read_and_delete_commands_in(dir: &Path) -> (Vec<ResumeCmd>, usize) {
     let mut malformed = 0usize;
     for path in paths {
         match std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<ResumeCmd>(&t).ok()) {
-            Some(cmd) => cmds.push(cmd),
+            Some(cmd) => {
+                // Re-validate the session id to ensure it meets security requirements
+                if is_valid_id(&cmd.session_id) {
+                    cmds.push(cmd);
+                } else {
+                    malformed += 1;
+                }
+            }
             None => malformed += 1,
         }
         let _ = std::fs::remove_file(&path);
@@ -241,6 +259,55 @@ mod tests {
     }
 
     #[test]
+    fn id_with_ampersand_is_error() {
+        let args = vec!["pterminal".into(), "resume".into(), "--id".into(), "abc&calc".into()];
+        assert!(parse_args(&args).expect("Some").is_err());
+    }
+
+    #[test]
+    fn id_with_space_is_error() {
+        let args = vec!["pterminal".into(), "resume".into(), "--id".into(), "abc calc".into()];
+        assert!(parse_args(&args).expect("Some").is_err());
+    }
+
+    #[test]
+    fn id_with_quote_is_error() {
+        let args = vec!["pterminal".into(), "resume".into(), "--id".into(), "abc\"def".into()];
+        assert!(parse_args(&args).expect("Some").is_err());
+    }
+
+    #[test]
+    fn valid_uuid_like_id_is_accepted() {
+        let args = vec!["pterminal".into(), "resume".into(), "--id".into(), "550e8400-e29b-41d4-a716-446655440000".into()];
+        let cmd = parse_args(&args).expect("Some").expect("Ok");
+        assert_eq!(cmd.session_id, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn relative_dir_is_absolutized() {
+        let args = vec![
+            "pterminal".into(), "resume".into(),
+            "--id".into(), "abc123".into(),
+            "--dir".into(), "subdir".into(),
+        ];
+        let cmd = parse_args(&args).expect("Some").expect("Ok");
+        let expected = std::env::current_dir().unwrap().join("subdir");
+        assert_eq!(cmd.dir, expected);
+        assert!(cmd.dir.is_absolute());
+    }
+
+    #[test]
+    fn absolute_dir_is_unchanged() {
+        let args = vec![
+            "pterminal".into(), "resume".into(),
+            "--id".into(), "abc123".into(),
+            "--dir".into(), "C:\\absolute\\path".into(),
+        ];
+        let cmd = parse_args(&args).expect("Some").expect("Ok");
+        assert_eq!(cmd.dir, PathBuf::from("C:\\absolute\\path"));
+    }
+
+    #[test]
     fn unknown_subcommand_is_error() {
         let args = vec!["pterminal".into(), "bogus".into()];
         assert!(parse_args(&args).expect("Some").is_err());
@@ -302,5 +369,31 @@ mod tests {
         let (cmds, malformed) = read_and_delete_commands_in(&dir);
         assert!(cmds.is_empty());
         assert_eq!(malformed, 0);
+    }
+
+    #[test]
+    fn drain_rejects_invalid_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("commands");
+
+        // Write a valid command
+        let cmd_valid = ResumeCmd { session_id: "valid-id-123".into(), dir: PathBuf::from("C:\\repo1") };
+        write_command_in(&cmd_valid, &dir).unwrap();
+
+        // Write a command with an invalid session id (contains `&`)
+        let cmd_invalid = ResumeCmd { session_id: "invalid&id".into(), dir: PathBuf::from("C:\\repo2") };
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let pid = std::process::id();
+        let invalid_path = dir.join(format!("resume-{millis}-{pid}-invalid.json"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&invalid_path, serde_json::to_string_pretty(&cmd_invalid).unwrap()).unwrap();
+
+        let (cmds, malformed) = read_and_delete_commands_in(&dir);
+        assert_eq!(cmds.len(), 1, "should have exactly one valid command");
+        assert_eq!(cmds[0].session_id, "valid-id-123");
+        assert_eq!(malformed, 1, "should count the invalid session id as malformed");
     }
 }
