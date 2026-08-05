@@ -148,12 +148,16 @@ fn event_command(event: &str, file: &Path) -> String {
 }
 
 /// True when `command` looks like one WE previously wrote for any tab —
-/// either a `pterm_hook.exe` invocation, or the older `cmd /c echo` fallback
-/// targeting a `tab-<id>.events` file. Used by the settings merge below to
-/// drop our own stale entries (from an earlier spawn into the same cwd)
-/// without touching anything a user configured by hand.
+/// either a `pterm_hook.exe` invocation, the older `cmd /c echo` fallback
+/// targeting a `tab-<id>.events` file, or our `SessionStart` inject command
+/// (recognized by its constant `echo You are agent "..."` tail, the one
+/// segment present in every variant regardless of which of `shared_md`/
+/// `agent_readme` are `Some`). Used by the settings merge below to drop our
+/// own stale entries (from an earlier spawn into the same cwd) without
+/// touching anything a user configured by hand.
 fn is_our_command(command: &str) -> bool {
     if command.contains("pterm_hook") { return true; }
+    if command.contains("echo You are agent \"") { return true; }
     if let Some(idx) = command.find("tab-") {
         let rest = &command[idx + "tab-".len()..];
         let digits = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
@@ -177,21 +181,26 @@ fn hook_group(cmds: &[String], matcher: Option<&str>) -> serde_json::Value {
 }
 
 /// Merges `our_group` into whatever array already sits at this hook key:
-/// existing array elements survive untouched UNLESS every command inside
+/// existing array elements survive untouched UNLESS **every** command inside
 /// them looks like ours ([`is_our_command`]), in which case that whole
-/// element is dropped before `our_group` is appended. This is what lets a
-/// re-spawn into the same cwd replace its own previous hook entries without
-/// ever clobbering a user's own PreToolUse (or any other) entry.
+/// element is dropped before `our_group` is appended. A MIXED element (one
+/// of our old commands sitting alongside a real user command in the same
+/// group) is never dropped — the cost of leaving our stale command behind
+/// in it is a harmless duplicate (we append a fresh one anyway), which is
+/// vastly preferable to the alternative of silently deleting a user's
+/// command. This is what lets a re-spawn into the same cwd replace its own
+/// previous hook entries without ever clobbering a user's own PreToolUse
+/// (or any other) entry.
 fn merge_hook_key(existing: Option<&serde_json::Value>, our_group: serde_json::Value) -> serde_json::Value {
     let mut kept: Vec<serde_json::Value> = existing
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter(|elem| {
-            let contains_ours = elem.get("hooks")
+            let all_ours = elem.get("hooks")
                 .and_then(|h| h.as_array())
-                .is_some_and(|cmds| cmds.iter().any(|c| {
+                .is_some_and(|cmds| !cmds.is_empty() && cmds.iter().all(|c| {
                     c.get("command").and_then(|s| s.as_str()).is_some_and(is_our_command)
                 }));
-            !contains_ours
+            !all_ours
         }).cloned().collect())
         .unwrap_or_default();
     kept.push(our_group);
@@ -377,6 +386,42 @@ mod tests {
         assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
         assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 1);
         assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_hook_key_drops_all_ours_but_keeps_mixed_entries() {
+        // Locks in the documented "dropped only when EVERY command inside it
+        // is ours" semantics: a mixed element (one of ours alongside a real
+        // user command) must survive untouched, even though that means our
+        // old command sits there duplicated with the fresh one we append —
+        // that's a harmless cosmetic duplicate, not lost user config. An
+        // element whose commands are ALL ours is fair game to drop.
+        let existing = serde_json::json!([
+            {
+                "hooks": [
+                    {"type": "command", "command": "\"C:\\pterm_hook.exe\" Stop \"C:\\tab-1.events\""},
+                    {"type": "command", "command": "user-command --flag"}
+                ]
+            },
+            {
+                "hooks": [
+                    {"type": "command", "command": "\"C:\\pterm_hook.exe\" Stop \"C:\\tab-1.events\""}
+                ]
+            }
+        ]);
+        let ours = hook_group(&["\"C:\\pterm_hook.exe\" Stop \"C:\\tab-2.events\"".to_string()], None);
+        let merged = merge_hook_key(Some(&existing), ours);
+        let arr = merged.as_array().unwrap();
+
+        // The all-ours element is gone; the mixed element survives; ours is appended.
+        assert_eq!(arr.len(), 2, "{arr:?}");
+        let mixed_cmds = arr[0]["hooks"].as_array().unwrap();
+        assert_eq!(mixed_cmds.len(), 2, "mixed entry must survive untouched: {arr:?}");
+        assert_eq!(mixed_cmds[1]["command"], "user-command --flag");
+        assert!(
+            arr[1]["hooks"][0]["command"].as_str().unwrap().contains("tab-2.events"),
+            "{arr:?}"
+        );
     }
 
     #[test]
