@@ -2010,11 +2010,26 @@ impl PtApp {
     /// written entirely while the app was closed still flow — the watcher
     /// can't report those, since it only sees events while it's running.
     ///
-    /// An unknown or exited target (`to` doesn't match any live, non-Exited
-    /// agent tab's title in this workspace) and any malformed lines in the
-    /// batch each surface through `self.error`, once per call — combined
-    /// into one message if both occurred, since only one error can be shown
-    /// at a time.
+    /// **Task 4 (cross-workspace message routing).** `ws_idx` being the
+    /// orchestrator's own workspace is what selects cross-workspace routing:
+    /// every message's `to` goes through `messages::resolve_target` against
+    /// a fresh, egui-free view of every OTHER workspace's live agent tabs
+    /// (`(tab_index, title, is_exited)` triples) — `Deliver` queues the
+    /// submit exactly like same-workspace delivery always has; `Orchestrator`
+    /// (the orchestrator addressing its own reserved name, a self-loop),
+    /// `Ambiguous`, and `Unknown` are all undeliverable. `ws_idx` being any
+    /// OTHER (real) workspace keeps the original same-workspace-title lookup
+    /// unchanged, with one addition: `to == "orchestrator"` is special-cased
+    /// to look up the orchestrator's own reserved-titled tab instead of a
+    /// tab in `ws_idx`'s own list. `resolve_target`'s own self-exclusion (see
+    /// its docs) means the orchestrator's workspace is passed into the view
+    /// unfiltered — belt and suspenders, not load-bearing here since real
+    /// callers only ever build this view from `self.workspaces` as a whole.
+    ///
+    /// An unknown, ambiguous, exited, or self-addressed target, and any
+    /// malformed lines in the batch, each surface through `self.error`, once
+    /// per call — combined into one message if both occurred, since only
+    /// one error can be shown at a time.
     ///
     /// **Final-review finding 1:** the text is written WITHOUT a trailing
     /// `\r`; the Enter is queued on `self.pending_submit` and written by
@@ -2029,43 +2044,135 @@ impl PtApp {
     /// startup delivery (`PtApp::new` calls this for every workspace before
     /// any frame has run) used to match the placeholder, type the message
     /// into a dead diagnostic process, and consume it from `messages.jsonl`
-    /// forever, with no error shown. Excluding placeholders sends those
-    /// messages down the undeliverable-banner branch instead, where the user
-    /// at least learns the message never landed.
+    /// forever, with no error shown. Excluding placeholders (here, and from
+    /// the cross-workspace resolver view built below) sends those messages
+    /// down the undeliverable-banner branch instead, where the user at least
+    /// learns the message never landed.
     fn deliver_messages(&mut self, ws_idx: usize) {
         let Some(ws) = self.workspaces.get(ws_idx) else { return };
         let path = shared_ctx::messages_path(&ws.meta.repo_path);
         let offset = ws.meta.msg_offset;
+        let is_orchestrator = ws.meta.is_orchestrator;
         let Ok(batch) = messages::read_new(&path, offset) else {
             return; // transient IO error; the next event/heartbeat retries
         };
 
+        // `undeliverable` holds the fully-formatted "'<to>' (<reason>)"
+        // fragment for the FIRST offending message in this batch — same
+        // one-error-per-call convention the pre-Task-4 code used, just with
+        // the reason now varying by which way resolution failed.
         let mut undeliverable: Option<String> = None;
-        for m in &batch.messages {
-            let ws_mut = &mut self.workspaces[ws_idx];
-            let target = ws_mut.tabs.iter_mut().find(|t| {
-                t.kind == TabKind::Agent
-                    && t.title == m.to
-                    && t.status != AgentStatus::Exited
-                    && t.missing_dir.is_none() // finding 2: never a placeholder
-            });
-            match target {
-                Some(tab) => {
-                    let tab_id = tab.id;
-                    // finding 1: text now, Enter later (see `pending_submit`)
-                    tab.term
-                        .write_input(&format!("[message from {}] {}", m.from, messages::flatten(&m.text)));
-                    self.pending_submit.push((tab_id, std::time::Instant::now() + SUBMIT_DELAY));
+
+        if is_orchestrator {
+            // A fresh, egui-free snapshot of every workspace's live
+            // (non-placeholder) agent tabs, keyed by their REAL index in
+            // `self.workspaces` — exactly the minimal shape
+            // `messages::resolve_target` needs. Built once per call, from an
+            // immutable borrow that ends before the delivery loop below
+            // needs `&mut self.workspaces`.
+            let agent_lists: Vec<(usize, &str, Vec<(usize, &str, bool)>)> = self
+                .workspaces
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    let agents = w
+                        .tabs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, t)| t.kind == TabKind::Agent && t.missing_dir.is_none())
+                        .map(|(ti, t)| (ti, t.title.as_str(), t.status == AgentStatus::Exited))
+                        .collect();
+                    (i, w.meta.name.as_str(), agents)
+                })
+                .collect();
+            let views: Vec<messages::WsAgents> = agent_lists
+                .iter()
+                .map(|(i, name, agents)| messages::WsAgents { ws_index: *i, name, agents: agents.as_slice() })
+                .collect();
+
+            let resolutions: Vec<messages::TargetResolution> =
+                batch.messages.iter().map(|m| messages::resolve_target(&m.to, &views, ws_idx)).collect();
+
+            for (m, resolution) in batch.messages.iter().zip(resolutions.iter()) {
+                match *resolution {
+                    messages::TargetResolution::Deliver { ws_index, tab_index } => {
+                        let tab = &mut self.workspaces[ws_index].tabs[tab_index];
+                        let tab_id = tab.id;
+                        tab.term.write_input(&format!(
+                            "[message from orchestrator] {}",
+                            messages::flatten(&m.text)
+                        ));
+                        self.pending_submit.push((tab_id, std::time::Instant::now() + SUBMIT_DELAY));
+                    }
+                    messages::TargetResolution::Orchestrator => {
+                        // Self-loop: the orchestrator addressing its own
+                        // reserved name from its own outbox. Never delivered.
+                        undeliverable
+                            .get_or_insert_with(|| format!("'{}' (cannot message itself)", m.to));
+                    }
+                    messages::TargetResolution::Ambiguous => {
+                        undeliverable
+                            .get_or_insert_with(|| format!("'{}' (ambiguous — multiple agents match)", m.to));
+                    }
+                    messages::TargetResolution::Unknown => {
+                        undeliverable.get_or_insert_with(|| format!("'{}' (no such running agent)", m.to));
+                    }
                 }
-                None => {
-                    undeliverable.get_or_insert_with(|| m.to.clone());
+            }
+        } else {
+            let orch_idx = self.orchestrator_index();
+            for m in &batch.messages {
+                if m.to == "orchestrator" {
+                    let target = orch_idx.and_then(|oi| self.workspaces.get_mut(oi)).and_then(|orch_ws| {
+                        orch_ws.tabs.iter_mut().find(|t| {
+                            t.kind == TabKind::Agent
+                                && t.title == "orchestrator"
+                                && t.status != AgentStatus::Exited
+                                && t.missing_dir.is_none() // finding 2: never a placeholder
+                        })
+                    });
+                    match target {
+                        Some(tab) => {
+                            let tab_id = tab.id;
+                            tab.term.write_input(&format!(
+                                "[message from {}] {}",
+                                m.from,
+                                messages::flatten(&m.text)
+                            ));
+                            self.pending_submit.push((tab_id, std::time::Instant::now() + SUBMIT_DELAY));
+                        }
+                        None => {
+                            undeliverable.get_or_insert_with(|| format!("'{}' (no such running agent)", m.to));
+                        }
+                    }
+                    continue;
+                }
+
+                let ws_mut = &mut self.workspaces[ws_idx];
+                let target = ws_mut.tabs.iter_mut().find(|t| {
+                    t.kind == TabKind::Agent
+                        && t.title == m.to
+                        && t.status != AgentStatus::Exited
+                        && t.missing_dir.is_none() // finding 2: never a placeholder
+                });
+                match target {
+                    Some(tab) => {
+                        let tab_id = tab.id;
+                        // finding 1: text now, Enter later (see `pending_submit`)
+                        tab.term
+                            .write_input(&format!("[message from {}] {}", m.from, messages::flatten(&m.text)));
+                        self.pending_submit.push((tab_id, std::time::Instant::now() + SUBMIT_DELAY));
+                    }
+                    None => {
+                        undeliverable.get_or_insert_with(|| format!("'{}' (no such running agent)", m.to));
+                    }
                 }
             }
         }
 
         let mut error_parts: Vec<String> = Vec::new();
-        if let Some(to) = undeliverable {
-            error_parts.push(format!("undeliverable message to '{to}' (no such running agent)"));
+        if let Some(reason) = undeliverable {
+            error_parts.push(format!("undeliverable message to {reason}"));
         }
         if batch.malformed > 0 {
             error_parts.push(format!("{} malformed message(s) in messages.jsonl skipped", batch.malformed));
@@ -3368,6 +3475,20 @@ mod tests {
         drain_to_exit(term);
     }
 
+    /// Flushes every currently-queued `pending_submit` Enter by waiting past
+    /// `SUBMIT_DELAY` and running one `drain_events` pass — same two-step
+    /// dance `delivery_queues_the_submit_enter_instead_of_writing_it_inline`
+    /// exercises directly. A delivery test that leaves a queued Enter
+    /// unflushed and then sends `exit_and_drain`'s own `"exit\r"` would
+    /// concatenate onto whatever delivered text is still unsubmitted on the
+    /// shell's input line, so the child never sees a recognizable `exit`
+    /// command and `drain_to_exit` times out — this must run first whenever
+    /// a test's own `deliver_messages` call queued a submit.
+    fn flush_pending_submit(app: &mut PtApp, ctx: &egui::Context) {
+        std::thread::sleep(SUBMIT_DELAY + std::time::Duration::from_millis(60));
+        app.drain_events(ctx);
+    }
+
     /// A `PtApp` with one workspace rooted at `repo` holding `tabs` live, and
     /// every other field at the cheapest value that type-checks — no sampler
     /// thread, no watcher, no dialogs. Enough for `deliver_messages` and
@@ -3631,6 +3752,19 @@ mod tests {
         std::fs::write(
             shared_ctx::messages_path(repo),
             format!("{{\"to\":\"{to}\",\"from\":\"sender\",\"text\":\"ping\"}}\n"),
+        )
+        .expect("write messages.jsonl");
+    }
+
+    /// Like `seed_message`, but with `from`/`text` under the caller's
+    /// control — Task 4's cross-workspace routing tests need `from` to be a
+    /// specific sender (`"orchestrator"` or a real agent's own title), which
+    /// `seed_message`'s hardcoded `"sender"` can't express.
+    fn seed_message_from(repo: &std::path::Path, to: &str, from: &str, text: &str) {
+        std::fs::create_dir_all(repo.join(".pterminal")).expect("mkdir .pterminal");
+        std::fs::write(
+            shared_ctx::messages_path(repo),
+            format!("{{\"to\":\"{to}\",\"from\":\"{from}\",\"text\":\"{text}\"}}\n"),
         )
         .expect("write messages.jsonl");
     }
@@ -4576,5 +4710,186 @@ mod tests {
             app.orchestrator_status_written.is_none(),
             "nothing to refresh without an orchestrator workspace present"
         );
+    }
+
+    // ---- deliver_messages: cross-workspace routing (Task 4) ----
+    //
+    // Reuses the `agent_tab` idiom (spawn_shell, relabeled as an Agent tab)
+    // that Task 3's status.md tests already established — `deliver_messages`
+    // only looks at `kind`/`title`/`status`/`missing_dir`, never at what the
+    // process actually is, so a real `powershell.exe` stands in for `claude`
+    // without the "can't end a live `claude --resume` deterministically"
+    // problem documented on `app_with_one_saved_shell_tab`.
+
+    /// The orchestrator's own outbox, addressing a real workspace's agent
+    /// explicitly by `"<workspace>/<agent>"`: must resolve and queue the
+    /// submit exactly like same-workspace delivery already does, with no
+    /// error raised.
+    #[test]
+    fn deliver_messages_from_orchestrator_routes_workspace_slash_agent_to_that_tab() {
+        let ctx = eframe::egui::Context::default();
+        let orch_dir = tempfile::tempdir().expect("tempdir");
+        let alpha_dir = tempfile::tempdir().expect("tempdir");
+        seed_message_from(orch_dir.path(), "alpha/builder", "orchestrator", "ping from orch");
+
+        let mut orch_ws = ws_with_name(orch_dir.path().to_path_buf(), "orchestrator");
+        orch_ws.meta.is_orchestrator = true;
+
+        let mut alpha_ws = ws_with_name(alpha_dir.path().to_path_buf(), "alpha");
+        let builder = agent_tab(&ctx, 90_700, alpha_dir.path(), "builder", AgentStatus::Working);
+        let builder_id = builder.id;
+        alpha_ws.tabs.push(builder);
+
+        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws], 0);
+
+        app.deliver_messages(0);
+
+        assert_eq!(app.pending_submit.len(), 1, "the builder tab must receive the queued Enter");
+        assert_eq!(app.pending_submit[0].0, builder_id);
+        assert!(app.error.is_none(), "a resolvable target must not raise an error banner");
+        assert!(app.workspaces[0].meta.msg_offset > 0, "offset must advance on a successful parse pass");
+
+        flush_pending_submit(&mut app, &ctx);
+        exit_and_drain(&mut app.workspaces[1].tabs[0].term);
+    }
+
+    /// The orchestrator's own outbox, addressing an agent by its BARE name
+    /// (no `workspace/` prefix): resolves so long as it is unique across
+    /// every real workspace, exactly like `resolve_target`'s own unit tests.
+    #[test]
+    fn deliver_messages_from_orchestrator_routes_bare_unique_agent_name() {
+        let ctx = eframe::egui::Context::default();
+        let orch_dir = tempfile::tempdir().expect("tempdir");
+        let alpha_dir = tempfile::tempdir().expect("tempdir");
+        seed_message_from(orch_dir.path(), "builder", "orchestrator", "ping bare");
+
+        let mut orch_ws = ws_with_name(orch_dir.path().to_path_buf(), "orchestrator");
+        orch_ws.meta.is_orchestrator = true;
+
+        let mut alpha_ws = ws_with_name(alpha_dir.path().to_path_buf(), "alpha");
+        let builder = agent_tab(&ctx, 90_705, alpha_dir.path(), "builder", AgentStatus::Working);
+        let builder_id = builder.id;
+        alpha_ws.tabs.push(builder);
+
+        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws], 0);
+
+        app.deliver_messages(0);
+
+        assert_eq!(app.pending_submit.len(), 1);
+        assert_eq!(app.pending_submit[0].0, builder_id);
+        assert!(app.error.is_none());
+
+        flush_pending_submit(&mut app, &ctx);
+        exit_and_drain(&mut app.workspaces[1].tabs[0].term);
+    }
+
+    /// A bare name that matches a live, non-exited agent in TWO different
+    /// real workspaces must resolve `Ambiguous`: delivered nowhere, and
+    /// surfaced through the same one-error-banner-per-batch mechanism
+    /// same-workspace delivery already uses for an unknown target.
+    #[test]
+    fn deliver_messages_from_orchestrator_ambiguous_bare_name_sets_error_and_delivers_nowhere() {
+        let ctx = eframe::egui::Context::default();
+        let orch_dir = tempfile::tempdir().expect("tempdir");
+        let alpha_dir = tempfile::tempdir().expect("tempdir");
+        let bravo_dir = tempfile::tempdir().expect("tempdir");
+        seed_message_from(orch_dir.path(), "dup", "orchestrator", "who gets this?");
+
+        let mut orch_ws = ws_with_name(orch_dir.path().to_path_buf(), "orchestrator");
+        orch_ws.meta.is_orchestrator = true;
+
+        let mut alpha_ws = ws_with_name(alpha_dir.path().to_path_buf(), "alpha");
+        alpha_ws.tabs.push(agent_tab(&ctx, 90_710, alpha_dir.path(), "dup", AgentStatus::Working));
+        let mut bravo_ws = ws_with_name(bravo_dir.path().to_path_buf(), "bravo");
+        bravo_ws.tabs.push(agent_tab(&ctx, 90_711, bravo_dir.path(), "dup", AgentStatus::Working));
+
+        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws, bravo_ws], 0);
+
+        app.deliver_messages(0);
+
+        assert!(app.pending_submit.is_empty(), "an ambiguous target must never be delivered anywhere");
+        let err = app.error.clone().unwrap_or_default();
+        assert!(err.contains("dup"), "{err}");
+        assert!(app.workspaces[0].meta.msg_offset > 0, "offset must still advance — the line parsed fine");
+
+        exit_and_drain(&mut app.workspaces[1].tabs[0].term);
+        exit_and_drain(&mut app.workspaces[2].tabs[0].term);
+    }
+
+    /// The orchestrator's own outbox, addressing a workspace/agent that does
+    /// not exist: `Unknown` must also raise the error banner and deliver
+    /// nowhere, same as `Ambiguous` above.
+    #[test]
+    fn deliver_messages_from_orchestrator_unknown_target_sets_error_and_delivers_nowhere() {
+        let orch_dir = tempfile::tempdir().expect("tempdir");
+        seed_message_from(orch_dir.path(), "nowhere/nobody", "orchestrator", "??");
+
+        let mut orch_ws = ws_with_name(orch_dir.path().to_path_buf(), "orchestrator");
+        orch_ws.meta.is_orchestrator = true;
+
+        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws], 0);
+
+        app.deliver_messages(0);
+
+        assert!(app.pending_submit.is_empty());
+        let err = app.error.clone().unwrap_or_default();
+        assert!(err.contains("nowhere/nobody"), "{err}");
+    }
+
+    /// A real workspace's own outbox addressing the reserved name
+    /// `"orchestrator"` must land in the orchestrator's own agent tab —
+    /// the other half of the routing loop from the tests above.
+    #[test]
+    fn deliver_messages_from_real_workspace_to_orchestrator_delivers_into_orchestrator_tab() {
+        let ctx = eframe::egui::Context::default();
+        let orch_dir = tempfile::tempdir().expect("tempdir");
+        let alpha_dir = tempfile::tempdir().expect("tempdir");
+
+        let mut orch_ws = ws_with_name(orch_dir.path().to_path_buf(), "orchestrator");
+        orch_ws.meta.is_orchestrator = true;
+        let orch_tab = agent_tab(&ctx, 90_720, orch_dir.path(), "orchestrator", AgentStatus::Working);
+        let orch_tab_id = orch_tab.id;
+        orch_ws.tabs.push(orch_tab);
+
+        let mut alpha_ws = ws_with_name(alpha_dir.path().to_path_buf(), "alpha");
+        alpha_ws.tabs.push(agent_tab(&ctx, 90_721, alpha_dir.path(), "builder", AgentStatus::Working));
+        seed_message_from(alpha_dir.path(), "orchestrator", "builder", "reply up");
+
+        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws], 0);
+
+        app.deliver_messages(1); // alpha's own outbox, not the orchestrator's
+
+        assert_eq!(app.pending_submit.len(), 1);
+        assert_eq!(app.pending_submit[0].0, orch_tab_id, "must land in the orchestrator's own tab");
+        assert!(app.error.is_none());
+
+        flush_pending_submit(&mut app, &ctx);
+        exit_and_drain(&mut app.workspaces[0].tabs[0].term);
+        exit_and_drain(&mut app.workspaces[1].tabs[0].term);
+    }
+
+    /// The orchestrator addressing itself (`to: "orchestrator"` written to
+    /// its OWN outbox) must never be delivered — a self-loop, explicitly
+    /// ruled out by the task brief regardless of `resolve_target`'s
+    /// `Orchestrator` variant existing for the other (real-workspace)
+    /// direction.
+    #[test]
+    fn deliver_messages_orchestrator_addressing_itself_is_never_delivered() {
+        let ctx = eframe::egui::Context::default();
+        let orch_dir = tempfile::tempdir().expect("tempdir");
+        seed_message_from(orch_dir.path(), "orchestrator", "orchestrator", "loop?");
+
+        let mut orch_ws = ws_with_name(orch_dir.path().to_path_buf(), "orchestrator");
+        orch_ws.meta.is_orchestrator = true;
+        orch_ws.tabs.push(agent_tab(&ctx, 90_730, orch_dir.path(), "orchestrator", AgentStatus::Working));
+
+        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws], 0);
+
+        app.deliver_messages(0);
+
+        assert!(app.pending_submit.is_empty(), "the orchestrator must never message itself");
+        assert!(app.error.is_some());
+
+        exit_and_drain(&mut app.workspaces[0].tabs[0].term);
     }
 }

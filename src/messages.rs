@@ -177,11 +177,246 @@ pub fn orchestrator_status(entries: &[WsStatus]) -> String {
     out
 }
 
+/// One workspace's resolvable data for [`resolve_target`] (Task 4:
+/// cross-workspace message routing): which index it sits at in
+/// `PtApp::workspaces` (so the resolver can recognize — and exclude — the
+/// orchestrator's own workspace even when it's present in the slice), its
+/// display name, and its live agent tabs as `(tab_index, title, is_exited)`
+/// triples. Deliberately NOT `&[app::WsRt]`: this is the minimal, egui-free
+/// slice of data `resolve_target` actually needs, built fresh by the caller
+/// (`PtApp::deliver_messages`) from its real `Tab`s each time — no
+/// terminal/PTY access, so it's unit-testable directly.
+pub struct WsAgents<'a> {
+    pub ws_index: usize,
+    pub name: &'a str,
+    pub agents: &'a [(usize, &'a str, bool)],
+}
+
+/// Where a message's `to` field routes, per [`resolve_target`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetResolution {
+    /// A specific, unambiguous, non-exited agent tab.
+    Deliver { ws_index: usize, tab_index: usize },
+    /// The reserved name `"orchestrator"` — route to the orchestrator's own
+    /// agent tab. `resolve_target` itself has no notion of which workspace
+    /// that is (it may not even be present in `workspaces`); the caller
+    /// resolves the actual tab.
+    Orchestrator,
+    /// A bare agent name matched more than one live, non-exited agent
+    /// across the real (non-orchestrator) workspaces.
+    Ambiguous,
+    /// No live match: `"<ws>/<agent>"` named a workspace or agent that
+    /// doesn't exist (or is exited), or a bare name matched no one.
+    Unknown,
+}
+
+/// Resolves an orchestrator outbound message's `to` field against
+/// `workspaces`. Never resolves to `orch_index`'s own tabs, even when that
+/// workspace is present in `workspaces` — see
+/// `resolve_target_never_returns_the_orchestrators_own_tab_via_bare_name`/
+/// `..._via_slash_addressing` below.
+///
+/// - `to == "orchestrator"` → [`TargetResolution::Orchestrator`],
+///   unconditionally and checked first. Safe to check before anything else
+///   because no REAL agent tab can ever be titled `"orchestrator"` —
+///   `term::unique_title` reserves that literal string (Task 4) — so this
+///   can never shadow a genuine agent.
+/// - `"<ws>/<agent>"` → the non-exited agent tab titled `<agent>` in the
+///   (non-`orch_index`) workspace named `<ws>`; [`TargetResolution::Unknown`]
+///   if no such workspace exists (excluding `orch_index`), or it exists but
+///   has no matching non-exited agent.
+/// - a bare `"<agent>"` → the unique non-exited agent tab titled `<agent>`
+///   across every (non-`orch_index`) workspace: exactly one match →
+///   [`TargetResolution::Deliver`], two or more → [`TargetResolution::Ambiguous`],
+///   zero → [`TargetResolution::Unknown`].
+pub fn resolve_target(to: &str, workspaces: &[WsAgents], orch_index: usize) -> TargetResolution {
+    if to == "orchestrator" {
+        return TargetResolution::Orchestrator;
+    }
+
+    if let Some((ws_name, agent_name)) = to.split_once('/') {
+        let ws = workspaces.iter().find(|w| w.ws_index != orch_index && w.name == ws_name);
+        return match ws {
+            Some(w) => w
+                .agents
+                .iter()
+                .find(|&&(_, title, is_exited)| title == agent_name && !is_exited)
+                .map(|&(tab_index, _, _)| TargetResolution::Deliver { ws_index: w.ws_index, tab_index })
+                .unwrap_or(TargetResolution::Unknown),
+            None => TargetResolution::Unknown,
+        };
+    }
+
+    let mut found: Option<(usize, usize)> = None;
+    for w in workspaces {
+        if w.ws_index == orch_index {
+            continue;
+        }
+        for &(tab_index, title, is_exited) in w.agents {
+            if title == to && !is_exited {
+                if found.is_some() {
+                    return TargetResolution::Ambiguous;
+                }
+                found = Some((w.ws_index, tab_index));
+            }
+        }
+    }
+    match found {
+        Some((ws_index, tab_index)) => TargetResolution::Deliver { ws_index, tab_index },
+        None => TargetResolution::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hooks::AgentStatus;
     use std::io::Write;
+
+    // ---- resolve_target (Task 4: cross-workspace message routing) ----
+    //
+    // Pure and egui-free: a workspace is reduced to `WsAgents { ws_index,
+    // name, agents }` where `agents` is `(tab_index, title, is_exited)`
+    // triples — exactly what `PtApp::deliver_messages` can build from
+    // `self.workspaces` without any terminal/PTY access. RED evidence for
+    // these lives in the Task 4 report: at the time these were written,
+    // neither `resolve_target` nor `TargetResolution` existed, so the crate
+    // failed to compile (`E0433`/`E0425`) until both were implemented below.
+
+    fn ws<'a>(ws_index: usize, name: &'a str, agents: &'a [(usize, &'a str, bool)]) -> WsAgents<'a> {
+        WsAgents { ws_index, name, agents }
+    }
+
+    #[test]
+    fn resolve_target_workspace_slash_agent_hit() {
+        let alpha_agents = [(0usize, "builder", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents)];
+
+        let got = resolve_target("alpha/builder", &workspaces, 99);
+
+        assert_eq!(got, TargetResolution::Deliver { ws_index: 0, tab_index: 0 });
+    }
+
+    #[test]
+    fn resolve_target_workspace_slash_agent_miss_unknown_workspace() {
+        let alpha_agents = [(0usize, "builder", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents)];
+
+        let got = resolve_target("bravo/builder", &workspaces, 99);
+
+        assert_eq!(got, TargetResolution::Unknown);
+    }
+
+    #[test]
+    fn resolve_target_workspace_slash_agent_miss_unknown_agent_in_known_workspace() {
+        let alpha_agents = [(0usize, "builder", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents)];
+
+        let got = resolve_target("alpha/reviewer", &workspaces, 99);
+
+        assert_eq!(got, TargetResolution::Unknown);
+    }
+
+    #[test]
+    fn resolve_target_bare_name_unique_across_workspaces_delivers() {
+        let alpha_agents = [(0usize, "builder", false)];
+        let bravo_agents = [(0usize, "solo", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents), ws(1, "bravo", &bravo_agents)];
+
+        let got = resolve_target("solo", &workspaces, 99);
+
+        assert_eq!(got, TargetResolution::Deliver { ws_index: 1, tab_index: 0 });
+    }
+
+    #[test]
+    fn resolve_target_bare_name_duplicated_across_two_workspaces_is_ambiguous() {
+        let alpha_agents = [(0usize, "dup", false)];
+        let bravo_agents = [(0usize, "dup", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents), ws(1, "bravo", &bravo_agents)];
+
+        let got = resolve_target("dup", &workspaces, 99);
+
+        assert_eq!(got, TargetResolution::Ambiguous);
+    }
+
+    #[test]
+    fn resolve_target_literal_orchestrator_returns_orchestrator_variant() {
+        let alpha_agents = [(0usize, "orchestrator", false)]; // must never matter — checked first
+        let workspaces = [ws(0, "alpha", &alpha_agents)];
+
+        let got = resolve_target("orchestrator", &workspaces, 99);
+
+        assert_eq!(got, TargetResolution::Orchestrator);
+    }
+
+    #[test]
+    fn resolve_target_excludes_exited_agent_from_slash_addressing() {
+        let alpha_agents = [(0usize, "gone", true)];
+        let workspaces = [ws(0, "alpha", &alpha_agents)];
+
+        let got = resolve_target("alpha/gone", &workspaces, 99);
+
+        assert_eq!(got, TargetResolution::Unknown, "an exited agent must never be a delivery target");
+    }
+
+    #[test]
+    fn resolve_target_excludes_exited_agent_from_bare_addressing_leaving_the_live_one_unique() {
+        let alpha_agents = [(0usize, "dup", true)]; // exited — must not count toward ambiguity
+        let bravo_agents = [(0usize, "dup", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents), ws(1, "bravo", &bravo_agents)];
+
+        let got = resolve_target("dup", &workspaces, 99);
+
+        assert_eq!(
+            got,
+            TargetResolution::Deliver { ws_index: 1, tab_index: 0 },
+            "the exited copy must not make this ambiguous, nor should it win"
+        );
+    }
+
+    #[test]
+    fn resolve_target_never_returns_the_orchestrators_own_tab_via_bare_name() {
+        // The orchestrator's own workspace (ws_index == orch_index) is
+        // present in the slice — same as it would be if a caller passed
+        // `self.workspaces` verbatim — but a bare name that ONLY exists
+        // there must resolve Unknown, never Deliver into it.
+        let orch_agents = [(0usize, "clone", false)];
+        let alpha_agents = [(0usize, "builder", false)];
+        let workspaces = [ws(0, "orchestrator", &orch_agents), ws(1, "alpha", &alpha_agents)];
+
+        let got = resolve_target("clone", &workspaces, 0);
+
+        assert_eq!(got, TargetResolution::Unknown, "the orchestrator's own tab must never be a delivery target");
+    }
+
+    #[test]
+    fn resolve_target_never_returns_the_orchestrators_own_tab_via_slash_addressing() {
+        // Explicitly addressing the orchestrator's own workspace by name
+        // (`"orchestrator/clone"`) must not find it either — self-exclusion
+        // applies regardless of how the target was spelled.
+        let orch_agents = [(0usize, "clone", false)];
+        let workspaces = [ws(0, "orchestrator", &orch_agents)];
+
+        let got = resolve_target("orchestrator/clone", &workspaces, 0);
+
+        assert_eq!(got, TargetResolution::Unknown);
+    }
+
+    #[test]
+    fn resolve_target_bare_name_present_in_both_orchestrator_and_one_real_workspace_still_delivers() {
+        // A title that happens to collide with something inside the
+        // orchestrator's own workspace must still resolve normally against
+        // the one REAL match — the orchestrator's copy doesn't count toward
+        // ambiguity either.
+        let orch_agents = [(0usize, "dup", false)];
+        let alpha_agents = [(0usize, "dup", false)];
+        let workspaces = [ws(0, "orchestrator", &orch_agents), ws(1, "alpha", &alpha_agents)];
+
+        let got = resolve_target("dup", &workspaces, 0);
+
+        assert_eq!(got, TargetResolution::Deliver { ws_index: 1, tab_index: 0 });
+    }
+
     use std::path::PathBuf;
 
     #[test]

@@ -309,10 +309,20 @@ pub fn agent_args(prompt: &str, resume: Option<&str>) -> Vec<String> {
 
 /// Returns `base` if it isn't in `taken`, else the first `base-2`, `base-3`,
 /// … suffix that is. Used to keep agent tab titles unique within a
-/// workspace (message delivery in Task 5 addresses agents by title, so a
+/// workspace (message delivery, Task 4/5, addresses agents by title, so a
 /// collision would make `to: "<title>"` ambiguous).
+///
+/// **`"orchestrator"` is reserved (Task 4: cross-workspace message
+/// routing)** — treated as always-taken regardless of what's actually in
+/// `taken`, so a normal agent slug that happens to BE `"orchestrator"` is
+/// bumped straight to `"orchestrator-2"` (or further, if that's taken too)
+/// rather than returned unchanged. The orchestrator's own tab is titled
+/// `"orchestrator"` directly (`app::new_orchestrator_workspace`), never
+/// through this function, and `messages::resolve_target` treats that literal
+/// string as unconditionally special — a real agent tab titled it would be
+/// unreachable by its own name and would shadow the orchestrator.
 pub fn unique_title(base: &str, taken: &[String]) -> String {
-    if !taken.iter().any(|t| t == base) {
+    if base != "orchestrator" && !taken.iter().any(|t| t == base) {
         return base.to_string();
     }
     let mut n = 2;
@@ -1038,6 +1048,26 @@ mod tests {
     fn unique_title_appends_dash_3_when_dash_2_also_taken() {
         let taken = vec!["alpha".to_string(), "alpha-2".to_string()];
         assert_eq!(unique_title("alpha", &taken), "alpha-3");
+    }
+
+    /// Task 4 (cross-workspace message routing): `"orchestrator"` is a
+    /// reserved name — the orchestrator's own tab is titled it directly
+    /// (`app::new_orchestrator_workspace`, never through `unique_title`), and
+    /// `resolve_target` treats it as unconditionally special. A normal
+    /// agent slug that happens to BE `"orchestrator"` must never collide
+    /// with (or be mistaken for) that reserved tab, even in a workspace
+    /// where nothing named "orchestrator" is in `taken` yet — so this must
+    /// bump straight to `-2` rather than returning the base unchanged, the
+    /// way every other base would.
+    #[test]
+    fn unique_title_reserves_orchestrator_even_when_not_in_taken() {
+        assert_eq!(unique_title("orchestrator", &[]), "orchestrator-2");
+    }
+
+    #[test]
+    fn unique_title_reserves_orchestrator_and_still_skips_taken_dash_2() {
+        let taken = vec!["orchestrator-2".to_string()];
+        assert_eq!(unique_title("orchestrator", &taken), "orchestrator-3");
     }
 
     #[test]
