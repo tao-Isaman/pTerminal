@@ -125,6 +125,80 @@ the target's own terminal — not a passive inbox the target has to poll.
   input. An unknown or exited target, or a malformed line, is never silently dropped — it's
   surfaced once via the error banner instead.
 
+## File editor
+
+Every workspace also has a plain-text editor, side by side with its shell/agent
+tabs — no syntax highlighting, just open/edit/save.
+
+- **Open** — `Ctrl+O` or the tab strip's **`+file`** button (suppressed for the
+  Orchestrator, see below) opens a native file picker rooted at the
+  workspace's folder; the chosen file becomes a new tab titled `[e] <name>`
+  in place of the usual `[wt]`/agent-status markers, rendered in the central
+  panel instead of a terminal. A dirty (unsaved) editor gets a trailing `*`:
+  `[e] <name> *`. (These are plain ASCII brackets/asterisk, not the fancier
+  pencil/dot glyphs you might expect — pTerminal ships no font files of its
+  own, and those glyphs render as tofu on at least one real machine; see the
+  status-marker note above for the same reasoning.)
+- **Save** — `Ctrl+S` or the editor's **Save** button writes the buffer back
+  to disk and clears the dirty marker.
+- **Persist and reopen** — every open editor's path is saved per workspace
+  and reopened automatically the next time pTerminal launches, right along
+  with its shell/agent tabs — restart pTerminal and your open files are still
+  in the tab strip (not auto-selected, so a relaunch doesn't yank focus into
+  an editor you weren't looking at).
+- **Missing file** — if an editor's saved path no longer exists on disk
+  (deleted outside pTerminal, or a stale entry from an old session), the tab
+  still opens with an amber "file not found on disk" note and an empty
+  buffer instead of erroring or silently dropping the tab. Typing content and
+  saving recreates the file at that same path.
+- Closing a dirty editor asks first ("Discard unsaved changes to `<name>`?");
+  a clean editor just closes.
+
+## Orchestrator
+
+A pinned **Orchestrator** row always sits first in the sidebar — above every
+real workspace, in plain ASCII text (no fancy glyph), and it can't be closed
+(no right-click menu, no close button) because it isn't a project workspace
+at all: it's a reserved Claude Code agent whose job is coordinating every
+other workspace's agents on your behalf.
+
+- **Auto-created, auto-resumed** — the very first time pTerminal launches, it
+  creates the Orchestrator's own working directory
+  (`%APPDATA%\pterminal\orchestrator`) and starts a `claude` session there
+  automatically, no setup required. Every later launch resumes that same
+  session (`claude --resume <session-id>`) instead of starting a new
+  conversation, exactly like any other saved agent tab — closing and
+  reopening pTerminal doesn't lose the orchestrator's context, and there is
+  always exactly one Orchestrator, never a duplicate.
+- **`status.md`** — pTerminal continuously maintains a live status report at
+  `%APPDATA%\pterminal\orchestrator\status.md`: one `## <workspace name>`
+  section per real workspace (the orchestrator's own entry excluded), each
+  listing its running agent tabs as `- <workspace>/<agent> — <status> — cwd
+  <path>`. It's regenerated whenever an agent's status changes and only
+  rewritten on disk when the content actually differs. Pressing **F2** while
+  the Orchestrator is the active workspace shows this file instead of the
+  usual `shared.md` — read-only (no save button; there's nothing to edit,
+  only to read), and it live-reloads the same way `shared.md` does elsewhere.
+- **Addressing** — the orchestrator talks to workspace agents the same way
+  agents talk to each other (see Messaging above), just with one extra
+  addressing form: appending a line to its own `messages.jsonl` with
+  `"to":"<workspace>/<agent>"` types that message into that exact agent's
+  terminal, in that exact workspace — even though the orchestrator's own
+  messages file lives outside any real workspace. Any workspace agent can
+  message back by addressing the reserved name `"orchestrator"` — no
+  workspace prefix needed, since there's only ever one — and it's typed
+  straight into the orchestrator's own terminal.
+- **Errors, not silence** — addressing a workspace/agent pair that doesn't
+  exist, a bare agent name that matches more than one running agent
+  (ambiguous), or the orchestrator trying to message itself, is never
+  silently dropped: it surfaces once via the same error banner other
+  undeliverable messages use.
+- **The full loop** — you prompt the orchestrator in its own tab → it
+  addresses one or more workspace agents by `<workspace>/<agent>` → each
+  agent works and, when done, replies back to `"orchestrator"` → you read the
+  outcome in the orchestrator's own tab (or check `status.md`/F2 at any
+  point along the way to see what's currently running where).
+
 ## Subagent tabs
 
 When an agent uses the Task tool to spawn a Claude Code subagent, a small child tab appears
@@ -143,7 +217,8 @@ occasionally be the wrong one if they finish out of start order. Acceptable for 
 UI; not acceptable if you need a precise per-subagent audit trail.
 
 ## Keys
-Ctrl+T new tab · Ctrl+W close · Ctrl+Tab cycle · Ctrl+1..9 jump · F2 shared context
+Ctrl+T new tab · Ctrl+W close · Ctrl+Tab cycle · Ctrl+1..9 jump · F2 shared context ·
+Ctrl+O open file · Ctrl+S save file
 
 ## Build
 `cargo build --release` (needs `git` and `claude` on PATH). Design docs in `docs/superpowers/`.
