@@ -321,16 +321,27 @@ impl PtApp {
     /// until the user hits Restart, which re-arms a claim through the
     /// normal single-slot path exactly like a brand-new tab does.
     ///
-    /// **Small, accepted race (documented, not fixed here).** `Tab::session_id`
-    /// tracks the most recently *observed* session id from hook events, and
-    /// `spawn_agent` always starts it at `None` regardless of
-    /// `resume_session` — it's set for real once the resumed agent's own
+    /// **Small, accepted race (documented, not fixed here) — narrowed by
+    /// REVIEW FINDING 1's fix (resumed tabs carrying the saved session id;
+    /// not the same "FINDING 1" numbering used elsewhere in this file for
+    /// the unrelated `ctx_panel_loaded_for` desync — review-round labels
+    /// aren't globally unique across rounds).** `Tab::session_id` tracks the most recently
+    /// *observed* session id from hook events; `spawn_agent` itself always
+    /// starts a fresh `Tab` at `None` regardless of `resume_session`, and
+    /// the real value is only set for real once the resumed agent's own
     /// `SessionStart` hook fires, typically within a second or two of
-    /// launch. If `persist()` runs in that narrow window (e.g. the user
-    /// opens an unrelated tab immediately on startup), the saved session id
-    /// for this tab is briefly overwritten with `None`, and a crash/kill
-    /// before the hook fires would lose the resume thread. Same shape of
-    /// race the PID-claim window above already accepts.
+    /// launch. The `Ok(mut tab)` arm below now carries `saved.session_id`
+    /// onto the resumed `Tab` explicitly before it's pushed, so the id is
+    /// no longer lost outright: a `persist()` in that narrow pre-`SessionStart`
+    /// window now writes back the *same* (correct, since `--resume` keeps
+    /// the session id unchanged) id instead of `None`. What remains is only
+    /// a freshness race — if the resumed session actually rotates its id
+    /// (rare, but hook events are the only source of truth for that), a
+    /// `persist()` before `SessionStart` fires still writes the older saved
+    /// id rather than the new one; a crash/kill in that same window loses
+    /// only that potential rotation, never the whole resume thread the way
+    /// it previously could. Same shape of race the PID-claim window above
+    /// already accepts.
     fn resume_saved_tabs(&mut self, ctx: &egui::Context) {
         for ws_idx in 0..self.workspaces.len() {
             let saved_tabs = self.workspaces[ws_idx].meta.saved_tabs.clone();
@@ -377,7 +388,27 @@ impl PtApp {
                     )
                 };
                 match result {
-                    Ok(tab) => {
+                    Ok(mut tab) => {
+                        // REVIEW FINDING 1 fix (resume session id — distinct
+                        // from this file's other "FINDING 1", the unrelated
+                        // ctx_panel_loaded_for desync): `spawn_agent`/`spawn_shell` always
+                        // start a fresh `Tab` with `session_id: None` (see
+                        // their own contracts) — correct for a brand-new
+                        // spawn, wrong here, since `claude --resume <sid>`
+                        // (via `resume_session` above) continues the exact
+                        // session `saved.session_id` names. Carry it onto
+                        // the resumed `Tab` explicitly so the very next
+                        // `persist()` (which mirrors live tabs back into
+                        // `saved_tabs`, Step 2) writes the same id back
+                        // instead of nulling it out before this session's
+                        // own `SessionStart` hook has a chance to fire. The
+                        // missing-dir placeholder branch already carries
+                        // `saved.session_id` onto its `Tab` directly
+                        // (`term::spawn_missing_dir_placeholder`,
+                        // `term.rs:488`) — this makes the real-spawn path
+                        // symmetric with it, so both start from the saved
+                        // value rather than one starting from `None`.
+                        tab.session_id = saved.session_id.clone();
                         let ws = &mut self.workspaces[ws_idx];
                         // Direct-mode hook takeover (see this fn's docs):
                         // this resumed tab just overwrote hook routing for
@@ -1334,6 +1365,20 @@ impl eframe::App for PtApp {
             }
             if let Some(i) = clicked {
                 self.active_ws = i;
+                // REVIEW FINDING 2 fix (selected_child not cleared on
+                // workspace switch — distinct from this file's other
+                // "FINDING 2", the unrelated watcher best-effort skip):
+                // every other path that changes which tab is
+                // showing (real-tab click `app.rs:1438`, keyboard tab
+                // switch `app.rs:978`/`989`, close/restart paths) already
+                // clears `selected_child` — this sidebar workspace click was
+                // the one gap. Without it, a child pane selected in
+                // workspace A stayed selected after switching to workspace
+                // B; the CentralPanel resolver used to scan every
+                // workspace's tabs for a matching id (not just the active
+                // one), so it would keep resolving and render A's info pane
+                // OVER B's terminal until the user clicked a real tab in B.
+                self.selected_child = None;
             }
             if let Some((ws_idx, wt)) = kept_clicked {
                 self.open_kept_worktree(ctx, ws_idx, wt);
@@ -1553,16 +1598,30 @@ impl eframe::App for PtApp {
                 // Collected into owned values (not `&SubTab`) up front so
                 // nothing here holds a live borrow of `self.workspaces` —
                 // simpler than reasoning about NLL across the match below.
-                let resolved: Option<(String, String, std::time::Instant, Option<std::time::Instant>)> =
-                    self.workspaces
-                        .iter()
-                        .flat_map(|w| w.tabs.iter())
-                        .find(|t| t.id == parent_id)
-                        .and_then(|t| {
-                            t.children
-                                .get(child_idx)
-                                .map(|c| (t.title.clone(), c.desc.clone(), c.started, c.done_at))
-                        });
+                //
+                // REVIEW FINDING 2 fix: restricted to `self.active_ws`'s own tabs
+                // ONLY, not `self.workspaces.iter().flat_map(...)` over
+                // every workspace. Tab ids are unique per `next_tab_id`
+                // counter but NOT namespaced per workspace, so scanning all
+                // workspaces could resolve a `parent_id` that belongs to a
+                // tab sitting in a workspace that isn't even showing right
+                // now — a pane selected in workspace A would keep rendering
+                // on top of workspace B's terminal after switching via the
+                // sidebar (the click site's own `selected_child = None` is
+                // the first half of this fix; this scan restriction is the
+                // second half, needed even where some other path failed to
+                // clear the selection).
+                let resolved: Option<(String, String, std::time::Instant, Option<std::time::Instant>)> = self
+                    .workspaces
+                    .get(self.active_ws)
+                    .into_iter()
+                    .flat_map(|w| w.tabs.iter())
+                    .find(|t| t.id == parent_id)
+                    .and_then(|t| {
+                        t.children
+                            .get(child_idx)
+                            .map(|c| (t.title.clone(), c.desc.clone(), c.started, c.done_at))
+                    });
                 match resolved {
                     Some((parent_title, desc, started, done_at)) => {
                         ui.heading("subagent");
@@ -1640,5 +1699,139 @@ impl eframe::App for PtApp {
                 ui.label("Ctrl+T — new tab    Ctrl+Tab — cycle    F2 — shared context");
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a `PtApp` with exactly one workspace/saved-tab and every other
+    /// field set to the cheapest value that still type-checks —
+    /// `resume_saved_tabs` never touches `sampler`/`watcher`/dialog state,
+    /// so an unconnected channel and `None`s are enough. Not a full `new()`:
+    /// no sampler thread, no filesystem watcher, no `deliver_messages` pass.
+    fn app_with_one_saved_agent(base: PathBuf, cwd: PathBuf, session_id: Option<String>) -> PtApp {
+        // Tab id kept well clear of the small 1..=9 ids `term::tests` uses
+        // (`poll_alone_reports_child_exit` uses `1`, etc.) — those write to
+        // the SAME global `hooks::events_file(id)` path this spawn_agent
+        // call also writes to, and `cargo test` runs tests in parallel by
+        // default within one binary.
+        let saved = state::SavedTab {
+            tab_id: 90_210,
+            kind: state::SavedTabKind::Agent,
+            title: "test-agent".to_string(),
+            cwd,
+            worktree: None,
+            session_id,
+        };
+        let meta = state::Workspace {
+            name: "test-ws".to_string(),
+            repo_path: base.clone(),
+            is_git: false,
+            default_isolate: false,
+            kept_worktrees: vec![],
+            saved_tabs: vec![saved],
+            active_tab: 0,
+            msg_offset: 0,
+        };
+        let (_tx, sampler_rx) = std::sync::mpsc::channel();
+        PtApp {
+            base,
+            workspaces: vec![WsRt { meta, tabs: vec![], active_tab: 0 }],
+            active_ws: 0,
+            next_tab_id: 90_211,
+            sampler: sampler_rx,
+            last_snap: vec![],
+            machine: MachineStats::default(),
+            watcher: None,
+            pending_claim: None,
+            pending_folder_pick: None,
+            show_ctx_panel: false,
+            ctx_panel_text: String::new(),
+            ctx_panel_has_focus: false,
+            ctx_panel_loaded_for: None,
+            error: None,
+            new_tab: None,
+            closing: None,
+            roster_written: HashMap::new(),
+            partial_pending: HashSet::new(),
+            selected_child: None,
+        }
+    }
+
+    /// Polls `term` to completion (bounded) so the test doesn't leave an
+    /// orphaned `cmd.exe`/`claude.exe` process behind — same convention as
+    /// `term::tests::poll_alone_reports_child_exit`.
+    fn drain_to_exit(term: &mut term::TabTerm) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while term.exited().is_none() && std::time::Instant::now() < deadline {
+            term.poll();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// REVIEW FINDING 1 regression test. Before the fix, `resume_saved_tabs`
+    /// pushed a resumed agent `Tab` with `session_id: None` (that's what
+    /// `spawn_agent` always starts a fresh `Tab` at, resume or not — the
+    /// real value normally only arrives once the resumed agent's own
+    /// `SessionStart` hook fires). `PtApp::new` calls `deliver_messages` for
+    /// every workspace immediately after `resume_saved_tabs`
+    /// (`app.rs:285-287`), and `deliver_messages` calls `persist()`
+    /// whenever it consumes any bytes at all from `messages.jsonl` — so any
+    /// message pending at startup used to null out this tab's saved session
+    /// id in `state.json` before `SessionStart` had a chance to run,
+    /// permanently so if the resume attempt itself failed (a failed
+    /// `--resume <sid>` never fires `SessionStart` for that id at all).
+    ///
+    /// Reaches `resume_saved_tabs` directly — it's private, but this is a
+    /// same-module test — rather than driving a full `eframe`/ConPTY-backed
+    /// app loop: everything on `PtApp` besides `workspaces`/`base` can be
+    /// the cheapest value that type-checks, since `resume_saved_tabs` never
+    /// reads them. The spawned `cmd.exe /c claude --resume bogus-id-123`
+    /// child is real (not a test double) — `claude` need not even be
+    /// installed on the machine running this test for the assertion below
+    /// to hold, since carrying the saved id onto `tab.session_id` happens
+    /// synchronously in `resume_saved_tabs`, before the child process does
+    /// anything at all — but it's still polled to completion before the
+    /// test returns rather than left running.
+    #[test]
+    fn resume_carries_saved_session_id_onto_the_tab_before_any_hook_fires() {
+        let ctx = eframe::egui::Context::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_one_saved_agent(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            Some("bogus-id-123".to_string()),
+        );
+
+        app.resume_saved_tabs(&ctx);
+
+        assert_eq!(app.workspaces[0].tabs.len(), 1, "resume should have spawned exactly one tab");
+        assert_eq!(
+            app.workspaces[0].tabs[0].session_id,
+            Some("bogus-id-123".to_string()),
+            "resumed tab must carry the SAVED session id immediately (before any \
+             SessionStart hook), not start at None",
+        );
+
+        // Recreate the exact failure mode from the finding: an early
+        // persist() — standing in for `deliver_messages`'s startup call —
+        // must round-trip the SAME id through `state.json`, not null it.
+        app.persist();
+        assert_eq!(
+            app.workspaces[0].meta.saved_tabs[0].session_id,
+            Some("bogus-id-123".to_string()),
+            "an early persist() must not null out the saved session id for a \
+             just-resumed tab",
+        );
+        let (reloaded, _) = state::load(&app.base);
+        assert_eq!(
+            reloaded.workspaces[0].saved_tabs[0].session_id,
+            Some("bogus-id-123".to_string()),
+            "the id written to state.json on disk must survive the early persist too",
+        );
+
+        drain_to_exit(&mut app.workspaces[0].tabs[0].term);
     }
 }
