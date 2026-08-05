@@ -41,6 +41,13 @@ pub struct Workspace {
     pub active_tab: usize,
     #[serde(default)]
     pub msg_offset: u64,
+    /// Paths of every editor tab open in this workspace, mirrored from
+    /// live `EditorTab`s by `PtApp::persist` (Task 1: file editor tabs).
+    /// `#[serde(default)]` so an old state.json without this field (saved
+    /// before this feature existed) still loads — see
+    /// `mvp_state_still_loads` below.
+    #[serde(default)]
+    pub saved_editors: Vec<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -130,6 +137,7 @@ mod tests {
                 ],
                 active_tab: 0,
                 msg_offset: 42,
+                saved_editors: vec!["D:\\projectx\\README.md".into(), "D:\\projectx\\src\\main.rs".into()],
             }],
             next_tab_id: 7,
             active_ws: 0,
@@ -197,5 +205,6 @@ mod tests {
         assert_eq!(loaded.workspaces[0].saved_tabs, vec![]); // default
         assert_eq!(loaded.workspaces[0].active_tab, 0); // default
         assert_eq!(loaded.workspaces[0].msg_offset, 0); // default
+        assert_eq!(loaded.workspaces[0].saved_editors, Vec::<PathBuf>::new()); // default
     }
 }

@@ -1,14 +1,16 @@
 //! Dialogs: "new tab" (spawn agent/shell), "close tab" (merge/keep/discard a
-//! worktree), "close workspace" (Task 2 of the close-workspace feature), and
-//! the always-on-top error dialog. All four share `PtApp`'s per-frame
+//! worktree), "close workspace" (Task 2 of the close-workspace feature),
+//! "close editor" (Task 1's discard-unsaved-changes confirmation), and the
+//! always-on-top error dialog. All five share `PtApp`'s per-frame
 //! [`PtApp::show_dialogs`] entry point (called once from `app.rs::update`),
 //! rendered in strict priority order — error, then new-tab, then close tab,
-//! then close workspace — with an early `return` after whichever one draws,
-//! so at most one dialog is ever on screen at a time. The error dialog wins
-//! over the rest because it means something already went wrong; stacking a
-//! new decision on top of an unacknowledged error would only be confusing.
+//! then close workspace, then close editor — with an early `return` after
+//! whichever one draws, so at most one dialog is ever on screen at a time.
+//! The error dialog wins over the rest because it means something already
+//! went wrong; stacking a new decision on top of an unacknowledged error
+//! would only be confusing.
 
-use crate::app::{NewTabDraft, PendingClaim, PtApp};
+use crate::app::{self, NewTabDraft, PendingClaim, PtApp};
 use crate::hooks::AgentStatus;
 use crate::term::{self, SpawnSpec, TabKind};
 use crate::{git, shared_ctx};
@@ -218,6 +220,53 @@ impl PtApp {
             }
             if cancel {
                 self.closing_ws = None;
+            }
+            return;
+        }
+
+        // ---- close editor dialog (Task 1: file editor tabs) ----
+        if let Some(draft) = &self.closing_editor {
+            // Resolved by IDENTITY (`ws_index` + `editor_id`), same non-modal
+            // rationale as every other draft above — see
+            // [`CloseEditorDraft`]'s doc comment in `app.rs`.
+            let ws_index = draft.ws_index;
+            let editor_id = draft.editor_id;
+            let Some(ws) = self.workspaces.get(ws_index) else {
+                self.closing_editor = None;
+                return;
+            };
+            let Some(ed) = ws.editors.iter().find(|e| e.id == editor_id) else {
+                self.closing_editor = None;
+                return;
+            };
+            let file_name = ed
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ed.path.display().to_string());
+            let mut discard = false;
+            let mut cancel = false;
+            egui::Window::new(format!("Discard unsaved changes to `{file_name}`?"))
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Discard").clicked() {
+                            discard = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if discard {
+                if let Some(ws) = self.workspaces.get_mut(ws_index) {
+                    app::remove_editor(ws, editor_id);
+                }
+                self.closing_editor = None;
+                self.persist();
+            }
+            if cancel {
+                self.closing_editor = None;
             }
         }
     }
