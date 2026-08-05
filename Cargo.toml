@@ -2,6 +2,9 @@
 name = "pterminal"
 version = "0.1.0"
 edition = "2024"
+# `src/bin/pterm_hook.rs` adds a second binary target; pin `cargo run` to the
+# GUI app so it stays unambiguous without an explicit `--bin`.
+default-run = "pterminal"
 
 [dependencies]
 # src/egui_term_vendored is a patched copy of egui_term 0.1.0; these three are its

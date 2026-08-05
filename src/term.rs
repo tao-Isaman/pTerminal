@@ -240,7 +240,15 @@ pub fn spawn_agent(
     // on disk. Run it as a unit so any error can trigger rollback below
     // instead of leaking the worktree + branch via a bare `?`.
     let build: anyhow::Result<Tab> = (|| {
-        hooks::write_settings(&cwd, id, spec.main_repo_shared_md.as_deref())?;
+        let hook_setup = hooks::HookSetup {
+            tab_id: id,
+            shared_md: spec.main_repo_shared_md.as_deref(),
+            // Task 5 threads the real per-agent README once dialogs.rs
+            // (open_tab) generates one via shared_ctx::write_agent_readme.
+            agent_readme: None,
+            agent_name: &slug,
+        };
+        hooks::write_settings(&cwd, &hook_setup)?;
         // truncate any stale event file from a previous run of this id
         let _ = std::fs::write(hooks::events_file(id), "");
 
