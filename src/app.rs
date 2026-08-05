@@ -13,6 +13,7 @@
 //! modal call there would stall `update` for as long as the dialog is open,
 //! and with it every tab's poll — see that function's docs.
 
+use crate::commands;
 use crate::git;
 use crate::hooks::{self, AgentStatus};
 use crate::messages;
@@ -24,7 +25,7 @@ use crate::watcher;
 use eframe::egui;
 use notify::RecommendedWatcher;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 pub struct WsRt {
@@ -117,6 +118,33 @@ fn close_draft_for(ws: &WsRt, ws_index: usize, tab_idx: usize) -> Option<CloseDr
         .map(|wt| git::is_dirty(&wt.path).unwrap_or(true))
         .unwrap_or(false);
     Some(CloseDraft { ws_index, tab_id: tab.id, dirty, confirm_discard: false })
+}
+
+/// True if `a` and `b` name the same directory, for [`PtApp::handle_resume_command`]'s
+/// find-or-create workspace lookup. `pterminal resume --dir <path>` is
+/// arbitrary shell text — it need not be absolute, need not match the case
+/// Windows reports back, and need not resolve symlinks/`..` the same way a
+/// workspace's stored `repo_path` (originally chosen through the native
+/// folder picker) already does — so a bare `PathBuf` `==` would miss real
+/// matches (e.g. `D:\repo` from a shell vs. `D:\Repo\.` as stored) far too
+/// easily, silently spawning a duplicate workspace for what the user
+/// considers the same directory.
+///
+/// Canonicalizing both sides first (`std::fs::canonicalize`) fixes that, but
+/// canonicalize requires the path to exist — so it can legitimately fail on
+/// EITHER side (a workspace whose folder was deleted since it was added;
+/// `handle_resume_command` already rejects a nonexistent `cmd.dir` before
+/// this is ever called, but a stale workspace path is a real, independent
+/// failure mode). Falling back to plain equality in that case, rather than
+/// treating a canonicalize failure as "never matches", is the documented
+/// (task-brief) choice: it degrades to the pre-canonicalize behavior instead
+/// of guaranteeing a spurious new workspace every time one side can't be
+/// resolved.
+fn paths_match(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
 }
 
 pub struct PtApp {
@@ -321,6 +349,17 @@ impl PtApp {
             saved_active_ws.min(app.workspaces.len() - 1)
         };
 
+        // Task 2: drain any `pterminal resume` command files written before
+        // this launch (the CLI's own fallback-to-GUI-launch path, and any
+        // command file left over from a launch that crashed before it got a
+        // chance to drain). Deliberately AFTER `resume_saved_tabs` (so a
+        // transferred tab doesn't collide with `next_tab_id`/hook-takeover
+        // bookkeeping still mid-setup) and BEFORE the startup
+        // `deliver_messages` pass below, so a same-launch transferred tab is
+        // already a real, addressable agent tab by the time queued messages
+        // get delivered.
+        app.drain_resume_commands(&cc.egui_ctx);
+
         // Step 7: deliver any messages written to a workspace's
         // `messages.jsonl` while the app was closed. The filesystem watcher
         // only reports events that happen while it's running, so without an
@@ -513,16 +552,192 @@ impl PtApp {
         }
     }
 
+    /// Task 2: drains every pending `pterminal resume` command file
+    /// (`commands::read_and_delete_commands`) and hands each parsed command
+    /// to [`PtApp::handle_resume_command`]. Called from two places: once at
+    /// startup (`PtApp::new`, after `resume_saved_tabs`/before the startup
+    /// `deliver_messages` pass) to pick up commands written before this
+    /// launch existed to see them, and again from `drain_events` whenever
+    /// the filesystem watcher reports a change under `commands::commands_dir()`
+    /// (a `pterminal resume` invocation while this instance is already
+    /// running). One shared entry point so the malformed-file banner below
+    /// can't drift between the two call sites.
+    ///
+    /// A malformed command file (one that failed to parse as JSON — Task 1's
+    /// contract) is deleted along with the good ones (`read_and_delete_commands`
+    /// already did that) and reported **once, combined into a single count**
+    /// rather than per-file, appended to any error `handle_resume_command`
+    /// itself already raised this call so one drain never clobbers another's
+    /// banner (`self.error` only holds one message at a time — same
+    /// combine-with-`;` convention `deliver_messages` uses for its own two
+    /// independent failure modes).
+    fn drain_resume_commands(&mut self, ctx: &egui::Context) {
+        let (cmds, malformed) = commands::read_and_delete_commands();
+        for cmd in cmds {
+            self.handle_resume_command(ctx, cmd);
+        }
+        if malformed > 0 {
+            let noun = if malformed == 1 { "file" } else { "files" };
+            let msg = format!("resume: {malformed} malformed command {noun} skipped");
+            self.error = Some(match self.error.take() {
+                Some(existing) => format!("{existing}; {msg}"),
+                None => msg,
+            });
+        }
+    }
+
+    /// Handles one parsed `pterminal resume --id <sid> --dir <path>`
+    /// command (Task 2): finds the workspace whose `repo_path` matches
+    /// `cmd.dir` (see [`paths_match`]), creating one if none exists yet —
+    /// **exactly like a manual "+ workspace" pick**, via
+    /// [`PtApp::finish_add_workspace`] itself (name from the folder,
+    /// `is_git`/`default_isolate` autodetected, no saved tabs, no picker
+    /// dialog) — then opens a fresh agent tab in it mirroring
+    /// `dialogs::open_tab`'s agent path: the same direct-mode hook-takeover
+    /// degrade, the same `shared.md`/`.gitignore`/per-agent-README wiring
+    /// for a git repo, and the same unique-title/`PendingClaim`/persist
+    /// dance — with two deliberate differences from a brand-new tab:
+    /// `resume_session: Some(cmd.session_id)` instead of a fresh
+    /// prompt-driven launch (`prompt` is therefore empty — ignored by
+    /// `spawn_agent` in the resume branch anyway, see `SpawnSpec`'s docs),
+    /// and a `resumed-<first 8 chars of the session id>` title instead of a
+    /// slugged prompt, run through the same [`term::unique_title`] so it
+    /// can't collide with an already-open agent tab. `worktree: None` /
+    /// `isolate: false` unconditionally: a resume always lands directly in
+    /// the workspace's main checkout, never a fresh isolated worktree —
+    /// matching `resume_saved_tabs`'s own resume path, and matching the
+    /// fact that `spawn_agent` ignores `isolate` entirely once
+    /// `resume_session` is `Some`.
+    ///
+    /// **`cmd.dir` must already exist on disk, checked up front.** Unlike
+    /// `finish_add_workspace` (only ever reached via a native folder-picker
+    /// that structurally cannot return a path that doesn't exist), a resume
+    /// command's `--dir` is arbitrary text the CLI wrote into a JSON file —
+    /// it could name a typo'd path, a directory deleted since the CLI ran,
+    /// or (a bogus id, tested live) a path that simply never existed.
+    /// Silently `create_dir_all`-ing it (the way `finish_add_workspace`'s
+    /// downstream `spawn_agent`/`git` calls effectively would) would invent
+    /// a workspace the user never asked for out of a typo. Rejected here
+    /// instead, with a one-line, keep-going error banner — the same
+    /// non-fatal-degradation mechanism `deliver_messages`/`resume_saved_tabs`
+    /// already use for every other per-command failure in this module — and
+    /// the command is otherwise skipped entirely: no workspace lookup, no
+    /// creation, no spawn attempt.
+    fn handle_resume_command(&mut self, ctx: &egui::Context, cmd: commands::ResumeCmd) {
+        if !cmd.dir.is_dir() {
+            self.error = Some(format!("resume: directory does not exist: {}", cmd.dir.display()));
+            return;
+        }
+
+        let ws_index = match self.workspaces.iter().position(|ws| paths_match(&ws.meta.repo_path, &cmd.dir)) {
+            Some(i) => i,
+            None => {
+                self.finish_add_workspace(cmd.dir.clone());
+                self.workspaces.len() - 1
+            }
+        };
+
+        // Same PID-claim snapshot dance as `dialogs::open_tab` /
+        // `open_kept_worktree`: capture our own children before spawning so
+        // `drain_events` can tell which new PID belongs to this tab.
+        let before: HashSet<u32> = self
+            .last_snap
+            .iter()
+            .filter(|p| p.parent == Some(std::process::id()))
+            .map(|p| p.pid)
+            .collect();
+
+        // `next_tab_id`/`persist` ordering mirrors `dialogs::open_tab`: the
+        // counter is claimed and saved before the spawn even runs, so a
+        // crash mid-spawn can never hand out the same id twice.
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.persist();
+
+        let Some(ws) = self.workspaces.get_mut(ws_index) else { return };
+        let repo = ws.meta.repo_path.clone();
+        let is_git = ws.meta.is_git;
+
+        // Direct-mode hook takeover (see `dialogs::open_tab`'s doc comment
+        // for the full rationale): this resume is always a direct
+        // (isolate: false) spawn, so it just repointed
+        // `.claude/settings.local.json`'s hook routing away from any other
+        // live direct-mode agent tab already running at `repo`.
+        for other in ws.tabs.iter_mut() {
+            if other.kind == TabKind::Agent
+                && other.worktree.is_none()
+                && other.cwd == repo
+                && other.status != AgentStatus::Exited
+            {
+                other.status = AgentStatus::Unknown;
+            }
+        }
+
+        let (shared, agent_readme) = if is_git {
+            let shared = match shared_ctx::ensure_shared_md(&repo) {
+                Ok(p) => {
+                    if shared_ctx::gitignore_needs_entry(&repo) {
+                        if let Err(e) = shared_ctx::add_gitignore_entry(&repo) {
+                            self.error = Some(format!("could not update .gitignore: {e}"));
+                        }
+                    }
+                    Some(p)
+                }
+                Err(e) => {
+                    self.error = Some(e.to_string());
+                    None
+                }
+            };
+            (shared, shared_ctx::write_agent_readme(&repo).ok())
+        } else {
+            (None, None)
+        };
+
+        let existing_titles: Vec<String> =
+            ws.tabs.iter().filter(|t| t.kind == TabKind::Agent).map(|t| t.title.clone()).collect();
+        let sid_prefix: String = cmd.session_id.chars().take(8).collect();
+        let title = term::unique_title(&format!("resumed-{sid_prefix}"), &existing_titles);
+
+        let result = term::spawn_agent(
+            ctx,
+            id,
+            &term::SpawnSpec {
+                workspace_repo: repo,
+                main_repo_shared_md: shared,
+                prompt: String::new(),
+                isolate: false,
+                agent_readme,
+                resume_session: Some(cmd.session_id.clone()),
+                title: Some(title),
+                worktree: None,
+            },
+        );
+
+        match result {
+            Ok(tab) => {
+                let ws = &mut self.workspaces[ws_index];
+                ws.tabs.push(tab);
+                ws.active_tab = ws.tabs.len() - 1;
+                self.pending_claim = Some(PendingClaim { ws_index, tab_id: id, before });
+                self.active_ws = ws_index;
+                self.persist();
+            }
+            Err(e) => self.error = Some(format!("resume: {e}")),
+        }
+    }
+
     /// Directories the filesystem watcher should cover: the hooks events
-    /// dir (tab status glyphs) plus every workspace's `.pterminal` dir
-    /// (F2 shared-context panel live-reload). `spawn_watcher` creates each
-    /// directory if it doesn't exist yet, so adding a workspace eagerly
-    /// creates its `.pterminal` folder even before any agent has spawned
-    /// there — a small side effect of watching it up front (previously that
-    /// directory only appeared on first agent spawn, via
-    /// `shared_ctx::ensure_shared_md`).
+    /// dir (tab status glyphs), every workspace's `.pterminal` dir (F2
+    /// shared-context panel live-reload), and (Task 2) `commands::commands_dir()`
+    /// — so a `pterminal resume` invocation's command file, written while
+    /// THIS instance is already running, is noticed without the user having
+    /// to relaunch. `spawn_watcher` creates each directory if it doesn't
+    /// exist yet, so adding a workspace eagerly creates its `.pterminal`
+    /// folder even before any agent has spawned there — a small side effect
+    /// of watching it up front (previously that directory only appeared on
+    /// first agent spawn, via `shared_ctx::ensure_shared_md`).
     fn watcher_dirs(workspaces: &[WsRt]) -> Vec<PathBuf> {
-        let mut dirs = vec![hooks::events_dir()];
+        let mut dirs = vec![hooks::events_dir(), commands::commands_dir()];
         dirs.extend(workspaces.iter().map(|w| w.meta.repo_path.join(".pterminal")));
         dirs
     }
@@ -754,8 +969,22 @@ impl PtApp {
         // N session-id updates landing in the same frame cost one
         // `state.json` write, not N.
         let mut session_changed = false;
+        // Task 2: set inside the loop below when any changed path lands
+        // under `commands::commands_dir()` — a running instance's pickup of
+        // a `pterminal resume` invocation. `read_and_delete_commands`
+        // already drains every pending file in one call, so this is only a
+        // flag (not a per-path handle), letting several Create/Modify
+        // events in the same frame (two `resume` invocations at once, or a
+        // Create+Modify pair for one file) collapse into a single drain
+        // after the loop rather than one drain per event.
+        let mut commands_ready = false;
+        let commands_dir = commands::commands_dir();
         for path in changed {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if path.parent() == Some(commands_dir.as_path()) {
+                commands_ready = true;
+                continue;
+            }
             // F2 panel live-reload: a workspace's shared.md changed on disk
             // (edited externally, e.g. in Notepad, or by an agent's
             // SessionStart hook appending to it). Only act while the panel
@@ -857,6 +1086,15 @@ impl PtApp {
         }
         if session_changed {
             self.persist();
+        }
+        // Task 2: a running instance's pickup of one or more `pterminal
+        // resume` command files (see `commands_ready`'s docs above). Runs
+        // after the hook-event loop, same relative position `deliver_messages`'s
+        // messages.jsonl branch already ran in above — nothing here depends
+        // on that ordering, it's just "handle every kind of watcher event
+        // exactly once per frame" grouped together.
+        if commands_ready {
+            self.drain_resume_commands(ctx);
         }
         // Step 7 (continued): retry any workspace whose last delivery left a
         // trailing partial line unconsumed, even without a fresh watcher
@@ -2353,5 +2591,94 @@ mod tests {
         );
 
         exit_and_drain(&mut app.workspaces[0].tabs[0].term);
+    }
+
+    // ---- paths_match (Task 2's find-workspace comparison) ----
+    //
+    // Pure and disk-only-via-`canonicalize` (no process spawn, no
+    // `PtApp`/state), so these are the cheap end of Task 2's contract —
+    // the actual `handle_resume_command`/`drain_resume_commands` wiring
+    // that calls into `spawn_agent` is exercised live instead (see the
+    // task report), matching `resume_carries_saved_session_id_...`'s own
+    // note above about why a real `--resume` spawn isn't something this
+    // suite drives.
+
+    #[test]
+    fn paths_match_same_existing_dir_is_true() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(paths_match(dir.path(), dir.path()));
+    }
+
+    #[test]
+    fn paths_match_different_existing_dirs_is_false() {
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
+        assert!(!paths_match(a.path(), b.path()));
+    }
+
+    #[test]
+    fn paths_match_is_case_insensitive_via_canonicalize() {
+        // Windows' filesystem is case-insensitive, but `PathBuf`'s
+        // `PartialEq` compares components as plain (case-sensitive)
+        // `OsStr`s — exactly the gap `canonicalize` closes, since both
+        // sides exist on disk here and Windows resolves either casing to
+        // the identical file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lower = PathBuf::from(dir.path().to_string_lossy().to_lowercase());
+        let upper = PathBuf::from(dir.path().to_string_lossy().to_uppercase());
+        assert_ne!(lower, upper, "test assumption: raw PathBuf equality must be case-sensitive");
+        assert!(paths_match(&lower, &upper));
+    }
+
+    #[test]
+    fn paths_match_falls_back_to_raw_equality_for_the_same_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist");
+        // Both sides fail to canonicalize (neither exists) — falls back to
+        // plain `PathBuf` equality, which holds since it's the same path.
+        assert!(paths_match(&missing, &missing.clone()));
+    }
+
+    #[test]
+    fn paths_match_falls_back_to_raw_equality_for_different_missing_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_a = dir.path().join("does-not-exist-a");
+        let missing_b = dir.path().join("does-not-exist-b");
+        assert!(!paths_match(&missing_a, &missing_b));
+    }
+
+    #[test]
+    fn paths_match_an_existing_dir_never_matches_a_missing_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist");
+        assert!(!paths_match(dir.path(), &missing));
+    }
+
+    // ---- handle_resume_command's up-front existence check ----
+    //
+    // This branch returns before touching `next_tab_id`/`spawn_agent`, so
+    // it's cheap to exercise directly with `app_with_tabs`'s zero-tabs
+    // form — no ConPTY child, no `claude`/`cmd.exe` process, just the
+    // banner + early-return behavior the live "bogus id" acceptance run
+    // documents separately for the full spawn path.
+
+    #[test]
+    fn resume_into_a_nonexistent_directory_banners_and_creates_no_workspace() {
+        let ctx = eframe::egui::Context::default();
+        let base = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_tabs(base.path().to_path_buf(), repo.path().to_path_buf(), vec![]);
+        let missing = repo.path().join("does-not-exist-at-all");
+
+        app.handle_resume_command(
+            &ctx,
+            commands::ResumeCmd { session_id: "abc12345".to_string(), dir: missing.clone() },
+        );
+
+        assert_eq!(app.workspaces.len(), 1, "must not create a workspace for a nonexistent --dir");
+        assert!(app.workspaces[0].tabs.is_empty(), "must not spawn a tab for a nonexistent --dir");
+        let err = app.error.expect("expected an error banner");
+        assert!(err.contains("resume: directory does not exist"), "unexpected banner text: {err}");
+        assert!(err.contains(&missing.display().to_string()), "banner should name the missing dir: {err}");
     }
 }

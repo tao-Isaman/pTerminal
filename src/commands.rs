@@ -124,8 +124,8 @@ fn write_command_in(cmd: &ResumeCmd, dir: &Path) -> anyhow::Result<PathBuf> {
 /// directory (nothing has ever written a command) is not an error — it's
 /// just an empty drain.
 ///
-/// Consumed by Task 2's startup/poll drain; unused within Task 1 itself.
-#[allow(dead_code)] // consumed in Task 2
+/// Consumed by Task 2's startup/poll drain (`PtApp::drain_resume_commands`
+/// in `app.rs`, called from both `PtApp::new` and `drain_events`).
 pub fn read_and_delete_commands() -> (Vec<ResumeCmd>, usize) {
     read_and_delete_commands_in(&commands_dir())
 }

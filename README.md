@@ -45,6 +45,44 @@ The active workspace and active tab are restored too. Known limitation: a resume
 skips PID resource-monitor claiming (single-slot bookkeeping, documented in-code) — CPU/RAM on
 hover may read blank for a resumed tab until its next natural respawn.
 
+## Transfer a session
+
+A Claude Code session started outside pTerminal (a bare terminal, another editor's integrated
+shell, `claude --resume` from a plain shell) can be pulled into pTerminal — a new tab that
+continues the exact same conversation — with one command:
+
+```
+pterminal resume --id <session-id> [--dir <path>]
+```
+
+- **`--id`** is the Claude Code session id (as printed by `claude --resume`'s picker, or from
+  `~/.claude/projects/<slug>/*.jsonl`'s filename). Required; anything containing `/`, `\`, or
+  `.` is rejected as invalid before anything else happens.
+- **`--dir`** is the directory the session was originally running in — Claude Code sessions are
+  per-directory, so `--resume <id>` only reattaches correctly when run from (or pointed at) that
+  same directory. Defaults to the current directory if omitted, matching plain `claude --resume`'s
+  own behavior. The directory must already exist: pTerminal never creates one on your behalf, and
+  a `--dir` naming a path that doesn't exist fails with an in-app error banner
+  ("resume: directory does not exist: `<path>`") rather than inventing an empty workspace for a
+  typo.
+- **pTerminal already running** — the command hands off to it and exits immediately
+  (`sent to running pTerminal (session <id>)`, exit 0): the workspace matching `--dir` (matched by
+  canonicalized path, so a relative or differently-cased `--dir` still finds it) gets a new tab
+  resuming the session, or a brand-new workspace is created for it first (named after the
+  directory, worktrees/isolation defaulted the same way "+ workspace" would) if no open workspace
+  points there yet. No restart, no dialog — the tab just appears, and becomes the active tab of
+  its workspace.
+- **pTerminal not running** — the command falls through to a normal GUI launch; the new instance
+  picks up the same request during its own startup, before it delivers any queued
+  agent-to-agent messages, so a transfer and a message to that same agent sent around the same
+  time both land correctly on first launch.
+- **Unknown or already-expired session id** — pTerminal does no validation of its own against
+  Claude Code's session store; the tab opens and runs `claude --resume <id>` exactly like any
+  other resumed tab, so a bad id's failure is whatever `claude` itself prints, visible directly in
+  that tab's terminal — not a pTerminal-level error.
+- **Bad invocation** (missing `--id`, an unknown flag, or any subcommand other than `resume`) —
+  usage text on stderr and exit code 2; nothing is written or launched.
+
 ## Messaging
 
 Agents in the same workspace can message each other; delivery is live, typed straight into
