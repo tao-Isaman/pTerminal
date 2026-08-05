@@ -7,6 +7,24 @@ pub struct WorktreeInfo {
     pub branch: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub enum SavedTabKind {
+    Agent,
+    Shell,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SavedTab {
+    pub tab_id: u64,
+    pub kind: SavedTabKind,
+    pub title: String,
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub worktree: Option<WorktreeInfo>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Workspace {
     pub name: String,
@@ -17,6 +35,12 @@ pub struct Workspace {
     pub default_isolate: bool,
     #[serde(default)]
     pub kept_worktrees: Vec<WorktreeInfo>,
+    #[serde(default)]
+    pub saved_tabs: Vec<SavedTab>,
+    #[serde(default)]
+    pub active_tab: usize,
+    #[serde(default)]
+    pub msg_offset: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -25,6 +49,8 @@ pub struct AppState {
     pub workspaces: Vec<Workspace>,
     #[serde(default)]
     pub next_tab_id: u64,
+    #[serde(default)]
+    pub active_ws: usize,
 }
 
 pub fn default_base() -> PathBuf {
@@ -84,8 +110,29 @@ mod tests {
                 is_git: true,
                 default_isolate: true,
                 kept_worktrees: vec![WorktreeInfo { path: "D:\\projectx-wt\\fix".into(), branch: "pt/fix".into() }],
+                saved_tabs: vec![
+                    SavedTab {
+                        tab_id: 1,
+                        kind: SavedTabKind::Agent,
+                        title: "agent-1".into(),
+                        cwd: "D:\\projectx".into(),
+                        worktree: Some(WorktreeInfo { path: "D:\\projectx-wt\\fix".into(), branch: "pt/fix".into() }),
+                        session_id: Some("session-123".into()),
+                    },
+                    SavedTab {
+                        tab_id: 2,
+                        kind: SavedTabKind::Shell,
+                        title: "shell-1".into(),
+                        cwd: "D:\\projectx".into(),
+                        worktree: None,
+                        session_id: None,
+                    },
+                ],
+                active_tab: 0,
+                msg_offset: 42,
             }],
             next_tab_id: 7,
+            active_ws: 0,
         };
         save(dir.path(), &s).unwrap();
         let (loaded, msg) = load(dir.path());
@@ -122,5 +169,33 @@ mod tests {
         assert!(msg.is_some());
         // Directory should still exist (not touched by load)
         assert!(dir.path().join("state.json").is_dir());
+    }
+
+    #[test]
+    fn mvp_state_still_loads() {
+        // Backward compatibility: old MVP state.json without new fields should load with defaults
+        let dir = tempfile::tempdir().unwrap();
+        let mvp_json = r#"{
+  "workspaces": [
+    {
+      "name": "old-project",
+      "repo_path": "D:\\old-project",
+      "is_git": true,
+      "default_isolate": false,
+      "kept_worktrees": []
+    }
+  ],
+  "next_tab_id": 5
+}"#;
+        std::fs::write(dir.path().join("state.json"), mvp_json).unwrap();
+        let (loaded, msg) = load(dir.path());
+        assert!(msg.is_none());
+        assert_eq!(loaded.next_tab_id, 5);
+        assert_eq!(loaded.active_ws, 0); // default
+        assert_eq!(loaded.workspaces.len(), 1);
+        assert_eq!(loaded.workspaces[0].name, "old-project");
+        assert_eq!(loaded.workspaces[0].saved_tabs, vec![]); // default
+        assert_eq!(loaded.workspaces[0].active_tab, 0); // default
+        assert_eq!(loaded.workspaces[0].msg_offset, 0); // default
     }
 }

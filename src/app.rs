@@ -278,6 +278,7 @@ impl PtApp {
         let st = state::AppState {
             workspaces: self.workspaces.iter().map(|w| w.meta.clone()).collect(),
             next_tab_id: self.next_tab_id,
+            active_ws: self.active_ws,
         };
         if let Err(e) = state::save(&self.base, &st) {
             self.error = Some(format!("could not save state: {e}"));
@@ -326,6 +327,9 @@ impl PtApp {
                 is_git,
                 default_isolate: is_git,
                 kept_worktrees: vec![],
+                saved_tabs: vec![],
+                active_tab: 0,
+                msg_offset: 0,
             },
             tabs: vec![],
             active_tab: 0,
