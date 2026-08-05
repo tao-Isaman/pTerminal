@@ -1711,16 +1711,35 @@ mod tests {
     /// `resume_saved_tabs` never touches `sampler`/`watcher`/dialog state,
     /// so an unconnected channel and `None`s are enough. Not a full `new()`:
     /// no sampler thread, no filesystem watcher, no `deliver_messages` pass.
-    fn app_with_one_saved_agent(base: PathBuf, cwd: PathBuf, session_id: Option<String>) -> PtApp {
+    ///
+    /// Uses `SavedTabKind::Shell`, not `Agent` — deliberately. The fix under
+    /// test (`resume_saved_tabs`' `Ok(mut tab) => tab.session_id = ...`)
+    /// lives in the shared post-match block that runs identically for both
+    /// kinds (see `resume_saved_tabs`), so `Shell` exercises the exact same
+    /// fixed line while spawning `powershell.exe` — a child this test can
+    /// end deterministically via `write_input("exit\r")`, matching
+    /// `term::tests::write_input_reaches_pty`'s convention. `Agent` was
+    /// tried first and had to be abandoned: it drives `spawn_agent`, whose
+    /// `agent_args` builds `cmd.exe /c claude --resume bogus-id-123`, and
+    /// under a real ConPTY that process did NOT exit or fail fast — three
+    /// separate timed runs each ran to a 15s bounded wait exactly on the
+    /// nose rather than exiting early, leaving real orphaned `claude.exe`/
+    /// `cmd.exe` processes behind every time this test ran (confirmed via
+    /// `Get-CimInstance Win32_Process`). Likely `claude` presents some kind
+    /// of interactive continuation prompt for an unresolvable `--resume`
+    /// target rather than erroring out non-interactively — plausible, not
+    /// confirmed; not this task's bug to chase. `Shell` sidesteps needing to
+    /// know or rely on that CLI's behavior at all.
+    fn app_with_one_saved_shell_tab(base: PathBuf, cwd: PathBuf, session_id: Option<String>) -> PtApp {
         // Tab id kept well clear of the small 1..=9 ids `term::tests` uses
         // (`poll_alone_reports_child_exit` uses `1`, etc.) — those write to
-        // the SAME global `hooks::events_file(id)` path this spawn_agent
-        // call also writes to, and `cargo test` runs tests in parallel by
+        // the SAME global `hooks::events_file(id)` path a same-id spawn
+        // would also touch, and `cargo test` runs tests in parallel by
         // default within one binary.
         let saved = state::SavedTab {
             tab_id: 90_210,
-            kind: state::SavedTabKind::Agent,
-            title: "test-agent".to_string(),
+            kind: state::SavedTabKind::Shell,
+            title: "test-shell".to_string(),
             cwd,
             worktree: None,
             session_id,
@@ -1760,46 +1779,47 @@ mod tests {
         }
     }
 
-    /// Polls `term` to completion (bounded) so the test doesn't leave an
-    /// orphaned `cmd.exe`/`claude.exe` process behind — same convention as
-    /// `term::tests::poll_alone_reports_child_exit`.
-    fn drain_to_exit(term: &mut term::TabTerm) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    /// Sends a graceful `exit` and polls `term` to completion (bounded) so
+    /// the test doesn't leave an orphaned `powershell.exe` process behind —
+    /// same convention as `term::tests::write_input_reaches_pty`.
+    fn exit_and_drain(term: &mut term::TabTerm) {
+        term.write_input("exit\r");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while term.exited().is_none() && std::time::Instant::now() < deadline {
             term.poll();
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        assert!(term.exited().is_some(), "test's own shell tab failed to exit — would leak a process");
     }
 
     /// REVIEW FINDING 1 regression test. Before the fix, `resume_saved_tabs`
-    /// pushed a resumed agent `Tab` with `session_id: None` (that's what
-    /// `spawn_agent` always starts a fresh `Tab` at, resume or not — the
-    /// real value normally only arrives once the resumed agent's own
-    /// `SessionStart` hook fires). `PtApp::new` calls `deliver_messages` for
-    /// every workspace immediately after `resume_saved_tabs`
-    /// (`app.rs:285-287`), and `deliver_messages` calls `persist()`
-    /// whenever it consumes any bytes at all from `messages.jsonl` — so any
-    /// message pending at startup used to null out this tab's saved session
-    /// id in `state.json` before `SessionStart` had a chance to run,
-    /// permanently so if the resume attempt itself failed (a failed
-    /// `--resume <sid>` never fires `SessionStart` for that id at all).
+    /// pushed a resumed `Tab` with `session_id: None` (that's what
+    /// `spawn_agent`/`spawn_shell` always start a fresh `Tab` at — for an
+    /// agent, the real value normally only arrives once the resumed
+    /// session's own `SessionStart` hook fires). `PtApp::new` calls
+    /// `deliver_messages` for every workspace immediately after
+    /// `resume_saved_tabs` (`app.rs:285-287`), and `deliver_messages` calls
+    /// `persist()` whenever it consumes any bytes at all from
+    /// `messages.jsonl` — so any message pending at startup used to null
+    /// out a resumed tab's saved session id in `state.json` before
+    /// `SessionStart` had a chance to run, permanently so for an agent
+    /// whose resume attempt itself failed (a failed `--resume <sid>` never
+    /// fires `SessionStart` for that id at all).
     ///
     /// Reaches `resume_saved_tabs` directly — it's private, but this is a
     /// same-module test — rather than driving a full `eframe`/ConPTY-backed
     /// app loop: everything on `PtApp` besides `workspaces`/`base` can be
     /// the cheapest value that type-checks, since `resume_saved_tabs` never
-    /// reads them. The spawned `cmd.exe /c claude --resume bogus-id-123`
-    /// child is real (not a test double) — `claude` need not even be
-    /// installed on the machine running this test for the assertion below
-    /// to hold, since carrying the saved id onto `tab.session_id` happens
-    /// synchronously in `resume_saved_tabs`, before the child process does
-    /// anything at all — but it's still polled to completion before the
-    /// test returns rather than left running.
+    /// reads them. See `app_with_one_saved_shell_tab`'s docs for why this
+    /// uses a `Shell`-kind saved tab (spawns real `powershell.exe`, not
+    /// `claude`) even though the finding itself was reported against agent
+    /// tabs — the fixed line is in the shared `Ok(mut tab)` arm both kinds
+    /// go through identically.
     #[test]
     fn resume_carries_saved_session_id_onto_the_tab_before_any_hook_fires() {
         let ctx = eframe::egui::Context::default();
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut app = app_with_one_saved_agent(
+        let mut app = app_with_one_saved_shell_tab(
             dir.path().to_path_buf(),
             dir.path().to_path_buf(),
             Some("bogus-id-123".to_string()),
@@ -1832,6 +1852,6 @@ mod tests {
             "the id written to state.json on disk must survive the early persist too",
         );
 
-        drain_to_exit(&mut app.workspaces[0].tabs[0].term);
+        exit_and_drain(&mut app.workspaces[0].tabs[0].term);
     }
 }
