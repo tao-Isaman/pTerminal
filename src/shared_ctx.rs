@@ -64,6 +64,52 @@ pub fn write_agent_readme(repo: &Path) -> anyhow::Result<PathBuf> {
     Ok(p)
 }
 
+/// Writes (overwriting any previous copy — this file is fully generated,
+/// same convention as [`write_agent_readme`]) the orchestrator's own
+/// `README-orchestrator.md` (Task 3, editor-orchestrator): the orchestrator
+/// agent's counterpart to a normal workspace agent's `README-agents.md`,
+/// but with different content — the orchestrator isn't working IN a
+/// per-repo checkout, it's the one agent coordinating every OTHER
+/// workspace, so the per-repo coordination doc's instructions don't apply
+/// to it. Every path embedded is absolute (via [`status_md_path`]/
+/// [`messages_path`] on `orch_dir`), same reasoning as `write_agent_readme`:
+/// copy-pasteable regardless of the reading agent's own working directory.
+pub fn write_orchestrator_readme(orch_dir: &Path) -> anyhow::Result<PathBuf> {
+    let p = orchestrator_readme_path(orch_dir);
+    std::fs::create_dir_all(p.parent().unwrap())?;
+    let status = status_md_path(orch_dir);
+    let messages = messages_path(orch_dir);
+    let text = format!(
+        "# Orchestrator\n\n\
+        This file is generated and overwritten on every orchestrator launch — don't edit it.\n\n\
+        You are the orchestrator: the one agent coordinating every workspace pTerminal has \
+        open, not an agent working inside any particular checkout — this directory is \
+        pTerminal's own scratch space, one per install, not a repo.\n\n\
+        ## Live status\n\n\
+        Every other workspace's running agent tabs (name, status, working directory) are kept \
+        up to date at:\n\n\
+        `{status}`\n\n\
+        Re-read it any time you need the current picture — it is rewritten whenever an agent's \
+        status changes.\n\n\
+        ## Directing a workspace agent\n\n\
+        To ask a specific agent in a specific workspace to do something, append ONE line to:\n\n\
+        `{messages}`\n\n\
+        containing:\n\n\
+        `{{\"to\":\"<workspace>/<agent>\",\"from\":\"orchestrator\",\"text\":\"...\"}}`\n\n\
+        ## Replies\n\n\
+        Agents reply to you by addressing their own outgoing message's `to` field to the \
+        reserved name `\"orchestrator\"`; their replies are delivered into THIS session \
+        automatically — you don't need to poll for them.\n\n\
+        ## Your job\n\n\
+        Relay outcomes back to the user as they come in — you're the single point of contact \
+        coordinating everyone else's work.\n",
+        status = status.display(),
+        messages = messages.display(),
+    );
+    std::fs::write(&p, text)?;
+    Ok(p)
+}
+
 /// Root directory for the reserved orchestrator workspace (editor-
 /// orchestrator feature, Task 2): `%APPDATA%\pterminal\orchestrator` (or
 /// whatever `state::default_base()` resolves to on this platform/install).
@@ -75,30 +121,19 @@ pub fn orchestrator_dir() -> PathBuf {
     crate::state::default_base().join("orchestrator")
 }
 
-/// Where the orchestrator's running status/notes live. Task 2 only defines
-/// the path (a plain join, no I/O); nothing reads or writes it yet — a
-/// later task owns the orchestrator's own status-reporting content.
-/// `allow(dead_code)` scoped to non-test builds, same convention as
-/// `hooks::status_from_events` — this task's tests exercise the path
-/// function itself; a real reader/writer is a later task's job.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Where the orchestrator's running status/notes live — written by
+/// [`PtApp::refresh_orchestrator_status`](crate::app::PtApp) (Task 3) via
+/// [`crate::messages::orchestrator_status`], and shown read-only-ish in the
+/// F2 panel when the active workspace is the orchestrator.
 pub fn status_md_path(orch_dir: &Path) -> PathBuf {
     orch_dir.join("status.md")
 }
 
-/// Where the orchestrator's own agent-session README will live — the
+/// Where the orchestrator's own agent-session README lives — the
 /// orchestrator's counterpart to [`agent_readme_path`], but with different
-/// content: the orchestrator isn't working IN a per-repo checkout, so the
-/// per-repo coordination doc's instructions don't apply to it. Task 2 only
-/// defines the path; Task 3 writes the content and wires it into the
-/// orchestrator's saved tab's `SpawnSpec::agent_readme` (see
-/// `PtApp::ensure_orchestrator`'s doc comment for the seam this leaves for
-/// THIS task: the orchestrator's tab still spawns through the ordinary
-/// `resume_saved_tabs` path, which for a non-git workspace like this one
-/// never calls `write_agent_readme`/this path at all).
-/// `allow(dead_code)` scoped to non-test builds, same convention as
-/// `hooks::status_from_events` / `status_md_path` above.
-#[cfg_attr(not(test), allow(dead_code))]
+/// content ([`write_orchestrator_readme`]): the orchestrator isn't working
+/// IN a per-repo checkout, so the per-repo coordination doc's instructions
+/// don't apply to it.
 pub fn orchestrator_readme_path(orch_dir: &Path) -> PathBuf {
     orch_dir.join(".pterminal").join("README-orchestrator.md")
 }
@@ -218,5 +253,67 @@ mod tests {
             orchestrator_readme_path(&orch_dir),
             orch_dir.join(".pterminal").join("README-orchestrator.md")
         );
+    }
+
+    /// Task 3 (editor-orchestrator): `write_orchestrator_readme` is the
+    /// orchestrator's counterpart to `write_agent_readme` above, but with
+    /// orchestrator-specific content — role framing (it's the one agent
+    /// coordinating every OTHER workspace), the absolute path to the live
+    /// `status.md` it can re-read any time, the absolute path to append a
+    /// `{"to":"<workspace>/<agent>",...}` line to in order to direct a
+    /// specific workspace's agent, and the reserved `orchestrator` name
+    /// other agents' replies address back to.
+    #[test]
+    fn write_orchestrator_readme_contains_absolute_paths_and_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let orch_dir = dir.path().to_path_buf();
+
+        let p = write_orchestrator_readme(&orch_dir).unwrap();
+
+        assert_eq!(p, orchestrator_readme_path(&orch_dir));
+        let text = std::fs::read_to_string(&p).unwrap();
+
+        let status = status_md_path(&orch_dir);
+        let messages = messages_path(&orch_dir);
+        assert!(status.is_absolute());
+        assert!(messages.is_absolute());
+        assert!(text.contains(&status.display().to_string()), "{text}");
+        assert!(text.contains(&messages.display().to_string()), "{text}");
+
+        // role framing
+        assert!(
+            text.to_lowercase().contains("orchestrator"),
+            "must frame the reader's role as the orchestrator: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("every") || text.to_lowercase().contains("all workspaces"),
+            "must frame the role as coordinating every/all workspaces: {text}"
+        );
+
+        // workspace/agent messaging protocol
+        assert!(text.contains("\"to\""), "{text}");
+        assert!(text.contains("\"from\""), "{text}");
+        assert!(text.contains("<workspace>/<agent>"), "{text}");
+        assert!(text.contains("\"orchestrator\""), "reserved reply-to name must be documented: {text}");
+
+        // relay outcomes to the user
+        assert!(text.to_lowercase().contains("relay"), "{text}");
+    }
+
+    /// Same overwrite guarantee as `write_agent_readme` — this file is
+    /// fully generated and rewritten on every orchestrator spawn, so stale
+    /// content left over from a previous version must not survive a call.
+    #[test]
+    fn write_orchestrator_readme_overwrites_stale_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let orch_dir = dir.path().to_path_buf();
+        let p = orchestrator_readme_path(&orch_dir);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "stale content").unwrap();
+
+        write_orchestrator_readme(&orch_dir).unwrap();
+
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_ne!(text, "stale content");
     }
 }

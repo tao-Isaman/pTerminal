@@ -138,6 +138,45 @@ pub fn status_str(s: AgentStatus) -> &'static str {
     }
 }
 
+/// One workspace's row group in the orchestrator's `status.md` (Task 3,
+/// editor-orchestrator): its display name, its checkout root, and every
+/// live AGENT tab it has as `(title, status_str-wire status, cwd)` triples.
+/// Building this is entirely the CALLER's job
+/// (`PtApp::refresh_orchestrator_status`): it must already have filtered
+/// out shell/editor tabs (only agent tabs belong in `agents`) and must
+/// never construct one of these for the orchestrator's own workspace
+/// (`orchestrator_status` has no way to know which entry, if any, is the
+/// orchestrator — it just renders whatever it's given).
+pub struct WsStatus {
+    pub name: String,
+    pub repo_path: PathBuf,
+    pub agents: Vec<(String, String, PathBuf)>,
+}
+
+/// Formats the orchestrator's `status.md` body from `entries`: one
+/// `## <name>  (<path>)` header per workspace, in `entries`' order,
+/// followed by one `- <name>/<title> — <status> — cwd <cwd>` line per agent
+/// tab in that workspace (in `agents`' order). A workspace with an empty
+/// `agents` list still gets its header, just no bullet lines under it — no
+/// synthetic "no agents" placeholder line. `entries` itself being empty
+/// (no other workspace open yet) yields a short human-readable placeholder
+/// string instead of `""`, so the F2 panel / status.md file always has
+/// something legible to show rather than going blank.
+pub fn orchestrator_status(entries: &[WsStatus]) -> String {
+    if entries.is_empty() {
+        return "# Orchestrator status\n\n(no workspaces yet)\n".to_string();
+    }
+    let mut out = String::from("# Orchestrator status\n\n");
+    for ws in entries {
+        out.push_str(&format!("## {}  ({})\n\n", ws.name, ws.repo_path.display()));
+        for (title, status, cwd) in &ws.agents {
+            out.push_str(&format!("- {}/{} — {} — cwd {}\n", ws.name, title, status, cwd.display()));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +369,66 @@ mod tests {
         assert_eq!(status_str(AgentStatus::Idle), "idle");
         assert_eq!(status_str(AgentStatus::Exited), "exited");
         assert_eq!(status_str(AgentStatus::Unknown), "unknown");
+    }
+
+    /// Task 3 (editor-orchestrator): two workspaces, each with agent tabs —
+    /// exact markdown, byte for byte, so any accidental whitespace/ordering
+    /// drift is caught immediately.
+    #[test]
+    fn orchestrator_status_two_workspaces_with_agents_exact_markdown() {
+        let entries = vec![
+            WsStatus {
+                name: "alpha".into(),
+                repo_path: PathBuf::from("C:\\wt\\alpha"),
+                agents: vec![
+                    ("builder".into(), "working".into(), PathBuf::from("C:\\wt\\alpha")),
+                    ("reviewer".into(), "idle".into(), PathBuf::from("C:\\wt\\alpha-wt2")),
+                ],
+            },
+            WsStatus {
+                name: "bravo".into(),
+                repo_path: PathBuf::from("C:\\wt\\bravo"),
+                agents: vec![("solo".into(), "needs_you".into(), PathBuf::from("C:\\wt\\bravo"))],
+            },
+        ];
+
+        let text = orchestrator_status(&entries);
+
+        let expected = "# Orchestrator status\n\n\
+            ## alpha  (C:\\wt\\alpha)\n\n\
+            - alpha/builder — working — cwd C:\\wt\\alpha\n\
+            - alpha/reviewer — idle — cwd C:\\wt\\alpha-wt2\n\n\
+            ## bravo  (C:\\wt\\bravo)\n\n\
+            - bravo/solo — needs_you — cwd C:\\wt\\bravo\n\n";
+        assert_eq!(text, expected);
+    }
+
+    /// A workspace with no agent tabs (only shell/editor "tabs", already
+    /// filtered out by the caller before this struct is even built) still
+    /// gets its header line, but contributes zero `- ` bullet lines.
+    #[test]
+    fn orchestrator_status_workspace_with_no_agent_tabs_has_header_and_no_agent_lines() {
+        let entries = vec![WsStatus {
+            name: "empty-ws".into(),
+            repo_path: PathBuf::from("C:\\wt\\empty-ws"),
+            agents: vec![],
+        }];
+
+        let text = orchestrator_status(&entries);
+
+        assert!(text.contains("## empty-ws  (C:\\wt\\empty-ws)"), "{text}");
+        assert!(
+            !text.contains(" — "),
+            "a workspace with no agent tabs must contribute no agent bullet line: {text}"
+        );
+    }
+
+    /// Empty input (no other workspace open yet) must be empty-safe: no
+    /// panic, and a legible placeholder rather than `""`.
+    #[test]
+    fn orchestrator_status_empty_entries_is_a_placeholder_not_a_crash() {
+        let text = orchestrator_status(&[]);
+        assert!(!text.is_empty(), "empty input must still yield something legible, not an empty string");
+        assert!(text.to_lowercase().contains("no workspaces"), "{text}");
     }
 }

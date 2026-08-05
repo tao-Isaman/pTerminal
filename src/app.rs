@@ -258,6 +258,34 @@ fn paths_match(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Chooses and writes the right per-agent README for a tab about to spawn
+/// (Task 3, editor-orchestrator — closes the seam `PtApp::ensure_orchestrator`'s
+/// doc comment calls out: the orchestrator's saved tab spawns through the
+/// ordinary `resume_saved_tabs` path, which — since `is_git` is `false` for
+/// that workspace — used to leave `agent_readme` at `None` forever, never
+/// calling [`shared_ctx::write_orchestrator_readme`] at all).
+///
+/// The orchestrator's tab gets its own orchestrator-specific README
+/// regardless of `is_git` (it's never a git checkout — that flag is always
+/// `false` for it); every other workspace keeps today's git-only
+/// `write_agent_readme` behavior unchanged. `None` on a write failure or
+/// when neither applies (non-git, non-orchestrator) — same best-effort
+/// contract `write_agent_readme`'s existing call sites already have.
+/// Extracted as its own free function (rather than inlined at each call
+/// site) so the branch is unit-testable without spawning a real `claude`
+/// process — see `app::tests::app_with_one_saved_shell_tab`'s doc comment
+/// for why a real `Agent`-kind spawn can't be driven to a deterministic end
+/// in a test.
+fn agent_readme_for_spawn(is_orchestrator: bool, is_git: bool, repo_root: &Path) -> Option<PathBuf> {
+    if is_orchestrator {
+        shared_ctx::write_orchestrator_readme(repo_root).ok()
+    } else if is_git {
+        shared_ctx::write_agent_readme(repo_root).ok()
+    } else {
+        None
+    }
+}
+
 /// The `msg_offset` a workspace freshly added at `repo` should start at: the
 /// CURRENT byte length of `repo`'s `messages.jsonl`, or `0` when the file
 /// doesn't exist yet. Used by [`PtApp::finish_add_workspace`] — see the
@@ -405,6 +433,11 @@ pub struct PtApp {
     /// touches disk when the built JSON actually changed. See that
     /// function's docs.
     pub roster_written: HashMap<usize, String>,
+    /// Last `status.md` string written for the orchestrator (Task 3), the
+    /// single-workspace analogue of `roster_written`'s per-index cache —
+    /// there is at most one orchestrator, so a plain `Option<String>`
+    /// suffices. See [`PtApp::refresh_orchestrator_status`]'s docs.
+    pub orchestrator_status_written: Option<String>,
     /// Workspace indices whose last [`PtApp::deliver_messages`] call left a
     /// trailing partial (not-yet-newline-terminated) line unconsumed in
     /// `messages.jsonl`. Retried on the next heartbeat frame even without a
@@ -546,6 +579,7 @@ impl PtApp {
             closing_ws: None,
             closing_editor: None,
             roster_written: HashMap::new(),
+            orchestrator_status_written: None,
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
@@ -666,14 +700,18 @@ impl PtApp {
             let saved_tabs = self.workspaces[ws_idx].meta.saved_tabs.clone();
             let repo_root = self.workspaces[ws_idx].meta.repo_path.clone();
             let is_git = self.workspaces[ws_idx].meta.is_git;
+            let is_orchestrator = self.workspaces[ws_idx].meta.is_orchestrator;
             for saved in saved_tabs {
                 let result = if saved.cwd.exists() {
                     match saved.kind {
                         state::SavedTabKind::Shell => term::spawn_shell(ctx, saved.tab_id, &saved.cwd),
                         state::SavedTabKind::Agent => {
                             let shared = if is_git { shared_ctx::ensure_shared_md(&repo_root).ok() } else { None };
-                            let agent_readme =
-                                if is_git { shared_ctx::write_agent_readme(&repo_root).ok() } else { None };
+                            // Task 3: the orchestrator's tab gets
+                            // `write_orchestrator_readme`'s output, refreshed
+                            // on every launch — see `agent_readme_for_spawn`'s
+                            // docs for the seam this closes.
+                            let agent_readme = agent_readme_for_spawn(is_orchestrator, is_git, &repo_root);
                             term::spawn_agent(
                                 ctx,
                                 saved.tab_id,
@@ -1051,6 +1089,15 @@ impl PtApp {
     fn watcher_dirs(workspaces: &[WsRt]) -> Vec<PathBuf> {
         let mut dirs = vec![hooks::events_dir(), commands::commands_dir()];
         dirs.extend(workspaces.iter().map(|w| w.meta.repo_path.join(".pterminal")));
+        // Task 3 (editor-orchestrator): `status.md` lives directly under the
+        // orchestrator's own root (`shared_ctx::status_md_path`), a SIBLING
+        // of `.pterminal`, not inside it — so the `.pterminal`-only watch
+        // above never sees it change. Add the orchestrator's own root too,
+        // so the F2 panel's live-reload (see `drain_events`) fires for it
+        // the same way it already does for every workspace's `shared.md`.
+        if let Some(orch) = workspaces.iter().find(|w| w.meta.is_orchestrator) {
+            dirs.push(orch.meta.repo_path.clone());
+        }
         dirs
     }
 
@@ -1398,15 +1445,15 @@ impl PtApp {
     /// already run and settled, so every real workspace they see is already
     /// living at its stable index in `1..n`.
     ///
-    /// **Seam (Task 3):** the fresh saved tab's spawn goes through
-    /// `resume_saved_tabs` completely unchanged from any other agent tab.
-    /// Since `is_git` is `false` for this workspace, that path's
-    /// `agent_readme` ends up `None` (it only calls `write_agent_readme`
-    /// when `is_git`) — NOT [`shared_ctx::orchestrator_readme_path`]. Task 3
-    /// wires the orchestrator-specific README into the spawn; for this task
-    /// the orchestrator's agent tab is otherwise an ordinary direct-mode
-    /// agent tab rooted at `orchestrator_dir()`, with no per-repo
-    /// coordination doc injected.
+    /// **Seam CLOSED (Task 3):** the fresh saved tab's spawn goes through
+    /// `resume_saved_tabs` completely unchanged from any other agent tab
+    /// EXCEPT for its `agent_readme` selection — `resume_saved_tabs` now
+    /// calls `agent_readme_for_spawn(is_orchestrator, is_git, &repo_root)`,
+    /// which writes [`shared_ctx::write_orchestrator_readme`]'s output for
+    /// this workspace regardless of `is_git` (always `false` here), rather
+    /// than falling through to `None` the way a plain `is_git`-only check
+    /// used to. See `agent_readme_for_spawn`'s doc comment for the full
+    /// history of the gap this closes.
     pub fn ensure_orchestrator(&mut self) {
         let mut metas: Vec<state::Workspace> = self.workspaces.iter().map(|w| w.meta.clone()).collect();
         let created = pin_orchestrator_front(&mut metas);
@@ -1617,6 +1664,26 @@ impl PtApp {
                     if let Some(ws) = self.workspaces.get(self.active_ws) {
                         let active_path = crate::shared_ctx::shared_md_path(&ws.meta.repo_path);
                         self.ctx_panel_text = std::fs::read_to_string(&active_path).unwrap_or_default();
+                    }
+                }
+                continue;
+            }
+            // Task 3: the orchestrator's `status.md` live-reload — same
+            // "only while the panel is open and not focused" rule as
+            // shared.md above. Only the orchestrator workspace has a
+            // `status.md` at all, so this also checks `is_orchestrator`
+            // rather than reloading unconditionally the way the shared.md
+            // branch does (there, EVERY workspace has its own shared.md, so
+            // reloading the active one regardless is harmless; here, a
+            // non-orchestrator active workspace has no `status.md` of its
+            // own to reload from).
+            if name == "status.md" {
+                if self.show_ctx_panel && !self.ctx_panel_has_focus {
+                    if let Some(ws) = self.workspaces.get(self.active_ws) {
+                        if ws.meta.is_orchestrator {
+                            let active_path = Self::ctx_panel_path_for(&ws.meta);
+                            self.ctx_panel_text = std::fs::read_to_string(&active_path).unwrap_or_default();
+                        }
                     }
                 }
                 continue;
@@ -1835,6 +1902,11 @@ impl PtApp {
         // see the function's docs — so calling it unconditionally every
         // frame is fine.
         self.maintain_roster();
+        // Task 3 (editor-orchestrator): same idea, one level up — keep the
+        // orchestrator's own `status.md` in sync with every OTHER
+        // workspace's live agent roster. Same cheap/debounced/no-op-most-
+        // frames shape as `maintain_roster` just above.
+        self.refresh_orchestrator_status();
     }
 
     /// Step 6: writes `.pterminal/agents.json` for every workspace whose
@@ -1875,6 +1947,56 @@ impl PtApp {
             if std::fs::write(&path, &json).is_ok() {
                 self.roster_written.insert(ws_idx, json);
             }
+        }
+    }
+
+    /// Task 3 (editor-orchestrator): keeps the orchestrator's `status.md`
+    /// up to date with every OTHER workspace's live agent-tab roster
+    /// (title, `status_str`-wire status, cwd) — a no-op when there's no
+    /// orchestrator workspace at all (nothing to write, nowhere to write
+    /// it). The orchestrator's OWN workspace is excluded by construction
+    /// (`enumerate().filter(|(i, _)| *i != orch_idx)` below skips it before
+    /// a `messages::WsStatus` is ever built for it) — SHELL/editor "tabs"
+    /// are excluded the same way `maintain_roster` excludes them from
+    /// `agents.json`, via the `TabKind::Agent` filter.
+    ///
+    /// `self.orchestrator_status_written` is the change-detect: the
+    /// formatted markdown is compared against the last string actually
+    /// written, and disk is only touched on a real difference — same
+    /// debounce shape as `maintain_roster`'s `roster_written`, just a plain
+    /// `Option<String>` instead of a per-index map since there is at most
+    /// one orchestrator. Errors (can't create the orchestrator's directory,
+    /// can't write the file) are skipped silently for this cycle, same
+    /// non-spammy-banner reasoning as `maintain_roster`'s docs.
+    fn refresh_orchestrator_status(&mut self) {
+        let Some(orch_idx) = self.orchestrator_index() else { return };
+        let entries: Vec<messages::WsStatus> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != orch_idx)
+            .map(|(_, ws)| messages::WsStatus {
+                name: ws.meta.name.clone(),
+                repo_path: ws.meta.repo_path.clone(),
+                agents: ws
+                    .tabs
+                    .iter()
+                    .filter(|t| t.kind == TabKind::Agent)
+                    .map(|t| (t.title.clone(), messages::status_str(t.status).to_string(), t.cwd.clone()))
+                    .collect(),
+            })
+            .collect();
+        let text = messages::orchestrator_status(&entries);
+        if self.orchestrator_status_written.as_ref() == Some(&text) {
+            return;
+        }
+        let path = shared_ctx::status_md_path(&shared_ctx::orchestrator_dir());
+        let Some(parent) = path.parent() else { return };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        if std::fs::write(&path, &text).is_ok() {
+            self.orchestrator_status_written = Some(text);
         }
     }
 
@@ -2153,8 +2275,28 @@ impl PtApp {
         true
     }
 
+    /// The path [`PtApp::show_ctx_panel_ui`] should show/reload for `ws`
+    /// (Task 3, editor-orchestrator): the orchestrator's own generated
+    /// `status.md` when `ws.is_orchestrator`, else that workspace's
+    /// ordinary `shared.md`. Both live under the same `ws.repo_path` — the
+    /// orchestrator's `repo_path` IS `shared_ctx::orchestrator_dir()` (see
+    /// `new_orchestrator_workspace`) — so this is pure path arithmetic, no
+    /// I/O. Extracted from `show_ctx_panel_ui` so the branch is testable
+    /// without an `egui::Context`/`SidePanel` frame.
+    fn ctx_panel_path_for(ws: &state::Workspace) -> PathBuf {
+        if ws.is_orchestrator {
+            shared_ctx::status_md_path(&ws.repo_path)
+        } else {
+            shared_ctx::shared_md_path(&ws.repo_path)
+        }
+    }
+
     /// The F2 shared-context panel: shows/edits the active workspace's
-    /// `shared.md`. Adapted from the brief's reference snippet in three
+    /// `shared.md` — or, for the reserved orchestrator workspace (Task 3),
+    /// shows its generated `status.md` instead (read-only-ish: no "save"
+    /// button, since the file is regenerated by
+    /// [`PtApp::refresh_orchestrator_status`] the moment any agent's status
+    /// changes anyway). Adapted from the brief's reference snippet in three
     /// ways:
     ///
     /// 1. **Focus tracking (the FOCUS fix `term::TabTerm::ui`'s docs call
@@ -2203,7 +2345,8 @@ impl PtApp {
             return;
         }
         let Some(ws) = self.workspaces.get(self.active_ws) else { return };
-        let path = crate::shared_ctx::shared_md_path(&ws.meta.repo_path);
+        let is_orchestrator = ws.meta.is_orchestrator;
+        let path = Self::ctx_panel_path_for(&ws.meta);
 
         // FINDING 1 fix: reload whenever the active workspace's path no
         // longer matches what the buffer was last loaded from — including
@@ -2223,12 +2366,16 @@ impl PtApp {
         let mut has_focus = false;
         egui::SidePanel::right("shared_ctx").default_width(360.0).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("shared.md");
+                ui.heading(if is_orchestrator { "status.md" } else { "shared.md" });
                 if ui.button("reload").clicked() {
                     self.ctx_panel_text = std::fs::read_to_string(&path).unwrap_or_default();
                     self.ctx_panel_loaded_for = Some(path.clone());
                 }
-                if ui.button("save").clicked() {
+                // Task 3: no "save" for the orchestrator's status.md — it's
+                // generated (`refresh_orchestrator_status`) and would just
+                // get overwritten the next time any agent's status changes;
+                // offering a save button here would be misleading.
+                if !is_orchestrator && ui.button("save").clicked() {
                     // Adaptation 2 (see doc comment above): ensure the
                     // parent dir exists before writing, since the brief's
                     // bare `std::fs::write` would fail on a workspace whose
@@ -2251,7 +2398,7 @@ impl PtApp {
             });
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let resp = ui.add_sized(ui.available_size(),
-                    egui::TextEdit::multiline(&mut self.ctx_panel_text).code_editor());
+                    egui::TextEdit::multiline(&mut self.ctx_panel_text).code_editor().interactive(!is_orchestrator));
                 has_focus = resp.has_focus();
             });
         });
@@ -3082,6 +3229,31 @@ fn thai_font_bytes() -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// Guards every test that does real filesystem I/O (create/remove) on
+    /// the singleton, non-tempdir `shared_ctx::orchestrator_dir()` — unlike
+    /// every other fixture in this module, that path is the SAME real
+    /// directory across every test in the binary (`%APPDATA%\pterminal\
+    /// orchestrator`, not a per-test tempdir), and `cargo test` runs tests
+    /// in parallel by default. Without this lock, one test's
+    /// `remove_dir_all` (its own "clean slate" setup/teardown) can delete
+    /// the directory out from under another concurrently-running test's
+    /// spawn, mid-test, since both call sites do
+    /// `remove_dir_all(orchestrator_dir())` on the very same real path with
+    /// no ordering between them (confirmed live: intermittent "The
+    /// directory name is invalid" `TabTerm::spawn` failures during Task 3
+    /// TDD, cured entirely by adding this lock everywhere the real
+    /// directory is touched). Tests that only use `orchestrator_dir()` as a
+    /// plain path value (building a `state::Workspace`/`WsRt` in memory,
+    /// no `create_dir_all`/`remove_dir_all`/real spawn there) don't need
+    /// it — nothing on disk to race over. `unwrap_or_else(PoisonError::
+    /// into_inner)` rather than a bare `.unwrap()`: one test panicking
+    /// while holding the lock must not poison it for every test after it
+    /// in the same run.
+    static ORCHESTRATOR_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn lock_orchestrator_dir() -> std::sync::MutexGuard<'static, ()> {
+        ORCHESTRATOR_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// pTerminal is Windows-only and both Thai font candidates ship with the
     /// OS, so resolution must succeed here. If this fails, Thai silently
     /// regresses to boxes — nothing else in the suite would notice.
@@ -3170,6 +3342,7 @@ mod tests {
             closing_ws: None,
             closing_editor: None,
             roster_written: HashMap::new(),
+            orchestrator_status_written: None,
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
@@ -3239,6 +3412,7 @@ mod tests {
             closing_ws: None,
             closing_editor: None,
             roster_written: HashMap::new(),
+            orchestrator_status_written: None,
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
@@ -3275,6 +3449,7 @@ mod tests {
             closing_ws: None,
             closing_editor: None,
             roster_written: HashMap::new(),
+            orchestrator_status_written: None,
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
@@ -4095,6 +4270,7 @@ mod tests {
     /// cleaned up before (in case a previous run/crash left it) and after.
     #[test]
     fn ensure_orchestrator_creates_pins_bumps_next_tab_id_and_makes_dirs() {
+        let _guard = lock_orchestrator_dir();
         let orch_dir = shared_ctx::orchestrator_dir();
         let _ = std::fs::remove_dir_all(&orch_dir);
         let base = tempfile::tempdir().expect("tempdir");
@@ -4208,5 +4384,197 @@ mod tests {
     fn initial_msg_offset_is_zero_when_the_file_is_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert_eq!(initial_msg_offset(dir.path()), 0);
+    }
+
+    // ---- Task 3 (editor-orchestrator): status.md generation, README
+    // auto-brief, and the F2 status view ----
+    //
+    // `agent_readme_for_spawn`/`ctx_panel_path_for` are pure(-ish) decision
+    // helpers extracted from `resume_saved_tabs`/`show_ctx_panel_ui` so the
+    // orchestrator-vs-normal-workspace branch is unit-testable without
+    // spawning a real `claude` process (documented elsewhere in this file
+    // as impossible to end deterministically) or driving a full egui
+    // `SidePanel` frame. `refresh_orchestrator_status` touches the real,
+    // non-tempdir `shared_ctx::orchestrator_dir()` — same convention as
+    // `ensure_orchestrator_creates_pins_bumps_next_tab_id_and_makes_dirs`
+    // above: cleaned up before (in case a previous run/crash left it) and
+    // after every test that writes there.
+
+    /// Spawns a real (but harmless) `powershell.exe` and relabels it as an
+    /// agent tab — the same "spawn_shell then flip kind/title" idiom
+    /// `delivery_queues_the_submit_enter_instead_of_writing_it_inline`
+    /// already uses, needed because `Tab::term` is a real `TabTerm`, not an
+    /// optional/mockable field. Callers must drain it (`exit_and_drain`)
+    /// before the test ends.
+    fn agent_tab(ctx: &egui::Context, id: u64, cwd: &Path, title: &str, status: AgentStatus) -> term::Tab {
+        let mut tab = term::spawn_shell(ctx, id, cwd).expect("spawn shell standing in for an agent tab");
+        tab.kind = TabKind::Agent;
+        tab.title = title.to_string();
+        tab.status = status;
+        tab
+    }
+
+    #[test]
+    fn agent_readme_for_spawn_orchestrator_uses_orchestrator_readme_regardless_of_is_git() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_path_buf();
+
+        let readme = agent_readme_for_spawn(true, false, &repo);
+
+        assert_eq!(readme, Some(shared_ctx::orchestrator_readme_path(&repo)));
+        let text = std::fs::read_to_string(readme.unwrap()).unwrap();
+        assert!(text.to_lowercase().contains("orchestrator"), "{text}");
+    }
+
+    #[test]
+    fn agent_readme_for_spawn_git_workspace_uses_agent_readme() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_path_buf();
+
+        let readme = agent_readme_for_spawn(false, true, &repo);
+
+        assert_eq!(readme, Some(shared_ctx::agent_readme_path(&repo)));
+    }
+
+    #[test]
+    fn agent_readme_for_spawn_non_git_non_orchestrator_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_path_buf();
+
+        assert_eq!(agent_readme_for_spawn(false, false, &repo), None);
+    }
+
+    #[test]
+    fn ctx_panel_path_for_orchestrator_workspace_is_status_md() {
+        let mut ws = plain_workspace("orchestrator");
+        ws.repo_path = shared_ctx::orchestrator_dir();
+        ws.is_orchestrator = true;
+
+        assert_eq!(PtApp::ctx_panel_path_for(&ws), shared_ctx::status_md_path(&shared_ctx::orchestrator_dir()));
+    }
+
+    #[test]
+    fn ctx_panel_path_for_normal_workspace_is_shared_md() {
+        let ws = plain_workspace("real0");
+        assert_eq!(PtApp::ctx_panel_path_for(&ws), shared_ctx::shared_md_path(&ws.repo_path));
+    }
+
+    #[test]
+    fn watcher_dirs_includes_orchestrators_own_root_for_status_md_live_reload() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut orch = ws_with_name(shared_ctx::orchestrator_dir(), "orchestrator");
+        orch.meta.is_orchestrator = true;
+        let real0 = ws_with_name(base.path().join("real0"), "real0");
+        let workspaces = vec![orch, real0];
+
+        let dirs = PtApp::watcher_dirs(&workspaces);
+
+        assert!(
+            dirs.contains(&shared_ctx::orchestrator_dir()),
+            "status.md lives directly under the orchestrator's own root, a sibling of .pterminal, \
+             not inside it: {dirs:?}"
+        );
+        assert!(dirs.contains(&shared_ctx::orchestrator_dir().join(".pterminal")));
+        assert!(dirs.contains(&base.path().join("real0").join(".pterminal")));
+        assert!(
+            !dirs.contains(&base.path().join("real0")),
+            "a normal workspace's own root (as opposed to its .pterminal subdir) must not be \
+             watched: {dirs:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_orchestrator_status_excludes_orchestrator_and_non_agent_tabs() {
+        let _guard = lock_orchestrator_dir();
+        let orch_dir = shared_ctx::orchestrator_dir();
+        let _ = std::fs::remove_dir_all(&orch_dir);
+        std::fs::create_dir_all(&orch_dir).expect("create orchestrator dir for the spawned shell's cwd");
+        let ctx = eframe::egui::Context::default();
+        let base = tempfile::tempdir().expect("tempdir");
+        let real_dir = tempfile::tempdir().expect("tempdir");
+
+        let mut orch_ws = ws_with_name(orch_dir.clone(), "orchestrator");
+        orch_ws.meta.is_orchestrator = true;
+        orch_ws.tabs.push(agent_tab(&ctx, 90_600, &orch_dir, "orchestrator", AgentStatus::Working));
+
+        let mut real_ws = ws_with_name(real_dir.path().to_path_buf(), "real0");
+        real_ws.tabs.push(agent_tab(&ctx, 90_601, real_dir.path(), "builder", AgentStatus::Working));
+        real_ws.tabs.push(term::spawn_shell(&ctx, 90_602, real_dir.path()).expect("spawn shell"));
+
+        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![orch_ws, real_ws], 0);
+
+        app.refresh_orchestrator_status();
+
+        let text = std::fs::read_to_string(shared_ctx::status_md_path(&orch_dir)).expect("status.md written");
+        assert!(text.contains("## real0"), "{text}");
+        assert!(
+            text.contains(&format!("real0/builder — working — cwd {}", real_dir.path().display())),
+            "{text}"
+        );
+        assert!(!text.contains("## orchestrator"), "the orchestrator's own workspace must be excluded: {text}");
+        assert!(!text.contains("orchestrator/orchestrator"), "{text}");
+        assert!(!text.contains("real0/shell"), "a shell tab must never appear in status.md: {text}");
+
+        for ws in app.workspaces.iter_mut() {
+            for tab in ws.tabs.iter_mut() {
+                exit_and_drain(&mut tab.term);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&orch_dir);
+    }
+
+    #[test]
+    fn refresh_orchestrator_status_skips_rewrite_when_unchanged_then_rewrites_on_change() {
+        let _guard = lock_orchestrator_dir();
+        let orch_dir = shared_ctx::orchestrator_dir();
+        let _ = std::fs::remove_dir_all(&orch_dir);
+        let ctx = eframe::egui::Context::default();
+        let base = tempfile::tempdir().expect("tempdir");
+        let real_dir = tempfile::tempdir().expect("tempdir");
+
+        let mut orch_ws = ws_with_name(orch_dir.clone(), "orchestrator");
+        orch_ws.meta.is_orchestrator = true;
+        let mut real_ws = ws_with_name(real_dir.path().to_path_buf(), "real0");
+        real_ws.tabs.push(agent_tab(&ctx, 90_610, real_dir.path(), "builder", AgentStatus::Working));
+
+        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![orch_ws, real_ws], 0);
+
+        app.refresh_orchestrator_status();
+        let status_path = shared_ctx::status_md_path(&orch_dir);
+        let first = std::fs::read_to_string(&status_path).expect("first write");
+        assert!(first.contains("working"), "{first}");
+
+        // Manually clobber the file; an unchanged next call must leave it alone.
+        std::fs::write(&status_path, "SENTINEL-UNCHANGED").unwrap();
+        app.refresh_orchestrator_status();
+        assert_eq!(
+            std::fs::read_to_string(&status_path).unwrap(),
+            "SENTINEL-UNCHANGED",
+            "unchanged computed content must not trigger a rewrite"
+        );
+
+        // Now really change a tab's status — this MUST overwrite the sentinel.
+        app.workspaces[1].tabs[0].status = AgentStatus::Idle;
+        app.refresh_orchestrator_status();
+        let after = std::fs::read_to_string(&status_path).unwrap();
+        assert_ne!(after, "SENTINEL-UNCHANGED");
+        assert!(after.contains("idle"), "{after}");
+
+        exit_and_drain(&mut app.workspaces[1].tabs[0].term);
+        let _ = std::fs::remove_dir_all(&orch_dir);
+    }
+
+    #[test]
+    fn refresh_orchestrator_status_without_an_orchestrator_workspace_is_a_noop() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let ws0 = ws_with_name(base.path().join("real0"), "real0");
+        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws0], 0);
+
+        app.refresh_orchestrator_status();
+
+        assert!(
+            app.orchestrator_status_written.is_none(),
+            "nothing to refresh without an orchestrator workspace present"
+        );
     }
 }
