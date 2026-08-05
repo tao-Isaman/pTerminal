@@ -45,6 +45,24 @@ The active workspace and active tab are restored too. Known limitation: a resume
 skips PID resource-monitor claiming (single-slot bookkeeping, documented in-code) — CPU/RAM on
 hover may read blank for a resumed tab until its next natural respawn.
 
+## Closing a workspace
+
+Right-click a workspace row in the sidebar and choose **Close workspace** to remove it from
+pTerminal — a confirmation dialog shows how many tabs are running and what happens to each:
+
+- **Running tabs are closed**, not killed outright — same as closing an individual tab, this
+  ends the tab's ConPTY but doesn't guarantee the underlying process dies immediately.
+- **Forget, never destroy**: worktrees stay on disk exactly as they were; only the sidebar's
+  "kept worktree" reminders for that workspace are forgotten. Nothing is deleted from disk, no
+  git branch or worktree is removed, and `state.json` simply drops the entry.
+- **Agent sessions remain resumable** — a closed workspace's agents aren't gone from Claude
+  Code's own session store, so `pterminal resume --id <session-id> --dir <path>` still pulls one
+  back into a (new or existing) workspace afterward.
+
+Other workspaces and their tabs are untouched; if the active workspace is the one closed,
+selection lands on a surviving workspace (or the "add a workspace to begin" empty state if it
+was the last one).
+
 ## Transfer a session
 
 A Claude Code session started outside pTerminal (a bare terminal, another editor's integrated

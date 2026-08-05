@@ -120,6 +120,29 @@ fn close_draft_for(ws: &WsRt, ws_index: usize, tab_idx: usize) -> Option<CloseDr
     Some(CloseDraft { ws_index, tab_id: tab.id, dirty, confirm_discard: false })
 }
 
+/// Draft state for the "close workspace" confirmation (Task 2 of the
+/// close-workspace feature). Populated by the sidebar row's context menu,
+/// consumed by `dialogs::show_dialogs` → [`PtApp::close_workspace`].
+///
+/// **Identity-tracked by `(ws_index, name)`, same rationale as
+/// [`CloseDraft`] and [`NewTabDraft`].** The confirmation window is not
+/// modal — the sidebar stays clickable behind it — and workspaces carry no
+/// stable id of their own (they're a plain `Vec`, append-only except this
+/// feature's own removal), so `(index, name)` is the cheapest identity that
+/// still tells a live workspace apart from whatever now happens to sit at
+/// that index. `show_dialogs` re-resolves the target every frame by this
+/// pair and drops the draft (`closing_ws = None`) rather than acting on a
+/// stale one: `workspaces.get(ws_index).map(|w| &w.meta.name) != Some(&name)`
+/// (see [`PtApp::workspace_still_named`], the extracted predicate). The only
+/// way this pair can actually go stale is a concurrent close shifting
+/// indices while this dialog sits open — dropping it silently in that case
+/// is the same "don't guess, don't act on a maybe-wrong target" rule the
+/// other two drafts already follow.
+pub struct CloseWsDraft {
+    pub ws_index: usize,
+    pub name: String,
+}
+
 /// True if `a` and `b` name the same directory, for [`PtApp::handle_resume_command`]'s
 /// find-or-create workspace lookup. `pterminal resume --dir <path>` is
 /// arbitrary shell text — it need not be absolute, need not match the case
@@ -199,6 +222,9 @@ pub struct PtApp {
     pub error: Option<String>,
     pub new_tab: Option<NewTabDraft>,
     pub closing: Option<CloseDraft>,
+    /// Draft for the "close workspace" confirmation (Task 2). See
+    /// [`CloseWsDraft`]'s doc comment for the identity-tracking rationale.
+    pub closing_ws: Option<CloseWsDraft>,
     /// Last `agents.json` string written per workspace (by index), so the
     /// per-frame roster maintenance in [`PtApp::maintain_roster`] only
     /// touches disk when the built JSON actually changed. See that
@@ -334,6 +360,7 @@ impl PtApp {
             error: corrupt_msg,
             new_tab: None,
             closing: None,
+            closing_ws: None,
             roster_written: HashMap::new(),
             partial_pending: HashSet::new(),
             selected_child: None,
@@ -1017,9 +1044,8 @@ impl PtApp {
     /// worktree removal, no branch deletion, no file edits — "forget",
     /// never "destroy".
     ///
-    /// Unused outside tests until Task 2 wires a UI trigger (context menu +
-    /// confirmation dialog) to it.
-    #[allow(dead_code)] // consumed in Task 2
+    /// Wired to the sidebar's "Close workspace" context-menu item (Task 2),
+    /// via the [`CloseWsDraft`] confirmation dialog in `dialogs.rs`.
     pub fn close_workspace(&mut self, ws_index: usize) {
         if ws_index >= self.workspaces.len() {
             return;
@@ -1038,6 +1064,13 @@ impl PtApp {
 
         self.new_tab = None;
         self.closing = None;
+        // Task 2 addition: same unconditional-wipe treatment as the two
+        // drafts above — `closing_ws` also carries a `ws_index` that may now
+        // point at a shifted workspace, and in the normal confirm-click path
+        // this is the very draft whose button just called this method (the
+        // caller in `dialogs.rs` clears it too; this is belt-and-suspenders
+        // for any other caller, direct or future).
+        self.closing_ws = None;
         self.selected_child = None;
         self.pending_claim = None;
         self.roster_written.clear();
@@ -1046,6 +1079,17 @@ impl PtApp {
 
         self.rebuild_watcher();
         self.persist();
+    }
+
+    /// True if `ws_index` still names a workspace called `name` — the
+    /// identity check behind [`CloseWsDraft`] (see its doc comment),
+    /// extracted as a pure predicate so it's unit-testable without an egui
+    /// context. `dialogs::show_dialogs` drops the draft (`closing_ws = None`)
+    /// rather than acting on it whenever this returns `false`. `pub`
+    /// (not private) because `dialogs.rs`, a sibling module, is the actual
+    /// caller — same visibility as `close_workspace` itself.
+    pub fn workspace_still_named(&self, ws_index: usize, name: &str) -> bool {
+        self.workspaces.get(ws_index).map(|w| w.meta.name.as_str()) == Some(name)
     }
 
     /// Opens a plain shell tab rooted at a worktree the user previously
@@ -1507,15 +1551,22 @@ impl PtApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        // A dialog (error / new-tab / close) owns the keyboard while it's
-        // open: without this guard, a repeated Ctrl+T would silently
-        // replace a half-filled `new_tab` draft, and Ctrl+W while `closing`
-        // is already set would retarget the confirmation at whatever tab is
-        // active *now* rather than the one the user is deciding about.
-        // Simplest correct fix — skip every shortcut (including
-        // F2/Ctrl+Tab/Ctrl+1..9) while any dialog is showing; the dialog's
-        // own buttons are the only way to act on it until it's dismissed.
-        if self.error.is_some() || self.new_tab.is_some() || self.closing.is_some() {
+        // A dialog (error / new-tab / close tab / close workspace) owns the
+        // keyboard while it's open: without this guard, a repeated Ctrl+T
+        // would silently replace a half-filled `new_tab` draft, and Ctrl+W
+        // while `closing` is already set would retarget the confirmation at
+        // whatever tab is active *now* rather than the one the user is
+        // deciding about. Simplest correct fix — skip every shortcut
+        // (including F2/Ctrl+Tab/Ctrl+1..9) while any dialog is showing; the
+        // dialog's own buttons are the only way to act on it until it's
+        // dismissed. `closing_ws` (Task 2) joins the same guard for the same
+        // reason — e.g. Ctrl+1..9 switching the active tab out from under a
+        // pending workspace-close confirmation.
+        if self.error.is_some()
+            || self.new_tab.is_some()
+            || self.closing.is_some()
+            || self.closing_ws.is_some()
+        {
             return;
         }
         let (t, w, cycle) = ctx.input_mut(|i| {
@@ -1884,6 +1935,25 @@ impl eframe::App for PtApp {
         self.drain_events(ctx);
         self.shortcuts(ctx);
 
+        // Guard mouse-driven draft stacking: a dialog (error / new-tab /
+        // close tab / close workspace) already owns the decision in flight,
+        // same rationale as shortcuts()'s keyboard guard above. Computed
+        // once here, BEFORE the sidebar panel below, so the sidebar row's
+        // "Close workspace" context-menu item (Task 2) can also read it —
+        // stacking a second `closing_ws` draft on top of an unresolved one
+        // (or on top of a different in-flight dialog) is exactly the
+        // draft-stacking this guard already prevents for `+`/middle-click.
+        // Sidebar workspace/kept-row LEFT-clicks are still NOT guarded —
+        // they stay live because every in-flight draft is now
+        // identity-tracked: `CloseDraft`/`PendingClaim` by (`ws_index` +
+        // `tab_id`), `NewTabDraft` by `ws_index`, `CloseWsDraft` by
+        // (`ws_index`, `name`). Switching workspaces mid-dialog can no
+        // longer misdirect any of them.
+        let dialog_open = self.error.is_some()
+            || self.new_tab.is_some()
+            || self.closing.is_some()
+            || self.closing_ws.is_some();
+
         egui::SidePanel::left("workspaces").default_width(180.0).show(ctx, |ui| {
             ui.heading("WORKSPACES");
             ui.separator();
@@ -1894,6 +1964,10 @@ impl eframe::App for PtApp {
             // needs a mutable borrow to spawn a tab and remove the entry)
             // has to wait until the loop is done.
             let mut kept_clicked: Option<(usize, state::WorktreeInfo)> = None;
+            // Task 2: same collect-outside-the-loop pattern as `clicked` /
+            // `kept_clicked` above — the context menu closure below only
+            // needs a mutable borrow of this local, not of `self`.
+            let mut close_ws_clicked: Option<CloseWsDraft> = None;
             for (i, ws) in self.workspaces.iter().enumerate() {
                 let agent_count = ws.tabs.iter().filter(|t| t.kind == TabKind::Agent).count();
                 let (cpu, mem): (f32, u64) = ws
@@ -1911,9 +1985,21 @@ impl eframe::App for PtApp {
                     mem as f64 / 1e9,
                     cpu,
                 );
-                if ui.selectable_label(i == self.active_ws, label).clicked() {
+                let row_resp = ui.selectable_label(i == self.active_ws, label);
+                if row_resp.clicked() {
                     clicked = Some(i);
                 }
+                // Task 2: right-click → "Close workspace". Single item, per
+                // the brief. Guarded by `dialog_open` the same way the `+`
+                // new-tab button is (`add_enabled`, not a post-hoc bool
+                // check) — a dialog already in flight visibly disables the
+                // menu item instead of silently swallowing the click.
+                row_resp.context_menu(|ui| {
+                    if ui.add_enabled(!dialog_open, egui::Button::new("Close workspace")).clicked() {
+                        close_ws_clicked = Some(CloseWsDraft { ws_index: i, name: ws.meta.name.clone() });
+                        ui.close_menu();
+                    }
+                });
                 for wt in &ws.meta.kept_worktrees {
                     // `ui.small(text)` alone doesn't reliably sense clicks
                     // (a plain `Label`'s default sense is hover-only unless
@@ -1952,27 +2038,15 @@ impl eframe::App for PtApp {
             if let Some((ws_idx, wt)) = kept_clicked {
                 self.open_kept_worktree(ctx, ws_idx, wt);
             }
+            if let Some(draft) = close_ws_clicked {
+                self.closing_ws = Some(draft);
+            }
             ui.separator();
             if ui.button("+ workspace").clicked() {
                 self.add_workspace();
             }
         });
 
-        // Guard mouse-driven draft stacking: a dialog (error / new-tab /
-        // close) already owns the decision in flight, same rationale as
-        // shortcuts()'s keyboard guard above. Computed once here (before
-        // `show_dialogs` runs later this frame) and used to make the `+`
-        // button and tab middle-click inert while any dialog is open — a
-        // middle-click on a DIFFERENT tab while a close dialog is showing
-        // must not silently replace `self.closing` with a fresh draft, and
-        // `+` must not stack a second "New tab" dialog on top of an
-        // unresolved one. Sidebar workspace/kept-row clicks are NOT
-        // guarded — they stay live because every in-flight draft is now
-        // identity-tracked: `CloseDraft`/`PendingClaim` by (`ws_index` +
-        // `tab_id`), `NewTabDraft` by the `ws_index` captured when it was
-        // created. Switching workspaces mid-dialog can no longer misdirect
-        // any of them.
-        let dialog_open = self.error.is_some() || self.new_tab.is_some() || self.closing.is_some();
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let active_ws = self.active_ws;
@@ -2156,8 +2230,13 @@ impl eframe::App for PtApp {
         // `ctx_panel_has_focus` (set from the panel's `TextEdit` response
         // in `show_ctx_panel_ui`) into this bool for the same reason: with
         // the panel open, typing in it must not also feed the terminal.
+        // `closing_ws` (Task 2) joins the same list — its confirmation
+        // window has no text field, but a stray keystroke reaching the
+        // terminal behind a decision the user hasn't made yet is the same
+        // class of bug the other three guard against.
         let focused = self.new_tab.is_none()
             && self.closing.is_none()
+            && self.closing_ws.is_none()
             && self.error.is_none()
             && !self.ctx_panel_has_focus;
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -2412,6 +2491,7 @@ mod tests {
             error: None,
             new_tab: None,
             closing: None,
+            closing_ws: None,
             roster_written: HashMap::new(),
             partial_pending: HashSet::new(),
             selected_child: None,
@@ -2475,6 +2555,7 @@ mod tests {
             error: None,
             new_tab: None,
             closing: None,
+            closing_ws: None,
             roster_written: HashMap::new(),
             partial_pending: HashSet::new(),
             selected_child: None,
@@ -2507,6 +2588,7 @@ mod tests {
             error: None,
             new_tab: None,
             closing: None,
+            closing_ws: None,
             roster_written: HashMap::new(),
             partial_pending: HashSet::new(),
             selected_child: None,
@@ -2981,6 +3063,7 @@ mod tests {
         app.pending_claim = Some(PendingClaim { ws_index: 2, tab_id: 1, before: HashSet::new() });
         app.new_tab = Some(NewTabDraft { ws_index: 2, prompt: String::new(), isolate: false, shell: false });
         app.closing = Some(CloseDraft { ws_index: 2, tab_id: 1, dirty: false, confirm_discard: false });
+        app.closing_ws = Some(CloseWsDraft { ws_index: 2, name: "ws2".to_string() });
         app.roster_written.insert(2, "stale-roster-json".to_string());
         app.partial_pending.insert(2);
 
@@ -2995,8 +3078,31 @@ mod tests {
         assert!(app.pending_claim.is_none());
         assert!(app.new_tab.is_none());
         assert!(app.closing.is_none());
+        assert!(app.closing_ws.is_none(), "Task 2: closing_ws must not survive its own confirm click");
         assert!(app.roster_written.is_empty(), "index-keyed roster cache must not survive an index shift");
         assert!(app.partial_pending.is_empty(), "index-keyed partial-line set must not survive an index shift");
+    }
+
+    // ---- workspace_still_named (Task 2: CloseWsDraft identity check) ----
+
+    #[test]
+    fn workspace_still_named_drops_a_stale_index_name_pair() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let ws0 = ws_with_name(base.path().join("ws0"), "ws0");
+        let app = app_with_workspaces(base.path().to_path_buf(), vec![ws0], 0);
+
+        assert!(
+            app.workspace_still_named(0, "ws0"),
+            "the live (index, name) pair the draft was created with must still match"
+        );
+        assert!(
+            !app.workspace_still_named(0, "some-other-workspace"),
+            "a name mismatch at the same index means a different workspace now sits there — stale"
+        );
+        assert!(
+            !app.workspace_still_named(5, "ws0"),
+            "an out-of-range index is always stale, regardless of the name"
+        );
     }
 
     #[test]

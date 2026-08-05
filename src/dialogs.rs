@@ -1,8 +1,9 @@
 //! Dialogs: "new tab" (spawn agent/shell), "close tab" (merge/keep/discard a
-//! worktree), and the always-on-top error dialog. All three share `PtApp`'s
-//! per-frame [`PtApp::show_dialogs`] entry point (called once from
-//! `app.rs::update`), rendered in strict priority order — error, then
-//! new-tab, then close — with an early `return` after whichever one draws,
+//! worktree), "close workspace" (Task 2 of the close-workspace feature), and
+//! the always-on-top error dialog. All four share `PtApp`'s per-frame
+//! [`PtApp::show_dialogs`] entry point (called once from `app.rs::update`),
+//! rendered in strict priority order — error, then new-tab, then close tab,
+//! then close workspace — with an early `return` after whichever one draws,
 //! so at most one dialog is ever on screen at a time. The error dialog wins
 //! over the rest because it means something already went wrong; stacking a
 //! new decision on top of an unacknowledged error would only be confusing.
@@ -28,9 +29,10 @@ impl PtApp {
     /// Renders whichever dialog is currently pending. Called once per frame
     /// from `app.rs::update`, after the sidebar/tab-strip/status panels (so
     /// it draws on top of them) but before the central panel — `app.rs`
-    /// reads `self.new_tab`/`self.closing`/`self.error` right after this to
-    /// decide whether the terminal should receive keyboard focus this frame
-    /// (the FOCUS fix: see `term::TabTerm::ui`'s doc comment).
+    /// reads `self.new_tab`/`self.closing`/`self.closing_ws`/`self.error`
+    /// right after this to decide whether the terminal should receive
+    /// keyboard focus this frame (the FOCUS fix: see `term::TabTerm::ui`'s
+    /// doc comment).
     pub fn show_dialogs(&mut self, ctx: &egui::Context) {
         // ---- error dialog (always wins) ----
         if let Some(msg) = self.error.clone() {
@@ -156,6 +158,66 @@ impl PtApp {
             }
             if let Some(a) = action {
                 self.finish_close(ctx, a);
+            }
+            return;
+        }
+
+        // ---- close workspace dialog (Task 2) ----
+        if let Some(draft) = &self.closing_ws {
+            // Resolved by IDENTITY (ws_index + name), not against a bare
+            // index — same non-modal rationale as the close-tab dialog
+            // above: the sidebar stays clickable behind this window, so a
+            // concurrent close could otherwise shift `ws_index` out from
+            // under this draft. `ws_index`/`name` are copied out here
+            // (ending the borrow of `self.closing_ws`) before the identity
+            // check, which needs a plain `&self` call.
+            let ws_index = draft.ws_index;
+            let name = draft.name.clone();
+            if !self.workspace_still_named(ws_index, &name) {
+                self.closing_ws = None;
+                return;
+            }
+            // Safe: `workspace_still_named` just confirmed this index
+            // resolves to a workspace named `name`.
+            let tab_count = self.workspaces[ws_index].tabs.len();
+            let mut confirm = false;
+            let mut cancel = false;
+            egui::Window::new(format!("Close workspace \"{name}\"?"))
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    // COPY RULING (Task 1 review): "closed", not
+                    // "terminated" — closing a workspace closes its tabs'
+                    // ConPTYs, which ends the forwarding thread, but does
+                    // NOT guarantee the child process itself dies (same
+                    // pre-existing behavior as an ordinary tab close, see
+                    // `PtApp::close_workspace`'s doc comment and
+                    // `term::tests::forwarding_thread_ends_when_terminal_is_dropped`).
+                    // "terminated" would overclaim a guarantee this codebase
+                    // doesn't make.
+                    ui.label(format!(
+                        "{tab_count} running tab(s) will be closed (nothing on disk is touched)"
+                    ));
+                    ui.label("Worktrees stay on disk; kept-worktree reminders are forgotten");
+                    ui.label("Agent sessions remain resumable: pterminal resume --id <sid>");
+                    ui.horizontal(|ui| {
+                        if ui.button("Close workspace").clicked() {
+                            confirm = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if confirm {
+                self.close_workspace(ws_index);
+                // Belt-and-suspenders: `close_workspace` already clears
+                // `closing_ws` itself (Task 2 addition to its unconditional
+                // transient-state wipe), but nothing here relies on that —
+                // clearing it again is a no-op if it's already `None`.
+                self.closing_ws = None;
+            }
+            if cancel {
+                self.closing_ws = None;
             }
         }
     }
