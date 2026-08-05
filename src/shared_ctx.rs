@@ -19,23 +19,17 @@ pub fn ensure_shared_md(repo: &Path) -> anyhow::Result<PathBuf> {
 
 /// Where the live agent roster (written by Task 5's roster-maintenance step)
 /// lives — one JSON array entry per running agent tab in this repo.
-// consumed in Task 4/5 (messages.rs roster_json, app.rs roster maintenance)
-#[allow(dead_code)]
 pub fn agents_json_path(repo: &Path) -> PathBuf {
     repo.join(".pterminal").join("agents.json")
 }
 
 /// Where agent-to-agent messages are appended, one JSON object per line —
 /// the append-only log Task 4's `messages::read_new` tails.
-// consumed in Task 4/5 (messages.rs read_new, app.rs delivery)
-#[allow(dead_code)]
 pub fn messages_path(repo: &Path) -> PathBuf {
     repo.join(".pterminal").join("messages.jsonl")
 }
 
 /// Where the generated per-repo agent coordination README lives.
-// consumed in Task 5 (dialogs.rs open_tab threads this into HookSetup)
-#[allow(dead_code)]
 pub fn agent_readme_path(repo: &Path) -> PathBuf {
     repo.join(".pterminal").join("README-agents.md")
 }
@@ -45,8 +39,6 @@ pub fn agent_readme_path(repo: &Path) -> PathBuf {
 /// append-one-line protocol for messaging another agent. Paths are embedded
 /// absolute so the instructions are copy-pasteable regardless of the
 /// reading agent's own working directory.
-// consumed in Task 5 (dialogs.rs open_tab, threaded into HookSetup::agent_readme)
-#[allow(dead_code)]
 pub fn write_agent_readme(repo: &Path) -> anyhow::Result<PathBuf> {
     let p = agent_readme_path(repo);
     std::fs::create_dir_all(p.parent().unwrap())?;

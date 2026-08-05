@@ -23,11 +23,7 @@ fn status_from_event_name(name: &str) -> AgentStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventRecord {
     pub event: String,
-    // consumed in Task 5 (drain_events session-id tracking / persistence)
-    #[allow(dead_code)]
     pub session_id: Option<String>,
-    // consumed in Task 5 (subagent PreToolUse/SubagentStop child-tab bookkeeping)
-    #[allow(dead_code)]
     pub tool_desc: Option<String>,
 }
 
@@ -99,8 +95,6 @@ pub fn parse_events(contents: &str) -> Vec<EventRecord> {
 }
 
 /// The session id from the last record that carries one, if any.
-// consumed in Task 5 (drain_events session-id tracking / persistence)
-#[allow(dead_code)]
 pub fn latest_session_id(records: &[EventRecord]) -> Option<String> {
     records.iter().rev().find_map(|r| r.session_id.clone())
 }

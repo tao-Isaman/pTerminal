@@ -4,8 +4,7 @@ mod dialogs;
 mod egui_term_vendored;
 mod git;
 mod hooks;
-#[allow(dead_code)]
-mod messages; // consumed in Task 5
+mod messages;
 mod resources;
 mod shared_ctx;
 mod state;

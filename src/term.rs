@@ -153,7 +153,6 @@ impl TabTerm {
     /// message delivery and any future programmatic input reach the PTY.
     /// The caller is responsible for appending `\r` (ConPTY Enter) when a
     /// submission — not just text sitting on the input line — is intended.
-    #[allow(dead_code)] // consumed in Task 5
     pub fn write_input(&mut self, text: &str) {
         self.backend
             .process_command(BackendCommand::Write(text.as_bytes().to_vec()));
@@ -172,7 +171,7 @@ impl TabTerm {
 // too, so none of this module's items are dead code anymore.
 
 /// What a [`Tab`] runs: an agent (Claude Code via `cmd.exe`) or a plain shell.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TabKind { Agent, Shell }
 
 /// Parameters for [`spawn_agent`]. `main_repo_shared_md` always points at the
@@ -215,10 +214,11 @@ pub struct SpawnSpec {
 /// A virtual child tab for one subagent invocation (Claude Code's `Task`
 /// tool) inside a parent agent tab, tracked from `PreToolUse`/`SubagentStop`
 /// hook events — not a real ConPTY child of its own, just bookkeeping for the
-/// tab strip's `└ <desc>` row. Consumed by Task 5 (child-tab UI + lifecycle:
+/// tab strip's child row (rendered `` `- <desc> ``, see `app.rs`'s tab-strip
+/// docs — a live font-coverage finding swapped the original `└` for this
+/// ASCII form). Consumed by Task 5 (child-tab UI + lifecycle:
 /// pushed on `PreToolUse`, `done_at` set on `SubagentStop`, pruned a few
 /// seconds after completion).
-#[allow(dead_code)] // consumed in Task 5
 pub struct SubTab {
     pub desc: String,
     pub started: std::time::Instant,
@@ -246,19 +246,15 @@ pub struct Tab {
     /// Most recently observed Claude Code session id for this tab, read from
     /// `SessionStart`/etc. hook events (`hooks::latest_session_id`). Persisted
     /// (`state::SavedTab::session_id`) so a restart can `--resume` it.
-    #[allow(dead_code)] // consumed in Task 5
     pub session_id: Option<String>,
     /// `Some(saved cwd)` when this tab is the missing-directory placeholder
     /// built on restart for a saved tab whose cwd no longer exists.
-    #[allow(dead_code)] // consumed in Task 5
     pub missing_dir: Option<PathBuf>,
     /// Live subagent children, oldest first; see [`SubTab`].
-    #[allow(dead_code)] // consumed in Task 5
     pub children: Vec<SubTab>,
     /// How many parsed `EventRecord`s (`hooks::parse_events`) have already
     /// been consumed for `children` bookkeeping — the drain loop only looks
     /// at `records[events_seen..]` each frame.
-    #[allow(dead_code)] // consumed in Task 5
     pub events_seen: usize,
 }
 
@@ -290,7 +286,6 @@ pub fn agent_args(prompt: &str, resume: Option<&str>) -> Vec<String> {
 /// … suffix that is. Used to keep agent tab titles unique within a
 /// workspace (message delivery in Task 5 addresses agents by title, so a
 /// collision would make `to: "<title>"` ambiguous).
-#[allow(dead_code)] // consumed in Task 5
 pub fn unique_title(base: &str, taken: &[String]) -> String {
     if !taken.iter().any(|t| t == base) {
         return base.to_string();
@@ -440,6 +435,58 @@ pub fn spawn_shell(
         mem: 0,
         session_id: None,
         missing_dir: None,
+        children: vec![],
+        events_seen: 0,
+    })
+}
+
+/// Builds the placeholder `Tab` for a saved tab (Task 5's resume-on-launch)
+/// whose saved `cwd` no longer exists on disk. Spawns a diagnostic
+/// `cmd.exe /c echo saved directory missing & exit 1` in `repo_root` (the
+/// workspace's main checkout — never the missing path, which by definition
+/// can't be a working directory) purely so the tab has something to look
+/// at and an exit code the existing exit banner can render; this is NOT a
+/// real agent/shell spawn, so no hooks are wired and no worktree is
+/// created.
+///
+/// `missing`/`worktree`/`session_id` are carried onto the placeholder
+/// `Tab` unchanged (not reset to `None`) so a later `persist()` round-trip
+/// (`app.rs`'s `persist`, Step 2) writes the SAME `SavedTab` back out —
+/// `cwd: missing_dir` in particular, not `repo_root` — instead of quietly
+/// forgetting the original path/session/worktree the moment the directory
+/// went missing. That's what lets the banner (and the option to recover if
+/// the path reappears, e.g. a remounted drive) survive another restart
+/// rather than silently downgrading to "just another main-checkout tab" on
+/// the next `persist()`.
+pub fn spawn_missing_dir_placeholder(
+    ctx: &eframe::egui::Context,
+    id: u64,
+    repo_root: &Path,
+    missing: PathBuf,
+    title: String,
+    kind: TabKind,
+    worktree: Option<WorktreeInfo>,
+    session_id: Option<String>,
+) -> anyhow::Result<Tab> {
+    let args: Vec<String> = ["/c", "echo", "saved", "directory", "missing", "&", "exit", "1"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let term = TabTerm::spawn(ctx, id, "cmd.exe", &args, repo_root)?;
+    Ok(Tab {
+        id,
+        title,
+        kind,
+        term,
+        status: AgentStatus::Unknown,
+        worktree,
+        cwd: repo_root.to_path_buf(),
+        root_pids: vec![],
+        spawned_at: std::time::Instant::now(),
+        cpu: 0.0,
+        mem: 0,
+        session_id,
+        missing_dir: Some(missing),
         children: vec![],
         events_seen: 0,
     })
@@ -671,6 +718,50 @@ mod tests {
             "child never exited after write_input",
         );
         assert_eq!(term.exited(), Some(7));
+    }
+
+    // --- Task 5: spawn_missing_dir_placeholder ------------------------------
+
+    /// Locks in the placeholder's contract (Step 5/`app.rs`'s missing-dir
+    /// banner depends on all of this): it runs in `repo_root` (never the
+    /// missing path — that's the whole reason it exists), always exits
+    /// `1` (the banner's "Respawn"/"Close" buttons only make sense once
+    /// the diagnostic has finished), and carries the saved `missing`/
+    /// `worktree`/`session_id` straight onto the `Tab` unchanged so a
+    /// later `persist()` round-trip doesn't quietly forget them.
+    #[test]
+    fn missing_dir_placeholder_exits_1_and_carries_saved_fields() {
+        let ctx = eframe::egui::Context::default();
+        let missing = PathBuf::from("D:\\pterminal-test-missing-dir-does-not-exist");
+        let wt = WorktreeInfo { path: PathBuf::from("D:\\wt\\x"), branch: "pt/x".into() };
+        let mut tab = spawn_missing_dir_placeholder(
+            &ctx,
+            9,
+            Path::new("C:\\"),
+            missing.clone(),
+            "my-agent".to_string(),
+            TabKind::Agent,
+            Some(wt.clone()),
+            Some("sess-1".to_string()),
+        )
+        .expect("spawn placeholder");
+
+        assert_eq!(tab.cwd, PathBuf::from("C:\\"));
+        assert_eq!(tab.missing_dir, Some(missing));
+        assert_eq!(tab.title, "my-agent");
+        assert_eq!(tab.kind, TabKind::Agent);
+        assert_eq!(tab.worktree, Some(wt));
+        assert_eq!(tab.session_id, Some("sess-1".to_string()));
+        assert!(tab.children.is_empty());
+
+        assert!(
+            wait_for(|| {
+                tab.term.poll();
+                tab.term.exited().is_some()
+            }),
+            "placeholder's diagnostic command never exited",
+        );
+        assert_eq!(tab.term.exited(), Some(1));
     }
 
     #[test]

@@ -207,12 +207,17 @@ impl PtApp {
                     }
                 }
             }
-            // shared.md + gitignore entry, once per workspace. Gitignore
-            // ruling (user-approved pre-flight decision): auto-add without
-            // a confirmation prompt; any failure surfaces through the error
-            // dialog like everything else, but doesn't block the spawn.
-            let shared = if ws.meta.is_git {
-                match shared_ctx::ensure_shared_md(&repo) {
+            // shared.md + gitignore entry + per-agent README, once per
+            // workspace. Gitignore ruling (user-approved pre-flight
+            // decision): auto-add without a confirmation prompt; any
+            // failure surfaces through the error dialog like everything
+            // else, but doesn't block the spawn. `agent_readme` is
+            // best-effort alongside `shared_md` (Step 9) — a failure to
+            // write it just means the resumed hook's SessionStart inject
+            // skips that segment (see `hooks::session_start_inject`), not a
+            // blocked spawn.
+            let (shared, agent_readme) = if ws.meta.is_git {
+                let shared = match shared_ctx::ensure_shared_md(&repo) {
                     Ok(p) => {
                         if shared_ctx::gitignore_needs_entry(&repo) {
                             if let Err(e) = shared_ctx::add_gitignore_entry(&repo) {
@@ -225,10 +230,23 @@ impl PtApp {
                         self.error = Some(e.to_string());
                         None
                     }
-                }
+                };
+                (shared, shared_ctx::write_agent_readme(&repo).ok())
             } else {
-                None
+                (None, None)
             };
+            // Step 9: a pre-computed unique title, so a fresh spawn whose
+            // slugged prompt collides with an already-open agent tab in
+            // this workspace doesn't produce two tabs that message delivery
+            // (Step 7, `to: "<title>"`) can't tell apart.
+            let slug = git::slug(&draft.prompt, id);
+            let existing_titles: Vec<String> = ws
+                .tabs
+                .iter()
+                .filter(|t| t.kind == TabKind::Agent)
+                .map(|t| t.title.clone())
+                .collect();
+            let title = term::unique_title(&slug, &existing_titles);
             term::spawn_agent(
                 ctx,
                 id,
@@ -237,13 +255,14 @@ impl PtApp {
                     main_repo_shared_md: shared,
                     prompt: draft.prompt,
                     isolate: draft.isolate,
-                    // Behavioral no-ops (Task 3): this dialog only ever opens
-                    // fresh tabs. Task 5 threads real values — a per-agent
-                    // README, a resumed session id, and a pre-computed
-                    // unique title/worktree — for the restart-resume path.
-                    agent_readme: None,
+                    agent_readme,
+                    // Behavioral no-op (Task 3): this dialog only ever opens
+                    // FRESH tabs — `resume_session`/`worktree` stay `None`
+                    // here. Resume is exclusively the app-relaunch path
+                    // (`PtApp::resume_saved_tabs`), never a live "open tab"
+                    // spawn.
                     resume_session: None,
-                    title: None,
+                    title: Some(title),
                     worktree: None,
                 },
             )
