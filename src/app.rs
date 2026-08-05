@@ -2266,11 +2266,19 @@ impl PtApp {
         // Task 1: Ctrl+O opens the file picker regardless of whether a
         // workspace has any terminal tabs — `open_file_dialog` itself is the
         // one that no-ops when there's no active workspace to attach to.
-        if open_file {
+        // Final-review finding 1: guarded off for the orchestrator too — the
+        // reserved orchestrator workspace is single-purpose, so it doesn't
+        // sprout stray editor tabs (mirrors the Ctrl+T/Ctrl+W guards below).
+        if open_file && !self.workspaces.get(self.active_ws).is_some_and(|w| w.meta.is_orchestrator) {
             self.open_file_dialog();
         }
         let Some(ws) = self.workspaces.get_mut(self.active_ws) else { return };
-        if t {
+        // Final-review finding 1: Ctrl+T must not add a tab to the
+        // orchestrator workspace — its tabs are unclosable by construction
+        // (see the Ctrl+W guard below), so an accidental Ctrl+T would create a
+        // permanently unclosable, persisted tab. Same `!is_orchestrator` guard
+        // as Ctrl+W.
+        if t && !ws.meta.is_orchestrator {
             self.new_tab = Some(NewTabDraft {
                 ws_index: self.active_ws,
                 prompt: String::new(),
@@ -3200,6 +3208,7 @@ impl eframe::App for PtApp {
         let focused = self.new_tab.is_none()
             && self.closing.is_none()
             && self.closing_ws.is_none()
+            && self.closing_editor.is_none()
             && self.error.is_none()
             && !self.ctx_panel_has_focus
             && !self.editor_has_focus;
