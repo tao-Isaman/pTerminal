@@ -64,6 +64,45 @@ pub fn write_agent_readme(repo: &Path) -> anyhow::Result<PathBuf> {
     Ok(p)
 }
 
+/// Root directory for the reserved orchestrator workspace (editor-
+/// orchestrator feature, Task 2): `%APPDATA%\pterminal\orchestrator` (or
+/// whatever `state::default_base()` resolves to on this platform/install).
+/// Deliberately NOT parameterized by any workspace's `repo_path` — the
+/// orchestrator isn't a checkout of anything, it's pTerminal's own
+/// app-wide scratch directory, one per install, same base every other
+/// piece of app-wide (not per-repo) state already uses.
+pub fn orchestrator_dir() -> PathBuf {
+    crate::state::default_base().join("orchestrator")
+}
+
+/// Where the orchestrator's running status/notes live. Task 2 only defines
+/// the path (a plain join, no I/O); nothing reads or writes it yet — a
+/// later task owns the orchestrator's own status-reporting content.
+/// `allow(dead_code)` scoped to non-test builds, same convention as
+/// `hooks::status_from_events` — this task's tests exercise the path
+/// function itself; a real reader/writer is a later task's job.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn status_md_path(orch_dir: &Path) -> PathBuf {
+    orch_dir.join("status.md")
+}
+
+/// Where the orchestrator's own agent-session README will live — the
+/// orchestrator's counterpart to [`agent_readme_path`], but with different
+/// content: the orchestrator isn't working IN a per-repo checkout, so the
+/// per-repo coordination doc's instructions don't apply to it. Task 2 only
+/// defines the path; Task 3 writes the content and wires it into the
+/// orchestrator's saved tab's `SpawnSpec::agent_readme` (see
+/// `PtApp::ensure_orchestrator`'s doc comment for the seam this leaves for
+/// THIS task: the orchestrator's tab still spawns through the ordinary
+/// `resume_saved_tabs` path, which for a non-git workspace like this one
+/// never calls `write_agent_readme`/this path at all).
+/// `allow(dead_code)` scoped to non-test builds, same convention as
+/// `hooks::status_from_events` / `status_md_path` above.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn orchestrator_readme_path(orch_dir: &Path) -> PathBuf {
+    orch_dir.join(".pterminal").join("README-orchestrator.md")
+}
+
 pub fn gitignore_needs_entry(repo: &Path) -> bool {
     let text = std::fs::read_to_string(repo.join(".gitignore")).unwrap_or_default();
     !text.lines().any(|l| l.trim() == ".pterminal/")
@@ -160,5 +199,24 @@ mod tests {
         let gi = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         assert_eq!(gi.matches(".pterminal/").count(), 1);
         assert!(!gitignore_needs_entry(dir.path()));
+    }
+
+    /// Task 2 (editor-orchestrator): the reserved orchestrator workspace's
+    /// root lives under the same `%APPDATA%\pterminal` base every other
+    /// piece of app-wide (not per-repo) state uses (`state::default_base`),
+    /// not under any particular workspace's `repo_path` — it's pTerminal's
+    /// own scratch directory, not a checkout. `status_md_path`/
+    /// `orchestrator_readme_path` are plain joins under it, same
+    /// no-side-effect-just-a-path convention as `shared_md_path`/
+    /// `agent_readme_path` above (nothing here touches disk).
+    #[test]
+    fn orchestrator_paths_are_under_default_base() {
+        let orch_dir = orchestrator_dir();
+        assert_eq!(orch_dir, crate::state::default_base().join("orchestrator"));
+        assert_eq!(status_md_path(&orch_dir), orch_dir.join("status.md"));
+        assert_eq!(
+            orchestrator_readme_path(&orch_dir),
+            orch_dir.join(".pterminal").join("README-orchestrator.md")
+        );
     }
 }

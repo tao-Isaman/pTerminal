@@ -266,6 +266,75 @@ fn initial_msg_offset(repo: &Path) -> u64 {
     std::fs::metadata(shared_ctx::messages_path(repo)).map(|m| m.len()).unwrap_or(0)
 }
 
+/// Builds the reserved orchestrator's `Workspace` record (editor-
+/// orchestrator feature, Task 2): rooted at `shared_ctx::orchestrator_dir()`
+/// — not a git repo, since it's pTerminal's own scratch directory, not a
+/// checkout — with a single unresumed `Agent` saved tab titled
+/// "orchestrator" so it resumes through the exact same `resume_saved_tabs`
+/// path as any other saved agent tab (fresh `claude` the first time,
+/// `--resume <sid>` on every launch after that).
+///
+/// The saved tab's `tab_id` here is a placeholder (`0`) — this is a free
+/// function with no `next_tab_id` counter to draw a real one from (see
+/// [`pin_orchestrator_front`]'s doc comment for why). `PtApp::ensure_orchestrator`
+/// overwrites it with a real id immediately after, but only on the branch
+/// where a NEW orchestrator was actually created — an already-existing one
+/// keeps whatever id it was persisted with.
+fn new_orchestrator_workspace() -> state::Workspace {
+    let orch_dir = shared_ctx::orchestrator_dir();
+    state::Workspace {
+        name: "orchestrator".to_string(),
+        repo_path: orch_dir.clone(),
+        is_git: false,
+        default_isolate: false,
+        kept_worktrees: vec![],
+        saved_tabs: vec![state::SavedTab {
+            tab_id: 0,
+            kind: state::SavedTabKind::Agent,
+            title: "orchestrator".to_string(),
+            cwd: orch_dir,
+            worktree: None,
+            session_id: None,
+        }],
+        active_tab: 0,
+        msg_offset: 0,
+        saved_editors: vec![],
+        is_orchestrator: true,
+    }
+}
+
+/// Task 2 (editor-orchestrator): pure list manipulation behind
+/// [`PtApp::ensure_orchestrator`] — no filesystem I/O, no `PtApp`/`WsRt`/
+/// egui dependency, so the create-or-pin algorithm is unit-testable
+/// directly against a plain `Vec<state::Workspace>`.
+///
+/// Finds the (at most one, by construction) entry with `is_orchestrator ==
+/// true` and moves it to index 0 via remove+insert — a stable rotation
+/// that shifts every workspace between the old and new position by one
+/// slot but never reorders any two of THEM relative to each other. If none
+/// exists yet, inserts a freshly-built [`new_orchestrator_workspace`] at
+/// index 0 instead.
+///
+/// Returns `true` iff a NEW orchestrator was inserted (none existed before
+/// this call) — `false` covers both "already at 0, nothing to do" and
+/// "existed elsewhere, just moved". `PtApp::ensure_orchestrator` uses this
+/// to know whether the fresh saved tab still needs a real `tab_id` drawn
+/// from `next_tab_id` and the on-disk directories still need creating.
+fn pin_orchestrator_front(workspaces: &mut Vec<state::Workspace>) -> bool {
+    match workspaces.iter().position(|w| w.is_orchestrator) {
+        Some(0) => false,
+        Some(i) => {
+            let orch = workspaces.remove(i);
+            workspaces.insert(0, orch);
+            false
+        }
+        None => {
+            workspaces.insert(0, new_orchestrator_workspace());
+            true
+        }
+    }
+}
+
 pub struct PtApp {
     pub base: PathBuf,
     pub workspaces: Vec<WsRt>,
@@ -433,6 +502,12 @@ impl PtApp {
         // once tabs actually exist, clamped against however many workspaces
         // (and, per-workspace, however many tabs) actually resumed.
         let saved_active_ws = st.active_ws;
+        // Task 2: identity of the workspace `saved_active_ws` names,
+        // captured BEFORE `ensure_orchestrator` (below) can reorder the
+        // list — see `PtApp::resolve_active_ws`'s doc comment for why a
+        // bare index alone can't survive that reorder.
+        let saved_active_identity: Option<(String, PathBuf)> =
+            st.workspaces.get(saved_active_ws).map(|w| (w.name.clone(), w.repo_path.clone()));
         let workspaces: Vec<WsRt> = st
             .workspaces
             .into_iter()
@@ -482,16 +557,23 @@ impl PtApp {
             app.error = watch_err;
         }
 
+        // Task 2: ensure the reserved orchestrator workspace exists and
+        // sits pinned at index 0 — BEFORE `resume_saved_tabs` so its saved
+        // tab resumes through the exact same path as any other saved agent
+        // tab (see `ensure_orchestrator`'s doc comment).
+        app.ensure_orchestrator();
+
         // Step 3: resume every saved tab, then restore the active
         // workspace/tab selection now that tabs actually exist to select
         // among (clamped — a spawn failure or a shrunk workspace list can
-        // leave fewer tabs/workspaces than what was saved).
+        // leave fewer tabs/workspaces than what was saved). Uses
+        // `resolve_active_ws`, not a bare index clamp, because
+        // `ensure_orchestrator` just above may have reordered
+        // `app.workspaces` — see that function's doc comment for the
+        // index-0-invariant bug this avoids.
         app.resume_saved_tabs(&cc.egui_ctx);
-        app.active_ws = if app.workspaces.is_empty() {
-            0
-        } else {
-            saved_active_ws.min(app.workspaces.len() - 1)
-        };
+        app.active_ws =
+            Self::resolve_active_ws(&app.workspaces, saved_active_ws, saved_active_identity.as_ref());
 
         // Task 1: reopen every saved editor tab, per workspace. Deliberately
         // after `resume_saved_tabs`/the active-workspace clamp above — it
@@ -1158,6 +1240,7 @@ impl PtApp {
                 active_tab: 0,
                 msg_offset,
                 saved_editors: vec![],
+                is_orchestrator: false,
             },
             tabs: vec![],
             active_tab: 0,
@@ -1224,6 +1307,17 @@ impl PtApp {
         if ws_index >= self.workspaces.len() {
             return;
         }
+        // Task 2 (editor-orchestrator): the reserved orchestrator workspace
+        // can never be closed — a true no-op, same bar as the out-of-range
+        // guard just above, not merely "skip the removal step". The
+        // sidebar's context menu already never offers this workspace
+        // "Close workspace" (see the sidebar-rendering code in `update`),
+        // but this guard is the one that actually matters: it's what makes
+        // the omission a real guarantee rather than just a UI nicety, for
+        // this and any other call site.
+        if self.workspaces[ws_index].meta.is_orchestrator {
+            return;
+        }
         let removed_tab_ids: HashSet<u64> =
             self.workspaces[ws_index].tabs.iter().map(|t| t.id).collect();
         self.workspaces.remove(ws_index);
@@ -1268,6 +1362,134 @@ impl PtApp {
     /// caller — same visibility as `close_workspace` itself.
     pub fn workspace_still_named(&self, ws_index: usize, name: &str) -> bool {
         self.workspaces.get(ws_index).map(|w| w.meta.name.as_str()) == Some(name)
+    }
+
+    /// Task 2 (editor-orchestrator): ensures `self.workspaces` contains
+    /// exactly one reserved "orchestrator" workspace, pinned at index 0
+    /// (see [`pin_orchestrator_front`] for the list algorithm) — creating
+    /// it (on-disk `.pterminal` directory + a fresh saved-tab id) the first
+    /// time this ever runs for a given `%APPDATA%` install, and merely
+    /// re-pinning an already-present one on every call after that.
+    /// Idempotent: a second call with the orchestrator already at index 0
+    /// moves nothing and creates nothing.
+    ///
+    /// Called from `PtApp::new`, AFTER state load (so a previously-created
+    /// orchestrator round-trips through `state.json` like any other
+    /// workspace) and BEFORE `resume_saved_tabs` (so its saved tab resumes
+    /// through the exact same code path as any other saved agent tab).
+    ///
+    /// **Precondition (not re-checked): every `WsRt` in `self.workspaces` at
+    /// this point still has empty `tabs`/`editors`.** True for every call
+    /// site today — this only ever runs before `resume_saved_tabs`/
+    /// `resume_saved_editors` populate them. Rebuilding `self.workspaces`
+    /// from re-ordered `meta` clones below (rather than rotating the
+    /// `WsRt`s themselves in place) is only lossless under that
+    /// precondition; a future call site reached after tabs already exist
+    /// would silently drop them.
+    ///
+    /// **Index-0 invariant / `active_ws`:** this can shift every real
+    /// workspace's index by one (a fresh orchestrator inserted at the
+    /// front) or rotate a range of them (an existing orchestrator moved to
+    /// the front from elsewhere). `PtApp::new` accounts for that with
+    /// [`PtApp::resolve_active_ws`] rather than trusting the raw saved
+    /// index across this reorder — see that function's doc comment.
+    /// `close_workspace`'s own index math and `finish_add_workspace`
+    /// (append-only) are unaffected: both operate entirely AFTER this has
+    /// already run and settled, so every real workspace they see is already
+    /// living at its stable index in `1..n`.
+    ///
+    /// **Seam (Task 3):** the fresh saved tab's spawn goes through
+    /// `resume_saved_tabs` completely unchanged from any other agent tab.
+    /// Since `is_git` is `false` for this workspace, that path's
+    /// `agent_readme` ends up `None` (it only calls `write_agent_readme`
+    /// when `is_git`) — NOT [`shared_ctx::orchestrator_readme_path`]. Task 3
+    /// wires the orchestrator-specific README into the spawn; for this task
+    /// the orchestrator's agent tab is otherwise an ordinary direct-mode
+    /// agent tab rooted at `orchestrator_dir()`, with no per-repo
+    /// coordination doc injected.
+    pub fn ensure_orchestrator(&mut self) {
+        let mut metas: Vec<state::Workspace> = self.workspaces.iter().map(|w| w.meta.clone()).collect();
+        let created = pin_orchestrator_front(&mut metas);
+        if created {
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
+            metas[0].saved_tabs[0].tab_id = id;
+            let orch_dir = shared_ctx::orchestrator_dir();
+            if let Err(e) = std::fs::create_dir_all(orch_dir.join(".pterminal")) {
+                self.error = Some(format!("could not create orchestrator directory: {e}"));
+            }
+        }
+        self.workspaces = metas
+            .into_iter()
+            .map(|meta| WsRt { meta, tabs: vec![], active_tab: 0, editors: vec![], active_editor: None })
+            .collect();
+        // Only a brand-new orchestrator needs the watcher rebuilt: the
+        // initial `spawn_watcher` call in `PtApp::new` already ran over the
+        // FULL loaded workspace list (including any pre-existing
+        // orchestrator, order doesn't matter to `watcher_dirs`) before this
+        // method ever runs — see this method's doc comment for the exact
+        // ordering. A newly-created one wasn't in that list yet, so without
+        // this its `.pterminal` dir (F2 live-reload, once Task 3 uses it)
+        // would go unwatched until the next unrelated rebuild. Mirrors
+        // `finish_add_workspace`'s own rebuild-on-change convention.
+        if created {
+            self.rebuild_watcher();
+        }
+    }
+
+    /// Finds the reserved orchestrator workspace's current index, if any.
+    /// Extracted as its own helper (rather than inlining
+    /// `self.workspaces.iter().position(...)` at each call site) so
+    /// `is_orchestrator` is only ever compared against in one place. No
+    /// production call site yet — this task's own sidebar/tab-strip
+    /// rendering already has `ws.meta.is_orchestrator` in hand while
+    /// iterating, so it never needed a separate lookup; the interface is
+    /// part of Task 2's brief regardless (a future task querying "is there
+    /// an orchestrator, and where" without an in-hand `WsRt` needs exactly
+    /// this). `allow(dead_code)` is scoped to non-test builds so a real
+    /// production consumer showing up later doesn't need to remove
+    /// anything, and if the tests below ever stop exercising it, the
+    /// `cargo test` build starts warning instead of it rotting silently —
+    /// same convention as `hooks::status_from_events`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn orchestrator_index(&self) -> Option<usize> {
+        self.workspaces.iter().position(|w| w.meta.is_orchestrator)
+    }
+
+    /// Resolves the active-workspace index to restore at startup, once
+    /// `ensure_orchestrator` may have reordered `workspaces` (Task 2:
+    /// pinning an existing or freshly-inserted orchestrator to index 0
+    /// shifts or rotates every other workspace's index). Prefers
+    /// relocating the SAME workspace `identity` (name + repo_path, captured
+    /// by `PtApp::new` before any reorder) over trusting the raw
+    /// `saved_index` — that index was computed against the list order
+    /// BEFORE `ensure_orchestrator` ran, so the workspace that used to be
+    /// active can silently end up under a different, now-shifted index
+    /// otherwise. Concretely, the bug this avoids: on the very first launch
+    /// after this feature ships, an existing install's active real
+    /// workspace would otherwise appear to jump to the newly-inserted
+    /// orchestrator instead of staying selected.
+    ///
+    /// Falls back to the raw `saved_index` (clamped to the last valid
+    /// index) when there's no identity to resolve (fresh install, empty
+    /// saved state) or it no longer matches anything in `workspaces` (the
+    /// previously active workspace's own name/path changed, or it's
+    /// genuinely gone) — same "can't guess, degrade to the least-wrong
+    /// index" rule the pre-Task-2 code already followed.
+    fn resolve_active_ws(
+        workspaces: &[WsRt],
+        saved_index: usize,
+        identity: Option<&(String, PathBuf)>,
+    ) -> usize {
+        if workspaces.is_empty() {
+            return 0;
+        }
+        identity
+            .and_then(|(name, path)| {
+                workspaces.iter().position(|w| &w.meta.name == name && &w.meta.repo_path == path)
+            })
+            .unwrap_or(saved_index)
+            .min(workspaces.len() - 1)
     }
 
     /// Opens a plain shell tab rooted at a worktree the user previously
@@ -1794,7 +2016,11 @@ impl PtApp {
                 shell: false,
             });
         }
-        if w && !ws.tabs.is_empty() {
+        // Task 2 (editor-orchestrator): Ctrl+W must not be able to do what
+        // the tab strip's own `x`/middle-click already refuse to do for the
+        // orchestrator's tab — otherwise hiding those buttons would be
+        // theater, not an actual "no-close" guarantee.
+        if w && !ws.tabs.is_empty() && !ws.meta.is_orchestrator {
             self.closing = close_draft_for(ws, self.active_ws, ws.active_tab);
         }
         if cycle && !ws.tabs.is_empty() {
@@ -2257,6 +2483,40 @@ impl eframe::App for PtApp {
             // needs a mutable borrow of this local, not of `self`.
             let mut close_ws_clicked: Option<CloseWsDraft> = None;
             for (i, ws) in self.workspaces.iter().enumerate() {
+                if ws.meta.is_orchestrator {
+                    // Task 2 (editor-orchestrator): distinct rendering, and
+                    // deliberately no `.context_menu` attached below — this
+                    // is the reserved singleton workspace
+                    // `ensure_orchestrator` pins at index 0, never a
+                    // candidate for the numbered agents/mem/cpu row format
+                    // or for "Close workspace" (enforced for real by
+                    // `close_workspace`'s own guard; this omission is what
+                    // makes that guarantee visible in the UI). It also never
+                    // has `kept_worktrees` (never populated for a non-git
+                    // workspace), so there's nothing else this row needs to
+                    // render.
+                    //
+                    // BUG FOUND IN MANUAL VERIFICATION (screenshot evidence,
+                    // `orch-1-fresh-launch-initial.png`): the brief's own
+                    // literal "\u{25C8}" (WHITE DIAMOND CONTAINING BLACK
+                    // SMALL DIAMOND) rendered as an empty tofu box on this
+                    // machine/font — the exact failure mode this file's own
+                    // `glyph()`/"[wt]"/"[e]" doc comments already warn about
+                    // for other bundled-font gaps; missed during
+                    // implementation, caught here. Dropped in favor of no
+                    // extra glyph at all: the row is already visually
+                    // distinct from a numbered workspace row by omitting the
+                    // agents/mem/cpu stats line entirely and always sitting
+                    // first, so unlike ">"/"[wt]"/"[e]" there's no ASCII
+                    // substitute needed — confirmed rendering correctly live
+                    // afterward (`orch-1-fresh-launch-orchestrator-active.png`).
+                    let label = format!("{} Orchestrator", if i == self.active_ws { ">" } else { " " });
+                    let row_resp = ui.selectable_label(i == self.active_ws, label);
+                    if row_resp.clicked() {
+                        clicked = Some(i);
+                    }
+                    continue;
+                }
                 let agent_count = ws.tabs.iter().filter(|t| t.kind == TabKind::Agent).count();
                 let (cpu, mem): (f32, u64) = ws
                     .tabs
@@ -2349,6 +2609,13 @@ impl eframe::App for PtApp {
                     ui.label("add a workspace to begin");
                     return;
                 };
+                // Task 2 (editor-orchestrator): the reserved orchestrator
+                // workspace is a single always-resumed agent tab — no
+                // `+`/`+file`, and its one tab can't be closed by
+                // middle-click or the `x` button (mirrored by a Ctrl+W
+                // guard in `shortcuts()`). Computed once, read at every
+                // suppression point below.
+                let is_orchestrator = ws.meta.is_orchestrator;
                 let mut close_req = None;
                 for (i, tab) in ws.tabs.iter().enumerate() {
                     // Shared-dir warning marker (Step 3). Only Agent tabs
@@ -2421,13 +2688,18 @@ impl eframe::App for PtApp {
                         self.selected_child = None; // Step 8: clicking any real tab clears it
                         ws.active_editor = None; // Task 1: a terminal tab click leaves the editor view
                     }
-                    if resp.middle_clicked() && !dialog_open {
+                    if resp.middle_clicked() && !dialog_open && !is_orchestrator {
                         close_req = Some(i);
                     }
                     // Visible close button — same confirmed-close path as
                     // middle-click/Ctrl+W (close dialog, then the drop of the
                     // tab's ConPTY takes the agent process down with it).
-                    if ui.small_button("x").on_hover_text("close tab").clicked() && !dialog_open {
+                    // Task 2: hidden entirely for the orchestrator's tab,
+                    // not just disabled — "no-close" per the brief.
+                    if !is_orchestrator
+                        && ui.small_button("x").on_hover_text("close tab").clicked()
+                        && !dialog_open
+                    {
                         close_req = Some(i);
                     }
                     // Step 8: subagent child rows, one small selectable
@@ -2534,19 +2806,25 @@ impl eframe::App for PtApp {
                     }
                 }
 
-                if ui.add_enabled(!dialog_open, egui::Button::new("+")).clicked() {
-                    let isolate = ws.meta.default_isolate && ws.meta.is_git;
-                    self.new_tab = Some(NewTabDraft {
-                        ws_index: active_ws,
-                        prompt: String::new(),
-                        isolate,
-                        shell: false,
-                    });
-                }
-                // Task 1: `+file` beside `+` — opens the native file picker
-                // (Ctrl+O does the same thing; this is the mouse path).
-                if ui.add_enabled(!dialog_open, egui::Button::new("+file")).clicked() {
-                    open_file_clicked = true;
+                // Task 2: both hidden outright (not just disabled) for the
+                // orchestrator workspace — single agent tab, no editors, no
+                // shells, per the brief.
+                if !is_orchestrator {
+                    if ui.add_enabled(!dialog_open, egui::Button::new("+")).clicked() {
+                        let isolate = ws.meta.default_isolate && ws.meta.is_git;
+                        self.new_tab = Some(NewTabDraft {
+                            ws_index: active_ws,
+                            prompt: String::new(),
+                            isolate,
+                            shell: false,
+                        });
+                    }
+                    // Task 1: `+file` beside `+` — opens the native file
+                    // picker (Ctrl+O does the same thing; this is the mouse
+                    // path).
+                    if ui.add_enabled(!dialog_open, egui::Button::new("+file")).clicked() {
+                        open_file_clicked = true;
+                    }
                 }
             });
             if open_file_clicked {
@@ -2866,6 +3144,7 @@ mod tests {
             active_tab: 0,
             msg_offset: 0,
             saved_editors: vec![],
+            is_orchestrator: false,
         };
         let (_tx, sampler_rx) = std::sync::mpsc::channel();
         PtApp {
@@ -2934,6 +3213,7 @@ mod tests {
             active_tab: 0,
             msg_offset: 0,
             saved_editors: vec![],
+            is_orchestrator: false,
         };
         let (_tx, sampler_rx) = std::sync::mpsc::channel();
         PtApp {
@@ -3016,11 +3296,32 @@ mod tests {
                 active_tab: 0,
                 msg_offset: 0,
                 saved_editors: vec![],
+                is_orchestrator: false,
             },
             tabs: vec![],
             active_tab: 0,
             editors: vec![],
             active_editor: None,
+        }
+    }
+
+    /// A bare `state::Workspace` (no `WsRt` wrapper, no tabs) named `name` —
+    /// for `pin_orchestrator_front` tests (Task 2: editor-orchestrator),
+    /// which operate on a plain `Vec<state::Workspace>` directly per that
+    /// function's pure-list-manipulation contract (no `WsRt`, no `PtApp`, no
+    /// egui).
+    fn plain_workspace(name: &str) -> state::Workspace {
+        state::Workspace {
+            name: name.to_string(),
+            repo_path: PathBuf::from(format!("D:\\{name}")),
+            is_git: false,
+            default_isolate: false,
+            kept_worktrees: vec![],
+            saved_tabs: vec![],
+            active_tab: 0,
+            msg_offset: 0,
+            saved_editors: vec![],
+            is_orchestrator: false,
         }
     }
 
@@ -3655,6 +3956,29 @@ mod tests {
         );
     }
 
+    /// Task 2 (editor-orchestrator): the reserved orchestrator workspace can
+    /// never be closed, from the sidebar or anywhere else that ultimately
+    /// calls `close_workspace` — same "true no-op" bar as the out-of-range
+    /// case above, not just "skip the removal".
+    #[test]
+    fn close_workspace_on_orchestrator_index_is_a_no_op() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut orch = ws_with_name(shared_ctx::orchestrator_dir(), "orchestrator");
+        orch.meta.is_orchestrator = true;
+        let ws0 = ws_with_name(base.path().join("real0"), "real0");
+        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![orch, ws0], 0);
+        app.new_tab = Some(NewTabDraft { ws_index: 0, prompt: "keep-me".to_string(), isolate: false, shell: false });
+
+        app.close_workspace(0);
+
+        assert_eq!(app.workspaces.len(), 2, "the orchestrator must survive close_workspace");
+        assert!(app.workspaces[0].meta.is_orchestrator);
+        assert!(
+            app.new_tab.is_some(),
+            "a guarded no-op must not touch any other transient state either"
+        );
+    }
+
     #[test]
     fn close_workspace_drops_pending_submit_entries_for_its_own_tabs_only() {
         use std::time::{Duration, Instant};
@@ -3692,6 +4016,179 @@ mod tests {
         );
 
         exit_and_drain(&mut app.workspaces[0].tabs[0].term);
+    }
+
+    // ---- pin_orchestrator_front / ensure_orchestrator / orchestrator_index
+    // (Task 2: editor-orchestrator) ----
+    //
+    // `pin_orchestrator_front` is pure list manipulation on a plain
+    // `Vec<state::Workspace>` — no `WsRt`, no `PtApp`, no egui — so the
+    // create-or-pin algorithm itself is tested directly, without touching
+    // disk. `ensure_orchestrator` (the `PtApp` method wrapping it) is
+    // tested separately below, and IS allowed to touch the real
+    // `%APPDATA%\pterminal\orchestrator` directory `shared_ctx::orchestrator_dir()`
+    // names — that path is a fixed, non-parameterized singleton by design
+    // (same as `state::default_base()` itself), not a per-test tempdir —
+    // so that one test cleans up before and after itself to leave no
+    // residue.
+
+    #[test]
+    fn pin_orchestrator_front_creates_one_at_index_0_when_none_exists() {
+        let mut workspaces = vec![plain_workspace("real0"), plain_workspace("real1")];
+
+        let created = pin_orchestrator_front(&mut workspaces);
+
+        assert!(created, "no orchestrator existed — must report having created one");
+        assert_eq!(workspaces.len(), 3);
+        assert!(workspaces[0].is_orchestrator);
+        assert_eq!(workspaces[0].name, "orchestrator");
+        assert_eq!(workspaces[0].repo_path, shared_ctx::orchestrator_dir());
+        assert!(!workspaces[0].is_git);
+        assert_eq!(workspaces[0].saved_tabs.len(), 1, "one Agent saved tab titled \"orchestrator\"");
+        let tab = &workspaces[0].saved_tabs[0];
+        assert_eq!(tab.kind, state::SavedTabKind::Agent);
+        assert_eq!(tab.title, "orchestrator");
+        assert_eq!(tab.cwd, shared_ctx::orchestrator_dir());
+        assert_eq!(tab.session_id, None, "brief: session None — fresh first time");
+        // Real workspaces keep their relative order, shifted down by one.
+        assert_eq!(workspaces[1].name, "real0");
+        assert_eq!(workspaces[2].name, "real1");
+    }
+
+    #[test]
+    fn pin_orchestrator_front_moves_an_existing_one_to_0_preserving_others_order() {
+        let mut orch = plain_workspace("orchestrator");
+        orch.is_orchestrator = true;
+        let mut workspaces = vec![plain_workspace("real0"), plain_workspace("real1"), orch];
+
+        let created = pin_orchestrator_front(&mut workspaces);
+
+        assert!(!created, "an orchestrator already existed — must not create a second one");
+        assert_eq!(workspaces.len(), 3, "must still be exactly one orchestrator, not two");
+        assert!(workspaces[0].is_orchestrator);
+        assert_eq!(workspaces[1].name, "real0", "relative order of the others must survive the rotation");
+        assert_eq!(workspaces[2].name, "real1");
+    }
+
+    #[test]
+    fn pin_orchestrator_front_is_idempotent() {
+        let mut workspaces = vec![plain_workspace("real0")];
+
+        assert!(pin_orchestrator_front(&mut workspaces), "first call creates it");
+        assert!(!pin_orchestrator_front(&mut workspaces), "second call must be a no-op");
+        assert!(!pin_orchestrator_front(&mut workspaces), "third call too");
+
+        assert_eq!(workspaces.len(), 2, "still exactly one orchestrator + one real workspace");
+        assert_eq!(
+            workspaces.iter().filter(|w| w.is_orchestrator).count(),
+            1,
+            "calling repeatedly must never produce a second orchestrator"
+        );
+        assert!(workspaces[0].is_orchestrator);
+        assert_eq!(workspaces[1].name, "real0");
+    }
+
+    /// `PtApp::ensure_orchestrator`: the `&mut self` wrapper around
+    /// `pin_orchestrator_front` that also (on the create branch only) mints
+    /// a real `tab_id` from `next_tab_id` and creates the on-disk
+    /// directories. Touches the real, non-tempdir `orchestrator_dir()` —
+    /// cleaned up before (in case a previous run/crash left it) and after.
+    #[test]
+    fn ensure_orchestrator_creates_pins_bumps_next_tab_id_and_makes_dirs() {
+        let orch_dir = shared_ctx::orchestrator_dir();
+        let _ = std::fs::remove_dir_all(&orch_dir);
+        let base = tempfile::tempdir().expect("tempdir");
+        let ws0 = ws_with_name(base.path().join("real0"), "real0");
+        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws0], 0);
+        let next_id_before = app.next_tab_id;
+
+        app.ensure_orchestrator();
+
+        assert_eq!(app.workspaces.len(), 2);
+        assert!(app.workspaces[0].meta.is_orchestrator);
+        assert_eq!(app.workspaces[1].meta.name, "real0", "the real workspace survives, shifted to index 1");
+        assert_eq!(app.next_tab_id, next_id_before + 1, "the fresh saved tab consumes one id");
+        assert_eq!(app.workspaces[0].meta.saved_tabs[0].tab_id, next_id_before);
+        assert!(orch_dir.join(".pterminal").is_dir(), "ensure_orchestrator must create the .pterminal dir");
+        assert_eq!(app.orchestrator_index(), Some(0));
+
+        // Idempotent: a second call moves/creates nothing further.
+        let next_id_after_first = app.next_tab_id;
+        app.ensure_orchestrator();
+        assert_eq!(app.workspaces.len(), 2, "calling twice must not create a second orchestrator");
+        assert_eq!(app.next_tab_id, next_id_after_first, "no new tab id consumed on the idempotent call");
+
+        let _ = std::fs::remove_dir_all(&orch_dir); // leave no residue
+    }
+
+    #[test]
+    fn orchestrator_index_finds_the_pinned_workspace_or_none() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let ws0 = ws_with_name(base.path().join("real0"), "real0");
+        let app_without = app_with_workspaces(base.path().to_path_buf(), vec![ws0], 0);
+        assert_eq!(app_without.orchestrator_index(), None);
+
+        let mut orch = ws_with_name(shared_ctx::orchestrator_dir(), "orchestrator");
+        orch.meta.is_orchestrator = true;
+        let ws1 = ws_with_name(base.path().join("real1"), "real1");
+        let app_with = app_with_workspaces(base.path().to_path_buf(), vec![orch, ws1], 0);
+        assert_eq!(app_with.orchestrator_index(), Some(0));
+    }
+
+    // ---- resolve_active_ws (Task 2: index-0 invariant across the
+    // ensure_orchestrator reorder) ----
+    //
+    // `ensure_orchestrator` can shift every real workspace's index by one
+    // (a fresh orchestrator inserted at the front) or rotate a range of them
+    // (an existing orchestrator moved to the front from elsewhere) — either
+    // one silently invalidates a bare `active_ws` index computed against the
+    // list's PRE-reorder order. `resolve_active_ws` is the fix: relocate the
+    // previously-active workspace by IDENTITY (name + repo_path) instead.
+
+    #[test]
+    fn resolve_active_ws_relocates_saved_identity_after_a_front_insert() {
+        let base = tempfile::tempdir().expect("tempdir");
+        // Post-reorder shape: orchestrator inserted at 0, `real0`/`real1`
+        // shifted from [0,1] to [1,2] — exactly what `ensure_orchestrator`
+        // produces for a fresh-orchestrator install that already had two
+        // real workspaces.
+        let mut orch = ws_with_name(shared_ctx::orchestrator_dir(), "orchestrator");
+        orch.meta.is_orchestrator = true;
+        let real0 = ws_with_name(base.path().join("real0"), "real0");
+        let real1 = ws_with_name(base.path().join("real1"), "real1");
+        let workspaces = vec![orch, real0, real1];
+
+        // Before the reorder, `real1` was active at (pre-reorder) index 1.
+        let identity = Some(("real1".to_string(), base.path().join("real1")));
+        assert_eq!(
+            PtApp::resolve_active_ws(&workspaces, 1, identity.as_ref()),
+            2,
+            "real1 must still resolve to itself at its NEW index, not the stale pre-reorder index 1"
+        );
+    }
+
+    #[test]
+    fn resolve_active_ws_falls_back_to_saved_index_when_identity_is_stale() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut orch = ws_with_name(shared_ctx::orchestrator_dir(), "orchestrator");
+        orch.meta.is_orchestrator = true;
+        let real0 = ws_with_name(base.path().join("real0"), "real0");
+        let workspaces = vec![orch, real0];
+
+        // No identity at all (fresh install / empty saved state): falls
+        // back to the raw saved index, clamped.
+        assert_eq!(PtApp::resolve_active_ws(&workspaces, 0, None), 0);
+
+        // An identity that no longer matches anything (the previously
+        // active workspace's own name/path is gone from this launch):
+        // falls back to the raw saved index, clamped to the last valid one.
+        let gone = Some(("deleted-ws".to_string(), base.path().join("deleted-ws")));
+        assert_eq!(PtApp::resolve_active_ws(&workspaces, 5, gone.as_ref()), 1);
+    }
+
+    #[test]
+    fn resolve_active_ws_on_empty_workspaces_is_zero() {
+        assert_eq!(PtApp::resolve_active_ws(&[], 3, None), 0);
     }
 
     // ---- initial_msg_offset (re-add rule) ----

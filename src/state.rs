@@ -48,6 +48,16 @@ pub struct Workspace {
     /// `mvp_state_still_loads` below.
     #[serde(default)]
     pub saved_editors: Vec<PathBuf>,
+    /// `true` for the single reserved "orchestrator" workspace
+    /// (editor-orchestrator feature, Task 2) that `PtApp::ensure_orchestrator`
+    /// auto-creates and pins at index 0 — `false` for every ordinary
+    /// user-added workspace. `#[serde(default)]` so an old state.json
+    /// written before this feature existed still loads with every
+    /// workspace correctly defaulting to `false` — see
+    /// `mvp_state_still_loads` below, same backward-compat convention as
+    /// `saved_editors`.
+    #[serde(default)]
+    pub is_orchestrator: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -138,6 +148,7 @@ mod tests {
                 active_tab: 0,
                 msg_offset: 42,
                 saved_editors: vec!["D:\\projectx\\README.md".into(), "D:\\projectx\\src\\main.rs".into()],
+                is_orchestrator: false,
             }],
             next_tab_id: 7,
             active_ws: 0,
@@ -206,5 +217,37 @@ mod tests {
         assert_eq!(loaded.workspaces[0].active_tab, 0); // default
         assert_eq!(loaded.workspaces[0].msg_offset, 0); // default
         assert_eq!(loaded.workspaces[0].saved_editors, Vec::<PathBuf>::new()); // default
+        assert!(!loaded.workspaces[0].is_orchestrator); // default (Task 2: editor-orchestrator)
+    }
+
+    /// Task 2 (editor-orchestrator): `is_orchestrator` must round-trip
+    /// through save/load like every other `Workspace` field, and (via
+    /// `#[serde(default)]`, exercised separately in `mvp_state_still_loads`
+    /// above) default to `false` for old state.json files that predate this
+    /// field entirely.
+    #[test]
+    fn is_orchestrator_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = AppState {
+            workspaces: vec![Workspace {
+                name: "orchestrator".into(),
+                repo_path: "D:\\appdata\\pterminal\\orchestrator".into(),
+                is_git: false,
+                default_isolate: false,
+                kept_worktrees: vec![],
+                saved_tabs: vec![],
+                active_tab: 0,
+                msg_offset: 0,
+                saved_editors: vec![],
+                is_orchestrator: true,
+            }],
+            next_tab_id: 1,
+            active_ws: 0,
+        };
+        save(dir.path(), &s).unwrap();
+        let (loaded, msg) = load(dir.path());
+        assert_eq!(loaded, s);
+        assert!(msg.is_none());
+        assert!(loaded.workspaces[0].is_orchestrator);
     }
 }
