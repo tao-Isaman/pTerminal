@@ -180,7 +180,44 @@ pub struct PtApp {
     /// and silently on the next frame if it goes stale (parent tab closed,
     /// or the child got pruned) — see `update`'s CentralPanel.
     pub selected_child: Option<(u64, usize)>,
+    /// Deferred Enter presses for text already typed into a tab's PTY by
+    /// [`PtApp::deliver_messages`]: `(tab id, when the `\r` is due)`.
+    ///
+    /// **Final-review finding 1 (delivery auto-submit was nondeterministic).**
+    /// Delivery used to write `"<text>\r"` in a single `write_input`, which
+    /// reaches the child as one PTY burst; `claude`'s input widget classifies
+    /// a burst that size as a *paste* and inserts it — trailing newline and
+    /// all — instead of submitting, so a delivered message sometimes just sat
+    /// on the input line until a human pressed Enter (2 evidenced stalls
+    /// against 1 clean delivery in the same session). Writing the `\r` back to
+    /// back in a second `write_input` doesn't help: it lands in the same burst
+    /// and is classified with it. `"\r\n"` and a doubled `"\r\r"` have the same
+    /// problem. The Enter has to arrive as its own burst a human-scale delay
+    /// later, which is what this queue is for — `drain_events` flushes entries
+    /// whose `due` has passed with a bare `write_input("\r")`, dropping any
+    /// whose tab has since gone away or exited, and asks for a repaint while
+    /// the queue is non-empty so the flush isn't hostage to the 500 ms
+    /// heartbeat.
+    ///
+    /// **Accepted limitation (documented, not fixed here):** when one batch
+    /// delivers two messages to the SAME tab, both texts are typed before
+    /// either `\r` is flushed, so the agent receives them concatenated on one
+    /// line followed by a stray empty Enter. That is strictly better than the
+    /// old behavior for the same input (a single burst containing both texts
+    /// and both newlines, which the paste heuristic swallowed whole), and a
+    /// multi-message batch requires two messages to land between two watcher
+    /// events — rare in practice, since each `messages.jsonl` append fires its
+    /// own event. Fixing it properly means deferring the message *text* too,
+    /// i.e. a per-tab delivery FIFO; deliberately out of scope for this fix.
+    pub pending_submit: Vec<(u64, std::time::Instant)>,
 }
+
+/// How long after a delivered message's text is typed into a tab's PTY the
+/// deferred Enter is sent, and the repaint cadence used to get there. Long
+/// enough to land in its own PTY write burst (so `claude` sees a keystroke,
+/// not part of a paste), short enough to feel instant. See
+/// [`PtApp::pending_submit`].
+const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
 impl PtApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
@@ -258,6 +295,7 @@ impl PtApp {
             roster_written: HashMap::new(),
             partial_pending: HashSet::new(),
             selected_child: None,
+            pending_submit: Vec::new(),
         };
         // Don't let a watcher-skip notice clobber a state-corruption error
         // (set above via `corrupt_msg`) — that one is the more actionable /
@@ -673,9 +711,15 @@ impl PtApp {
 
     /// Per-frame event pump: drains the resource sampler, applies hook-event
     /// status changes, picks up a completed folder dialog, claims PIDs for a
-    /// freshly spawned tab, and — for every tab of every workspace — drains
-    /// its PTY channel, notices exit, syncs visibility, and rolls up CPU/mem.
-    fn drain_events(&mut self) {
+    /// freshly spawned tab, flushes due deferred message-submit Enters, and —
+    /// for every tab of every workspace — drains its PTY channel, notices
+    /// exit, syncs visibility, and rolls up CPU/mem.
+    ///
+    /// Takes `ctx` (final-review finding 1) purely so the deferred-submit
+    /// flush can `request_repaint_after(SUBMIT_DELAY)` while its queue is
+    /// non-empty: without that, an Enter due 150 ms after a delivery would
+    /// wait for `update`'s 500 ms heartbeat to come round.
+    fn drain_events(&mut self, ctx: &egui::Context) {
         // resource snapshots
         while let Ok((snap, machine)) = self.sampler.try_recv() {
             self.last_snap = snap;
@@ -889,6 +933,45 @@ impl PtApp {
                 });
             }
         }
+        // FINAL-REVIEW FINDING 1: flush deferred submit Enters for messages
+        // whose text was typed into a tab's PTY `SUBMIT_DELAY` ago (see
+        // `pending_submit`'s docs for why the `\r` cannot ride along with the
+        // text). Deliberately runs AFTER the poll loop above, so `exited()` /
+        // `status` are this frame's values — an Enter must not be written into
+        // a child that died in the meantime.
+        if !self.pending_submit.is_empty() {
+            let now = std::time::Instant::now();
+            let mut still_pending: Vec<(u64, std::time::Instant)> = Vec::new();
+            for (tab_id, due) in std::mem::take(&mut self.pending_submit) {
+                if due > now {
+                    still_pending.push((tab_id, due));
+                    continue;
+                }
+                // Tab ids are unique app-wide (one `next_tab_id` counter), so
+                // the first match in any workspace is the right one. A tab
+                // that has been closed, or whose child has exited, silently
+                // drops its pending Enter — there is nothing left to submit
+                // to, and writing into a dead PTY is a no-op at best.
+                for ws in &mut self.workspaces {
+                    if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        if tab.status != AgentStatus::Exited && tab.term.exited().is_none() {
+                            tab.term.write_input("\r");
+                        }
+                        break;
+                    }
+                }
+            }
+            self.pending_submit = still_pending;
+            // Keep the app awake until the queue drains: `update`'s heartbeat
+            // is 500 ms, which would stretch a 150 ms submit delay more than
+            // three-fold and make delivery feel (and, for a mid-task agent,
+            // behave) laggy.
+            if let Some(soonest) =
+                self.pending_submit.iter().map(|(_, due)| due.saturating_duration_since(now)).min()
+            {
+                ctx.request_repaint_after(soonest);
+            }
+        }
         // Step 6: keep each workspace's live agent roster (agents.json) in
         // sync. Cheap (string build + compare) and debounced internally —
         // see the function's docs — so calling it unconditionally every
@@ -952,6 +1035,23 @@ impl PtApp {
     /// batch each surface through `self.error`, once per call — combined
     /// into one message if both occurred, since only one error can be shown
     /// at a time.
+    ///
+    /// **Final-review finding 1:** the text is written WITHOUT a trailing
+    /// `\r`; the Enter is queued on `self.pending_submit` and written by
+    /// `drain_events` `SUBMIT_DELAY` later, as its own PTY burst. See
+    /// `pending_submit`'s docs for why.
+    ///
+    /// **Final-review finding 2:** a dead placeholder tab
+    /// (`missing_dir.is_some()`, `term::spawn_dead_tab`) is NOT a delivery
+    /// target. Its "terminal" is a diagnostic `cmd.exe` that has already
+    /// exited, and its `status` is `Unknown` rather than `Exited` for the
+    /// whole window between resume and the first `drain_events` poll — so
+    /// startup delivery (`PtApp::new` calls this for every workspace before
+    /// any frame has run) used to match the placeholder, type the message
+    /// into a dead diagnostic process, and consume it from `messages.jsonl`
+    /// forever, with no error shown. Excluding placeholders sends those
+    /// messages down the undeliverable-banner branch instead, where the user
+    /// at least learns the message never landed.
     fn deliver_messages(&mut self, ws_idx: usize) {
         let Some(ws) = self.workspaces.get(ws_idx) else { return };
         let path = shared_ctx::messages_path(&ws.meta.repo_path);
@@ -964,12 +1064,18 @@ impl PtApp {
         for m in &batch.messages {
             let ws_mut = &mut self.workspaces[ws_idx];
             let target = ws_mut.tabs.iter_mut().find(|t| {
-                t.kind == TabKind::Agent && t.title == m.to && t.status != AgentStatus::Exited
+                t.kind == TabKind::Agent
+                    && t.title == m.to
+                    && t.status != AgentStatus::Exited
+                    && t.missing_dir.is_none() // finding 2: never a placeholder
             });
             match target {
                 Some(tab) => {
+                    let tab_id = tab.id;
+                    // finding 1: text now, Enter later (see `pending_submit`)
                     tab.term
-                        .write_input(&format!("[message from {}] {}\r", m.from, messages::flatten(&m.text)));
+                        .write_input(&format!("[message from {}] {}", m.from, messages::flatten(&m.text)));
+                    self.pending_submit.push((tab_id, std::time::Instant::now() + SUBMIT_DELAY));
                 }
                 None => {
                     undeliverable.get_or_insert_with(|| m.to.clone());
@@ -1379,7 +1485,7 @@ impl eframe::App for PtApp {
         // actually reaches the screen without user input.
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
-        self.drain_events();
+        self.drain_events(ctx);
         self.shortcuts(ctx);
 
         egui::SidePanel::left("workspaces").default_width(180.0).show(ctx, |ui| {
@@ -1859,7 +1965,19 @@ mod tests {
             roster_written: HashMap::new(),
             partial_pending: HashSet::new(),
             selected_child: None,
+            pending_submit: Vec::new(),
         }
+    }
+
+    /// Polls `term` to completion (bounded) so a test never leaves an
+    /// orphaned child process behind.
+    fn drain_to_exit(term: &mut term::TabTerm) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while term.exited().is_none() && std::time::Instant::now() < deadline {
+            term.poll();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(term.exited().is_some(), "test's own child failed to exit — would leak a process");
     }
 
     /// Sends a graceful `exit` and polls `term` to completion (bounded) so
@@ -1867,12 +1985,251 @@ mod tests {
     /// same convention as `term::tests::write_input_reaches_pty`.
     fn exit_and_drain(term: &mut term::TabTerm) {
         term.write_input("exit\r");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while term.exited().is_none() && std::time::Instant::now() < deadline {
-            term.poll();
-            std::thread::sleep(std::time::Duration::from_millis(20));
+        drain_to_exit(term);
+    }
+
+    /// A `PtApp` with one workspace rooted at `repo` holding `tabs` live, and
+    /// every other field at the cheapest value that type-checks — no sampler
+    /// thread, no watcher, no dialogs. Enough for `deliver_messages` and
+    /// `drain_events`, which is all the delivery tests below touch (a
+    /// disconnected sampler channel just makes `drain_events`' first `try_recv`
+    /// return `Disconnected` and fall straight through, and `watcher: None`
+    /// means it sees no changed paths).
+    fn app_with_tabs(base: PathBuf, repo: PathBuf, tabs: Vec<term::Tab>) -> PtApp {
+        let meta = state::Workspace {
+            name: "test-ws".to_string(),
+            repo_path: repo,
+            is_git: false,
+            default_isolate: false,
+            kept_worktrees: vec![],
+            saved_tabs: vec![],
+            active_tab: 0,
+            msg_offset: 0,
+        };
+        let (_tx, sampler_rx) = std::sync::mpsc::channel();
+        PtApp {
+            base,
+            workspaces: vec![WsRt { meta, tabs, active_tab: 0 }],
+            active_ws: 0,
+            next_tab_id: 90_400,
+            sampler: sampler_rx,
+            last_snap: vec![],
+            machine: MachineStats::default(),
+            watcher: None,
+            pending_claim: None,
+            pending_folder_pick: None,
+            show_ctx_panel: false,
+            ctx_panel_text: String::new(),
+            ctx_panel_has_focus: false,
+            ctx_panel_loaded_for: None,
+            error: None,
+            new_tab: None,
+            closing: None,
+            roster_written: HashMap::new(),
+            partial_pending: HashSet::new(),
+            selected_child: None,
+            pending_submit: Vec::new(),
         }
-        assert!(term.exited().is_some(), "test's own shell tab failed to exit — would leak a process");
+    }
+
+    /// Writes a one-line `messages.jsonl` under `repo` and returns `repo`.
+    fn seed_message(repo: &std::path::Path, to: &str) {
+        std::fs::create_dir_all(repo.join(".pterminal")).expect("mkdir .pterminal");
+        std::fs::write(
+            shared_ctx::messages_path(repo),
+            format!("{{\"to\":\"{to}\",\"from\":\"sender\",\"text\":\"ping\"}}\n"),
+        )
+        .expect("write messages.jsonl");
+    }
+
+    /// FINAL-REVIEW FINDING 2 regression test. A dead placeholder tab keeps
+    /// the saved tab's title and `AgentStatus::Unknown` (not `Exited` — that
+    /// only gets set once `drain_events` has polled its already-finished
+    /// diagnostic child, which at startup has not happened yet), so the old
+    /// target filter matched it: the message got typed into a dead `cmd.exe`
+    /// and consumed from `messages.jsonl` forever, silently. It must reach
+    /// the undeliverable banner instead.
+    #[test]
+    fn messages_to_a_dead_placeholder_are_undeliverable_not_swallowed() {
+        let ctx = eframe::egui::Context::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_path_buf();
+        seed_message(&repo, "my-agent");
+
+        let saved = state::SavedTab {
+            tab_id: 90_310,
+            kind: state::SavedTabKind::Agent,
+            title: "my-agent".to_string(),
+            cwd: PathBuf::from("D:\\pterminal-test-missing-dir-does-not-exist"),
+            worktree: None,
+            session_id: Some("sess-x".to_string()),
+        };
+        let placeholder =
+            term::spawn_dead_tab(&ctx, &saved, &repo, "saved directory missing".to_string())
+                .expect("spawn placeholder");
+        let mut app = app_with_tabs(dir.path().to_path_buf(), repo, vec![placeholder]);
+
+        app.deliver_messages(0);
+
+        assert!(
+            app.pending_submit.is_empty(),
+            "nothing may be typed into a placeholder's dead diagnostic process",
+        );
+        let err = app.error.clone().unwrap_or_default();
+        assert!(err.contains("undeliverable message to 'my-agent'"), "{err}");
+
+        drain_to_exit(&mut app.workspaces[0].tabs[0].term);
+    }
+
+    /// FINAL-REVIEW FINDING 1 regression test: delivery must leave the Enter
+    /// on `pending_submit` rather than writing it in the same `write_input`
+    /// as the text (one PTY burst, which `claude` classifies as a paste and
+    /// inserts instead of submitting), `drain_events` must not flush it early,
+    /// and while it is queued the app must ask to be woken well before
+    /// `update`'s 500 ms heartbeat.
+    ///
+    /// Uses `spawn_shell` and then flips `kind`/`title`, rather than a real
+    /// agent tab: `deliver_messages` only looks at `kind`/`title`/`status`/
+    /// `missing_dir`, and a genuine agent tab would launch real `claude`
+    /// (which `app::tests`' other helper documents as impossible to end
+    /// deterministically from a test).
+    ///
+    /// The repaint assertion observes a SEPARATE `egui::Context` from the one
+    /// the terminal was spawned with — `drain_events` uses `ctx` for nothing
+    /// but `request_repaint_after`, and this keeps the terminal's own PTY
+    /// thread (which requests `ZERO` when visible, 250 ms when hidden) from
+    /// contaminating the delays under test.
+    #[test]
+    fn delivery_queues_the_submit_enter_instead_of_writing_it_inline() {
+        use std::time::{Duration, Instant};
+
+        let ctx = eframe::egui::Context::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_path_buf();
+        seed_message(&repo, "target");
+
+        let mut tab = term::spawn_shell(&ctx, 90_320, dir.path()).expect("spawn shell");
+        tab.kind = TabKind::Agent;
+        tab.title = "target".to_string();
+        let tab_id = tab.id;
+        let mut app = app_with_tabs(dir.path().to_path_buf(), repo, vec![tab]);
+
+        let before = Instant::now();
+        app.deliver_messages(0);
+
+        assert_eq!(app.pending_submit.len(), 1, "the Enter must be queued, not written with the text");
+        assert_eq!(app.pending_submit[0].0, tab_id);
+        let due = app.pending_submit[0].1;
+        assert!(due > before, "the Enter must be due in the FUTURE, not in the text's own burst");
+        assert!(due <= before + SUBMIT_DELAY + Duration::from_millis(50), "due too far out");
+
+        let repaint_ctx = eframe::egui::Context::default();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Duration>>> = Default::default();
+        let sink = std::sync::Arc::clone(&seen);
+        repaint_ctx.set_request_repaint_callback(move |info| sink.lock().unwrap().push(info.delay));
+
+        app.drain_events(&repaint_ctx);
+        assert_eq!(app.pending_submit.len(), 1, "a drain in the same frame must NOT flush a not-yet-due Enter");
+        let delays: Vec<Duration> = seen.lock().unwrap().clone();
+        assert!(
+            delays.iter().any(|d| *d > Duration::ZERO && *d <= SUBMIT_DELAY),
+            "a queued Enter must schedule its own wake-up, not wait for the 500ms heartbeat: {delays:?}",
+        );
+
+        std::thread::sleep(SUBMIT_DELAY + Duration::from_millis(60));
+        app.drain_events(&repaint_ctx);
+        assert!(app.pending_submit.is_empty(), "a due Enter must be flushed");
+
+        // The delivered text was typed onto powershell's input line and the
+        // flushed `\r` submitted it (an unknown command — harmless), so a
+        // plain `exit` now ends the child.
+        exit_and_drain(&mut app.workspaces[0].tabs[0].term);
+    }
+
+    /// FINAL-REVIEW FINDING 3 regression test: when the real spawn fails for
+    /// a saved tab whose cwd still exists, resume must push a dead placeholder
+    /// carrying every saved field, so the very next `persist()` writes the
+    /// saved tab back out instead of erasing it (session id and worktree
+    /// reference included).
+    ///
+    /// The failure is forced deterministically and without launching real
+    /// `claude`: `spawn_agent` calls `hooks::write_settings` FIRST, which
+    /// starts with `create_dir_all(work_dir.join(".claude"))` — so a plain
+    /// FILE named `.claude` in the workspace root makes that call, and with it
+    /// the whole spawn, fail before `TabTerm::spawn` is ever reached.
+    #[test]
+    fn a_failed_resume_spawn_keeps_the_saved_tab_as_a_placeholder() {
+        let ctx = eframe::egui::Context::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_path_buf();
+        // A file, not a directory: `write_settings`' create_dir_all fails.
+        std::fs::write(repo.join(".claude"), "not a directory").expect("write .claude file");
+
+        let wt = state::WorktreeInfo { path: PathBuf::from("D:\\wt\\gone"), branch: "pt/gone".into() };
+        let saved = state::SavedTab {
+            tab_id: 90_340,
+            kind: state::SavedTabKind::Agent,
+            title: "doomed".to_string(),
+            cwd: repo.clone(),
+            worktree: Some(wt.clone()),
+            session_id: Some("sess-keep-me".to_string()),
+        };
+        let mut app = app_with_tabs(dir.path().to_path_buf(), repo.clone(), vec![]);
+        app.workspaces[0].meta.saved_tabs = vec![saved];
+
+        app.resume_saved_tabs(&ctx);
+
+        assert_eq!(app.workspaces[0].tabs.len(), 1, "a failed resume must still leave a tab behind");
+        let tab = &app.workspaces[0].tabs[0];
+        assert_eq!(tab.id, 90_340);
+        assert_eq!(tab.title, "doomed");
+        assert_eq!(tab.missing_dir, Some(repo), "the saved cwd must be preserved for persist()");
+        assert_eq!(tab.worktree, Some(wt.clone()));
+        assert_eq!(tab.session_id, Some("sess-keep-me".to_string()));
+        assert!(
+            tab.dead_reason.as_deref().unwrap_or_default().starts_with("resume failed"),
+            "{:?}",
+            tab.dead_reason,
+        );
+        assert!(app.error.is_some(), "the failure itself must still be surfaced");
+
+        // The point of the fix: the next persist() round-trips the saved tab
+        // rather than dropping it.
+        app.persist();
+        let saved_back = &app.workspaces[0].meta.saved_tabs;
+        assert_eq!(saved_back.len(), 1, "persist() must not erase the saved tab");
+        assert_eq!(saved_back[0].session_id, Some("sess-keep-me".to_string()));
+        assert_eq!(saved_back[0].worktree, Some(wt));
+        let (reloaded, _) = state::load(&app.base);
+        assert_eq!(reloaded.workspaces[0].saved_tabs.len(), 1);
+        assert_eq!(reloaded.workspaces[0].saved_tabs[0].session_id, Some("sess-keep-me".to_string()));
+
+        drain_to_exit(&mut app.workspaces[0].tabs[0].term);
+    }
+
+    /// FINAL-REVIEW FINDING 1, drop half: an Enter queued for a tab that has
+    /// since exited (or been closed) must be discarded, not written into a
+    /// dead PTY — and must not keep the queue, and therefore the 150 ms
+    /// repaint loop, alive forever.
+    #[test]
+    fn a_queued_enter_for_a_gone_tab_is_dropped() {
+        use std::time::{Duration, Instant};
+
+        let ctx = eframe::egui::Context::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_tabs(dir.path().to_path_buf(), dir.path().to_path_buf(), vec![]);
+
+        // 90_330 names no tab at all; 90_331 is a tab whose child has exited.
+        let mut exited = term::spawn_shell(&ctx, 90_331, dir.path()).expect("spawn shell");
+        exit_and_drain(&mut exited.term);
+        app.workspaces[0].tabs.push(exited);
+
+        let due = Instant::now() - Duration::from_millis(1);
+        app.pending_submit = vec![(90_330, due), (90_331, due)];
+
+        app.drain_events(&ctx);
+
+        assert!(app.pending_submit.is_empty(), "due entries must always leave the queue");
     }
 
     /// REVIEW FINDING 1 regression test. Before the fix, `resume_saved_tabs`

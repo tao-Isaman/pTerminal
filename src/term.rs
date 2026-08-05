@@ -153,6 +153,17 @@ impl TabTerm {
     /// message delivery and any future programmatic input reach the PTY.
     /// The caller is responsible for appending `\r` (ConPTY Enter) when a
     /// submission — not just text sitting on the input line — is intended.
+    ///
+    /// **The `\r` must not ride along in the same call as the text when the
+    /// receiver is a TUI with paste detection** (final-review finding 1).
+    /// `claude`'s input widget classifies a single large stdin burst as a
+    /// paste and *inserts* it — newline included — instead of submitting it,
+    /// so `write_input("text\r")` auto-submitted only sometimes. A second
+    /// `write_input("\r")` issued back-to-back doesn't help either: both
+    /// land in the same PTY write burst and get classified together. The
+    /// Enter has to arrive as its own burst, a human-scale delay later —
+    /// see `PtApp::pending_submit` / `SUBMIT_DELAY` in `app.rs`, which is
+    /// the only supported way to submit programmatically delivered text.
     pub fn write_input(&mut self, text: &str) {
         self.backend
             .process_command(BackendCommand::Write(text.as_bytes().to_vec()));
