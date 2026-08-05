@@ -52,10 +52,14 @@ pub struct EditorTab {
     pub path: PathBuf,
     pub buffer: String,
     pub dirty: bool,
-    /// `true` when `path` did not exist on disk the last time it was
-    /// read (open, or an external delete since) — cleared by a successful
-    /// `save_editor` (a save can recreate the file). The CentralPanel shows
-    /// a note instead of silently editing a phantom file.
+    /// `true` when `read_to_string(path)` failed the last time it was read
+    /// (open, or an external delete since) — cleared by a successful
+    /// `save_editor` (a save can recreate/overwrite the file). Covers BOTH a
+    /// genuinely absent path AND a present-but-unreadable one (a directory,
+    /// a locked/permission-denied file, invalid UTF-8); `editor_note`
+    /// distinguishes the two at render time from `path.exists()` so the
+    /// CentralPanel's warning is truthful about whether a save would *create*
+    /// the file or *overwrite* an existing one (finding 2).
     pub missing: bool,
 }
 
@@ -81,7 +85,9 @@ pub struct CloseEditorDraft {
 /// degrades the same way: an empty, editable buffer the user can still type
 /// into and save over, rather than a hard failure), appends the new
 /// `EditorTab`, and activates it. Never fails — matches `open_file_dialog`'s
-/// contract of "the picker succeeded, so something must open".
+/// contract of "the picker succeeded, so something must open". The pane's
+/// warning note (`editor_note`) then tells the truth about whether that save
+/// would create or overwrite, computed from `path.exists()` — see finding 2.
 pub fn open_editor(ws: &mut WsRt, id: u64, path: PathBuf) {
     let (buffer, missing) = match std::fs::read_to_string(&path) {
         Ok(s) => (s, false),
@@ -89,6 +95,33 @@ pub fn open_editor(ws: &mut WsRt, id: u64, path: PathBuf) {
     };
     ws.editors.push(EditorTab { id, path, buffer, dirty: false, missing });
     ws.active_editor = Some(ws.editors.len() - 1);
+}
+
+/// The editor pane's warning note for `ed`, or `None` when the file read
+/// cleanly (`missing == false`). When `missing` is set, distinguishes the two
+/// underlying causes so a reflexive Ctrl+S isn't a silent surprise (finding
+/// 2): a path that genuinely doesn't exist (a save will *create* it) versus
+/// one that exists on disk but couldn't be read — a directory, a
+/// locked/permission-denied file, invalid UTF-8 (a save will *overwrite* it
+/// with the current, possibly empty, buffer). Recomputed from `path.exists()`
+/// each call so it reflects the current disk state, not a stale open-time
+/// snapshot. Pure (only touches `ed` + a `path.exists()` probe) so it's
+/// unit-testable without an `egui` frame.
+fn editor_note(ed: &EditorTab) -> Option<String> {
+    if !ed.missing {
+        return None;
+    }
+    if ed.path.exists() {
+        Some(format!(
+            "\u{26A0} file exists but could not be read \u{2014} saving will OVERWRITE it with the current buffer: {}",
+            ed.path.display()
+        ))
+    } else {
+        Some(format!(
+            "\u{26A0} file not found \u{2014} saving will create it: {}",
+            ed.path.display()
+        ))
+    }
 }
 
 /// Writes `ed`'s buffer to `ed.path`, clearing `dirty` and `missing` on
@@ -2354,10 +2387,14 @@ impl PtApp {
             return false;
         };
 
-        if ed.missing {
+        // Finding 2: the note must be truthful about what a save does — a
+        // genuinely absent path is "will create", but an existing-but-
+        // unreadable one (directory, locked/permission-denied, bad UTF-8) is a
+        // "will OVERWRITE" warning, since save writes unconditionally.
+        if let Some(note) = editor_note(ed) {
             ui.colored_label(
                 egui::Color32::from_rgb(255, 170, 40), // amber — same as NeedsYou/the missing-dir banner
-                format!("\u{26A0} file not found on disk: {}", ed.path.display()),
+                note,
             );
         }
         let mut save_clicked = false;
@@ -2367,12 +2404,21 @@ impl PtApp {
                 save_clicked = true;
             }
         });
-        let resp =
-            ui.add_sized(ui.available_size(), egui::TextEdit::multiline(&mut ed.buffer).code_editor());
-        if resp.changed() {
+        // Finding 4: wrap the editor in a vertical ScrollArea (mirrors the F2
+        // panel's TextEdit) — an egui multiline `TextEdit` doesn't scroll
+        // itself, so without this a file taller than the window has its lower
+        // rows permanently off-screen and unreachable.
+        let mut changed = false;
+        let mut has_focus = false;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let resp = ui
+                .add_sized(ui.available_size(), egui::TextEdit::multiline(&mut ed.buffer).code_editor());
+            changed = resp.changed();
+            has_focus = resp.has_focus();
+        });
+        if changed {
             ed.dirty = true;
         }
-        let has_focus = resp.has_focus();
         let save_result = if save_clicked { Some(save_editor(ed)) } else { None };
 
         self.editor_has_focus = has_focus;
@@ -3662,6 +3708,58 @@ mod tests {
         assert!(ws.editors[0].missing);
         assert!(!ws.editors[0].dirty);
         assert_eq!(ws.active_editor, Some(0));
+    }
+
+    /// Finding 2: a genuinely-absent path yields a "will create" note — never
+    /// an "overwrite" warning, since there's nothing on disk to lose.
+    #[test]
+    fn editor_note_for_missing_path_says_create_not_overwrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ghost = dir.path().join("does-not-exist.txt");
+        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
+
+        open_editor(&mut ws, 7, ghost);
+
+        assert!(ws.editors[0].missing, "a nonexistent path reads as missing");
+        let note = editor_note(&ws.editors[0]).expect("missing file must carry a note");
+        assert!(note.to_lowercase().contains("create"), "{note}");
+        assert!(!note.to_lowercase().contains("overwrite"), "{note}");
+    }
+
+    /// Finding 2: a path that EXISTS but can't be read (here, a directory —
+    /// `read_to_string` fails deterministically on every platform) must warn
+    /// that a save OVERWRITES it, not that it "creates" a file that isn't
+    /// there. This is the silent-data-loss case: `missing` is set (read
+    /// failed) yet `path.exists()` is true, so the note is computed from
+    /// `exists()`, not from the raw `missing` flag.
+    #[test]
+    fn editor_note_for_existing_but_unreadable_path_warns_overwrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_path_buf(); // a directory: exists() true, read_to_string fails
+        let mut ws = ws_with_name(dir_path.clone(), "test-ws");
+
+        open_editor(&mut ws, 9, dir_path.clone());
+
+        assert!(ws.editors[0].missing, "reading a directory fails, so `missing` is set");
+        assert!(dir_path.exists(), "the directory path exists on disk");
+        assert_eq!(ws.editors[0].buffer, "", "unreadable → empty buffer");
+        let note = editor_note(&ws.editors[0]).expect("unreadable file must carry a note");
+        assert!(note.to_lowercase().contains("overwrite"), "{note}");
+        assert!(!note.to_lowercase().contains("not found"), "{note}");
+    }
+
+    /// A cleanly-read file has no note at all.
+    #[test]
+    fn editor_note_for_readable_file_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("ok.txt");
+        std::fs::write(&file_path, "content").expect("write fixture");
+        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
+
+        open_editor(&mut ws, 3, file_path);
+
+        assert!(!ws.editors[0].missing);
+        assert!(editor_note(&ws.editors[0]).is_none());
     }
 
     /// `save_editor` writes the buffer to disk and clears both `dirty` and
