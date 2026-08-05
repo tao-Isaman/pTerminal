@@ -168,6 +168,34 @@ mod tests {
         assert_eq!(batch.new_offset, content.len() as u64);
     }
 
+    /// Regression-lock (review finding): the trailing `\r` of a CRLF-terminated
+    /// line must be stripped before serde parsing but still counted toward
+    /// `new_offset` — a plan-mandated byte-offset contract whose failure mode
+    /// (over- or under-counting the `\r`) is a silent skipped or re-delivered
+    /// message on the next `read_new` call, not a crash. Mixes one CRLF line
+    /// with one plain LF line so both accounting paths are exercised in the
+    /// same byte count.
+    #[test]
+    fn crlf_line_parses_and_is_fully_counted_in_new_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("messages.jsonl");
+        let content = concat!(
+            "{\"to\":\"b\",\"from\":\"a\",\"text\":\"hi\"}\r\n",
+            r#"{"to":"carol","from":"dave","text":"yo"}"#, "\n",
+        );
+        std::fs::write(&p, content).unwrap();
+
+        let batch = read_new(&p, 0).unwrap();
+
+        assert_eq!(batch.messages.len(), 2);
+        assert_eq!(batch.messages[0].to, "b");
+        assert_eq!(batch.messages[0].from, "a");
+        assert_eq!(batch.messages[0].text, "hi");
+        assert_eq!(batch.messages[1].to, "carol");
+        assert_eq!(batch.malformed, 0);
+        assert_eq!(batch.new_offset, content.len() as u64, "the CRLF's \\r must still be counted as a consumed byte");
+    }
+
     #[test]
     fn resume_from_prior_offset_returns_only_new_line() {
         let dir = tempfile::tempdir().unwrap();
