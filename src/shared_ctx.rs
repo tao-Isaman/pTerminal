@@ -56,7 +56,12 @@ pub fn write_agent_readme(repo: &Path) -> anyhow::Result<PathBuf> {
         containing:\n\n\
         `{{\"to\":\"<agent name>\",\"from\":\"<your agent name>\",\"text\":\"...\"}}`\n\n\
         Messages are delivered into the target agent's session automatically — you \
-        don't need to do anything else, and the target does not need to poll for them.\n",
+        don't need to do anything else, and the target does not need to poll for them.\n\n\
+        ## Messaging the orchestrator\n\n\
+        To message the coordinator overseeing every workspace, use the reserved target \
+        `\"orchestrator\"`:\n\n\
+        `{{\"to\":\"orchestrator\",\"from\":\"<your agent name>\",\"text\":\"...\"}}`\n\n\
+        It is delivered into the orchestrator's own session, same as any other message.\n",
         agents = agents.display(),
         messages = messages.display(),
     );
@@ -203,6 +208,9 @@ mod tests {
         assert!(text.contains("\"to\""), "{text}");
         assert!(text.contains("\"from\""), "{text}");
         assert!(text.to_lowercase().contains("delivered"), "{text}");
+        // Finding 6: the reserved `orchestrator` reply target must be documented
+        // so agents know how to reach the coordinator.
+        assert!(text.contains("\"orchestrator\""), "reserved orchestrator target must be documented: {text}");
     }
 
     #[test]
