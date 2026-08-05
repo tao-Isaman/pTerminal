@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app;
+mod commands;
 mod dialogs;
 mod egui_term_vendored;
 mod git;
@@ -12,6 +13,28 @@ mod term;
 mod watcher;
 
 fn main() -> eframe::Result<()> {
+    let argv: Vec<String> = std::env::args().collect();
+    match commands::parse_args(&argv) {
+        Some(Err(usage)) => {
+            eprintln!("{usage}");
+            std::process::exit(2);
+        }
+        Some(Ok(cmd)) => {
+            let session_id = cmd.session_id.clone();
+            if let Err(e) = commands::write_command(&cmd) {
+                eprintln!("failed to write resume command: {e}");
+                std::process::exit(2);
+            }
+            if commands::another_instance_running() {
+                println!("sent to running pTerminal (session {session_id})");
+                std::process::exit(0);
+            }
+            // No running instance: fall through and launch the GUI normally.
+            // Task 2's startup drain picks up the command file we just wrote.
+        }
+        None => {} // no subcommand: normal GUI launch
+    }
+
     let opts = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
