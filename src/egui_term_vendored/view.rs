@@ -329,6 +329,14 @@ impl<'a> TerminalView<'a> {
                     std::mem::swap(&mut fg, &mut bg);
                 }
 
+                // Combining marks (e.g. Thai upper/lower vowels and tone
+                // marks) are zero-width chars alacritty stores next to the
+                // base char — append them so they overstrike it instead of
+                // being silently dropped.
+                let mut text = indexed.c.to_string();
+                if let Some(zerowidth) = indexed.cell.zerowidth() {
+                    text.extend(zerowidth);
+                }
                 shapes.push(Shape::text(
                     &painter.fonts(|c| c.clone()),
                     Pos2 {
@@ -336,7 +344,7 @@ impl<'a> TerminalView<'a> {
                         y,
                     },
                     Align2::CENTER_TOP,
-                    indexed.c,
+                    text,
                     self.font.font_type(),
                     fg,
                 ));

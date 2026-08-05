@@ -11,6 +11,10 @@ A native Windows terminal for running and monitoring multiple Claude Code agents
   are verified to cover — pTerminal ships no font files of its own.
 - **Shared context**: `.pterminal/shared.md` in each repo is injected into every agent at
   session start (F2 shows it live).
+- **Thai text** renders throughout (terminal, tab titles, UI) via a glyph fallback to the
+  Windows system font Leelawadee UI (or Tahoma), loaded from `%WINDIR%\Fonts` at runtime —
+  pTerminal still ships no font files. Combining marks are drawn by overstrike (egui does
+  no complex text shaping), which reads fine for normal Thai text.
 - **Resource monitor**: per-tab CPU/RAM on hover, per-workspace in the sidebar, totals in the status bar.
 - **Dark theme**: pTerminal always runs dark (`ThemePreference::Dark`, pinned at startup so it
   doesn't drift to the OS light theme on the first real frame). There is no light mode and no

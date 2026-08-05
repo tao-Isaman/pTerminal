@@ -252,6 +252,12 @@ impl PtApp {
         cc.egui_ctx.set_visuals(eframe::egui::Visuals::dark());
         cc.egui_ctx.set_theme(eframe::egui::ThemePreference::Dark);
 
+        // Step 1b: Thai glyph fallback. egui's bundled fonts cover no Thai,
+        // so Thai text (terminal output, tab titles, shared.md) renders as
+        // boxes without this. Loaded from the OS at runtime — pTerminal
+        // still ships no font files. See `install_thai_fallback`.
+        install_thai_fallback(&cc.egui_ctx);
+
         let base = state::default_base();
         let (st, corrupt_msg) = state::load(&base);
         // Captured before `st.workspaces` is moved into the `WsRt` skeletons
@@ -1891,9 +1897,57 @@ impl eframe::App for PtApp {
     }
 }
 
+/// Append a Thai-capable Windows system font as the *lowest-priority*
+/// fallback in both egui font families. Bundled fonts keep first priority,
+/// so Latin/UI text and the status-marker glyphs are untouched; only code
+/// points the bundled fonts lack (Thai) fall through to it. No candidate
+/// font on disk → no-op, exactly today's behavior.
+///
+/// ponytail: no complex text shaping — Thai combining marks render by
+/// zero-width overstrike, fine for normal text; revisit only if stacked-mark
+/// positioning misrenders badly enough to matter.
+fn install_thai_fallback(ctx: &egui::Context) {
+    let Some(bytes) = thai_font_bytes() else { return };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert("thai-fallback".into(), egui::FontData::from_owned(bytes).into());
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("thai-fallback".into());
+    }
+    ctx.set_fonts(fonts);
+}
+
+/// Leelawadee UI is Windows' standard Thai UI font (shipped since 8.1);
+/// Tahoma also covers Thai and exists on effectively every install.
+fn thai_font_bytes() -> Option<Vec<u8>> {
+    let dir = PathBuf::from(std::env::var_os("WINDIR")?).join("Fonts");
+    ["LeelawUI.ttf", "tahoma.ttf"]
+        .into_iter()
+        .find_map(|f| std::fs::read(dir.join(f)).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// pTerminal is Windows-only and both Thai font candidates ship with the
+    /// OS, so resolution must succeed here. If this fails, Thai silently
+    /// regresses to boxes — nothing else in the suite would notice.
+    #[test]
+    fn thai_font_resolves_on_windows() {
+        let bytes = thai_font_bytes().expect("no Thai-capable system font found");
+        // sfnt magics (ttf/ttc/otf) — proves we read a real font file.
+        let magic = &bytes[..4];
+        assert!(
+            [&b"\x00\x01\x00\x00"[..], b"ttcf", b"true", b"OTTO"].contains(&magic),
+            "unrecognized font magic: {magic:?}"
+        );
+    }
 
     /// Builds a `PtApp` with exactly one workspace/saved-tab and every other
     /// field set to the cheapest value that still type-checks —
