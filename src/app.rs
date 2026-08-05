@@ -301,8 +301,11 @@ impl PtApp {
     /// exists — see `SpawnSpec`'s docs — `isolate: false` either way, since
     /// the worktree-reuse branch takes priority over fresh creation), a
     /// shell just reopens in that directory. One whose `cwd` is gone becomes
-    /// a `missing_dir` placeholder instead
-    /// (`term::spawn_missing_dir_placeholder`) — see Step 5's banner.
+    /// a dead placeholder instead (`term::spawn_dead_tab`) — see Step 5's
+    /// banner. **Final-review finding 3:** a saved tab whose real spawn
+    /// *fails* now becomes that same kind of placeholder rather than being
+    /// dropped on the floor, so a transient failure can no longer erase the
+    /// saved session id / worktree reference on the next `persist()`.
     ///
     /// Direct-mode hook takeover (documented on `spawn_agent`) applies here
     /// too: if two saved direct-mode (no-worktree) agent tabs in the same
@@ -372,19 +375,14 @@ impl PtApp {
                         }
                     }
                 } else {
-                    let kind = match saved.kind {
-                        state::SavedTabKind::Agent => TabKind::Agent,
-                        state::SavedTabKind::Shell => TabKind::Shell,
-                    };
-                    term::spawn_missing_dir_placeholder(
+                    term::spawn_dead_tab(
                         ctx,
-                        saved.tab_id,
+                        &saved,
                         &repo_root,
-                        saved.cwd.clone(),
-                        saved.title.clone(),
-                        kind,
-                        saved.worktree.clone(),
-                        saved.session_id.clone(),
+                        // Unchanged wording for the missing-dir case: the
+                        // banner renders "\u{26A0} {reason}", so this is the
+                        // exact string it always showed.
+                        format!("saved directory missing: {}", saved.cwd.display()),
                     )
                 };
                 match result {
@@ -402,11 +400,10 @@ impl PtApp {
                         // `saved_tabs`, Step 2) writes the same id back
                         // instead of nulling it out before this session's
                         // own `SessionStart` hook has a chance to fire. The
-                        // missing-dir placeholder branch already carries
+                        // dead-placeholder branch already carries
                         // `saved.session_id` onto its `Tab` directly
-                        // (`term::spawn_missing_dir_placeholder`,
-                        // `term.rs:488`) — this makes the real-spawn path
-                        // symmetric with it, so both start from the saved
+                        // (`term::spawn_dead_tab`) — this makes the real-spawn
+                        // path symmetric with it, so both start from the saved
                         // value rather than one starting from `None`.
                         tab.session_id = saved.session_id.clone();
                         let ws = &mut self.workspaces[ws_idx];
@@ -428,7 +425,41 @@ impl PtApp {
                         ws.tabs.push(tab);
                     }
                     Err(e) => {
+                        // FINAL-REVIEW FINDING 3 fix. This arm used to set
+                        // `self.error` and nothing else — the tab was never
+                        // pushed, so the very next `persist()` (which rebuilds
+                        // `saved_tabs` from the LIVE tab list) erased the saved
+                        // tab outright, taking its session id and worktree
+                        // reference with it. A transient spawn failure (a
+                        // locked `.claude/settings.local.json`, a momentarily
+                        // unavailable `cmd.exe`, a worktree path that just went
+                        // read-only) therefore destroyed the only record of the
+                        // session, permanently. Fall back to the same dead
+                        // placeholder the missing-dir case uses — it carries
+                        // every saved field through `persist()` untouched, so
+                        // the tab (and its resume thread) survives to be
+                        // recovered later.
                         self.error = Some(format!("failed to resume tab '{}': {e}", saved.title));
+                        match term::spawn_dead_tab(ctx, &saved, &repo_root, format!("resume failed: {e}")) {
+                            Ok(tab) => self.workspaces[ws_idx].tabs.push(tab),
+                            // Even the placeholder couldn't spawn — `cmd.exe`
+                            // itself is unusable in `repo_root`. Nothing left
+                            // to push, so the banner-only loss the finding
+                            // describes does remain in this (much narrower)
+                            // case: the saved tab is dropped on the next
+                            // `persist()`. Deliberate — inventing a `Tab` with
+                            // no live `TabTerm` would mean making `Tab::term`
+                            // optional and auditing every one of its ~30 uses,
+                            // far more surface than this failure mode is worth.
+                            Err(placeholder_err) => {
+                                self.error = Some(format!(
+                                    "failed to resume tab '{}': {e}; could not even build a \
+                                     placeholder for it ({placeholder_err}) — this tab will be \
+                                     dropped from saved state",
+                                    saved.title,
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -715,13 +746,19 @@ impl PtApp {
             if let Some(idstr) = name.strip_prefix("tab-").and_then(|s| s.strip_suffix(".events")) {
                 if let Ok(id) = idstr.parse::<u64>() {
                     // Step 4: read the events file once, then derive BOTH
-                    // status (still via `hooks::status_from_events`, the
-                    // authoritative status source) and the parsed
-                    // `EventRecord`s (session id + subagent bookkeeping) from
-                    // that one read — rather than the old status-only path.
+                    // status and the parsed `EventRecord`s (session id +
+                    // subagent bookkeeping) from that one read.
+                    //
+                    // FINAL-REVIEW FINDING 6: also *parse* it exactly once.
+                    // This used to call `hooks::status_from_events(&contents)`
+                    // (which parses internally) alongside
+                    // `hooks::parse_events(&contents)`, running the whole
+                    // line-by-line parse twice per changed events file per
+                    // frame. `hooks::status_from_records` takes the records we
+                    // already have and returns the identical answer.
                     let contents = std::fs::read_to_string(&path).unwrap_or_default();
-                    let status = hooks::status_from_events(&contents);
                     let records = hooks::parse_events(&contents);
+                    let status = hooks::status_from_records(&records);
                     for ws in &mut self.workspaces {
                         for tab in &mut ws.tabs {
                             if tab.id != id || tab.kind != TabKind::Agent {
@@ -737,33 +774,30 @@ impl PtApp {
                                 }
                             }
                             // Subagent bookkeeping: only the records not
-                            // already seen this tab. `PreToolUse` with a
-                            // tool description starts a child; `SubagentStop`
-                            // completes the OLDEST still-running one (children
-                            // are pushed oldest-first, so the first `None`
-                            // `done_at` found scanning from the front is it).
+                            // already seen for this tab. The ordering rules
+                            // (and their tests) live in
+                            // `term::apply_subagent_events` — FINAL-REVIEW
+                            // FINDING 5 extracted them out of this loop, which
+                            // needs a live app + ConPTY child to reach and so
+                            // could never be tested directly.
+                            //
+                            // FINAL-REVIEW FINDING 6: clamp `events_seen`
+                            // before slicing. The events file is external
+                            // state — anything can truncate it (a `--resume`
+                            // that rewrites it, a crash mid-append, a user with
+                            // a text editor), and `parse_events` can also
+                            // legitimately return FEWER records than last frame
+                            // if a partially-written trailing line stops
+                            // matching. `records[tab.events_seen..]` would then
+                            // panic on an out-of-range slice, taking the whole
+                            // app down.
+                            tab.events_seen = tab.events_seen.min(records.len());
                             if records.len() > tab.events_seen {
-                                for rec in &records[tab.events_seen..] {
-                                    match rec.event.as_str() {
-                                        "PreToolUse" => {
-                                            if let Some(desc) = &rec.tool_desc {
-                                                tab.children.push(term::SubTab {
-                                                    desc: desc.clone(),
-                                                    started: std::time::Instant::now(),
-                                                    done_at: None,
-                                                });
-                                            }
-                                        }
-                                        "SubagentStop" => {
-                                            if let Some(child) =
-                                                tab.children.iter_mut().find(|c| c.done_at.is_none())
-                                            {
-                                                child.done_at = Some(std::time::Instant::now());
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
+                                term::apply_subagent_events(
+                                    &mut tab.children,
+                                    &records[tab.events_seen..],
+                                    std::time::Instant::now(),
+                                );
                                 tab.events_seen = records.len();
                             }
                         }
@@ -1189,7 +1223,40 @@ impl PtApp {
     /// when it pointed at THIS tab's now-gone children (`respawn` already
     /// resets `tab.children` to empty) — otherwise the info pane would keep
     /// showing a subagent row that just vanished out from under it.
+    ///
+    /// **Final-review finding 4: never `Tab::respawn` a dead placeholder.**
+    /// A placeholder (`missing_dir.is_some()`, `term::spawn_dead_tab`) never
+    /// went through `spawn_agent`, so no `.claude/settings.local.json` was
+    /// ever written for its tab id — and its `cwd` is the workspace's MAIN
+    /// checkout, not the saved directory. `respawn` on one would launch a
+    /// real `cmd /c claude` there under whatever hook settings already exist
+    /// in that checkout: status capture is dead at best, and if another live
+    /// direct-mode tab owns those settings, the restarted session's hooks
+    /// append to THAT tab's events file — where `drain_events` reads them
+    /// back and overwrites the other tab's `session_id`, corrupting what a
+    /// later `--resume` would reattach to.
+    ///
+    /// **Chosen fix (both halves).** Primary: the exit banner simply does not
+    /// render a Restart button for a placeholder tab, leaving the missing-dir
+    /// banner's own `[Respawn in main checkout]` / `[Close]` as the only
+    /// actions — that button already does the right thing (a genuine
+    /// `spawn_agent`, hook settings and all, via `respawn_missing_dir_tab`),
+    /// so a second, subtly-broken restart path was never anything but a trap.
+    /// Secondary (this guard): should any future caller reach this function
+    /// with a placeholder active anyway, route it to that same correct path
+    /// rather than let it fall through to `respawn`. Cheap, and it keeps the
+    /// invariant with the function that must hold it instead of relying on
+    /// one `if` in the UI layer staying correct forever.
     fn restart_active_tab(&mut self, ctx: &egui::Context) {
+        if self
+            .workspaces
+            .get(self.active_ws)
+            .and_then(|ws| ws.tabs.get(ws.active_tab))
+            .is_some_and(|t| t.missing_dir.is_some())
+        {
+            self.respawn_missing_dir_tab(ctx);
+            return;
+        }
         let before: HashSet<u32> = self
             .last_snap
             .iter()
@@ -1653,11 +1720,22 @@ impl eframe::App for PtApp {
                     // almost immediately, so both banners typically show
                     // together — intended, not a bug (see
                     // `spawn_missing_dir_placeholder`'s docs).
-                    if let Some(missing) = tab.missing_dir.clone() {
+                    let placeholder = tab.missing_dir.is_some();
+                    if placeholder {
+                        // Finding 3: the reason is now carried on the tab
+                        // (missing directory, or a failed resume spawn) rather
+                        // than being reconstructed from `missing_dir` here.
+                        // `dead_reason` is always `Some` when `missing_dir`
+                        // is — both are set by the one constructor that builds
+                        // placeholders — so the fallback never renders.
+                        let reason = tab
+                            .dead_reason
+                            .clone()
+                            .unwrap_or_else(|| "this tab could not be restored".to_string());
                         ui.horizontal(|ui| {
                             ui.colored_label(
                                 egui::Color32::from_rgb(255, 170, 40), // amber — same as NeedsYou
-                                format!("\u{26A0} saved directory missing: {}", missing.display()),
+                                format!("\u{26A0} {reason}"),
                             );
                             if ui.button("Respawn in main checkout").clicked() {
                                 respawn_missing = true;
@@ -1677,7 +1755,12 @@ impl eframe::App for PtApp {
                                 egui::Color32::LIGHT_RED,
                                 format!("process exited with code {code}"),
                             );
-                            if ui.button("Restart").clicked() {
+                            // FINAL-REVIEW FINDING 4: no Restart button for a
+                            // dead placeholder — `Tab::respawn` would poison
+                            // hook routing (see `restart_active_tab`'s docs).
+                            // The missing-dir banner drawn just above already
+                            // offers the two actions that make sense for one.
+                            if !placeholder && ui.button("Restart").clicked() {
                                 restart = true;
                             }
                         });

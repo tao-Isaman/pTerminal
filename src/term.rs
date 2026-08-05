@@ -247,9 +247,23 @@ pub struct Tab {
     /// `SessionStart`/etc. hook events (`hooks::latest_session_id`). Persisted
     /// (`state::SavedTab::session_id`) so a restart can `--resume` it.
     pub session_id: Option<String>,
-    /// `Some(saved cwd)` when this tab is the missing-directory placeholder
-    /// built on restart for a saved tab whose cwd no longer exists.
+    /// `Some(saved cwd)` when this tab is a **dead placeholder** built by
+    /// [`spawn_dead_tab`] on resume for a saved tab that could not be brought
+    /// back — either because its cwd no longer exists, or (final-review
+    /// finding 3) because the real spawn itself failed. Holds the ORIGINAL
+    /// saved cwd in both cases (which may well still exist in the
+    /// spawn-failure case), because that is what `PtApp::persist` writes back
+    /// as the saved tab's `cwd` — the field is "the directory this
+    /// placeholder stands in for", not "a directory known to be missing".
+    ///
+    /// Set together with [`Tab::dead_reason`] by the single constructor that
+    /// produces placeholders, so the two can never drift apart: `Some`/`Some`
+    /// for a placeholder, `None`/`None` for every real spawn.
     pub missing_dir: Option<PathBuf>,
+    /// Human-readable reason this tab is a placeholder, rendered by the
+    /// banner above the terminal (final-review finding 3). Always `Some`
+    /// exactly when `missing_dir` is — see that field's docs.
+    pub dead_reason: Option<String>,
     /// Live subagent children, oldest first; see [`SubTab`].
     pub children: Vec<SubTab>,
     /// How many parsed `EventRecord`s (`hooks::parse_events`) have already
@@ -385,6 +399,7 @@ pub fn spawn_agent(
             mem: 0,
             session_id: None,
             missing_dir: None,
+            dead_reason: None,
             children: vec![],
             events_seen: 0,
         })
@@ -435,61 +450,123 @@ pub fn spawn_shell(
         mem: 0,
         session_id: None,
         missing_dir: None,
+        dead_reason: None,
         children: vec![],
         events_seen: 0,
     })
 }
 
-/// Builds the placeholder `Tab` for a saved tab (Task 5's resume-on-launch)
-/// whose saved `cwd` no longer exists on disk. Spawns a diagnostic
-/// `cmd.exe /c echo saved directory missing & exit 1` in `repo_root` (the
-/// workspace's main checkout — never the missing path, which by definition
-/// can't be a working directory) purely so the tab has something to look
-/// at and an exit code the existing exit banner can render; this is NOT a
-/// real agent/shell spawn, so no hooks are wired and no worktree is
-/// created.
+/// Builds the **dead placeholder** `Tab` standing in for a saved tab
+/// (Task 5's resume-on-launch) that could not be brought back to life.
+/// Two callers, both in `PtApp::resume_saved_tabs`:
 ///
-/// `missing`/`worktree`/`session_id` are carried onto the placeholder
-/// `Tab` unchanged (not reset to `None`) so a later `persist()` round-trip
-/// (`app.rs`'s `persist`, Step 2) writes the SAME `SavedTab` back out —
-/// `cwd: missing_dir` in particular, not `repo_root` — instead of quietly
-/// forgetting the original path/session/worktree the moment the directory
-/// went missing. That's what lets the banner (and the option to recover if
-/// the path reappears, e.g. a remounted drive) survive another restart
-/// rather than silently downgrading to "just another main-checkout tab" on
-/// the next `persist()`.
-pub fn spawn_missing_dir_placeholder(
+/// 1. the saved `cwd` no longer exists on disk (the original missing-dir
+///    case), and
+/// 2. **final-review finding 3:** the real `spawn_shell`/`spawn_agent` call
+///    returned an error. That arm used to only set `self.error` and push
+///    nothing at all, so the very next `persist()` — which rebuilds
+///    `saved_tabs` from the LIVE tab list — erased the saved tab outright,
+///    taking its session id and worktree reference with it. Pushing a
+///    placeholder instead keeps the saved record alive across the failure.
+///
+/// Spawns a diagnostic `cmd.exe` that prints one line and exits `1` in
+/// `repo_root` (the workspace's main checkout — never `saved.cwd`, which in
+/// case 1 by definition can't be a working directory) purely so the tab has
+/// something to look at and an exit code the existing exit banner can
+/// render; this is NOT a real agent/shell spawn, so no hooks are wired and
+/// no worktree is created. The diagnostic line is deliberately a fixed,
+/// `cmd`-safe string rather than `reason` itself: a reason built from an
+/// `anyhow` chain can contain `&`, `>`, `|` and quotes, which `cmd /c echo`
+/// would interpret rather than print. `reason` is shown by the banner
+/// directly above the terminal (`app.rs`), where it needs no escaping.
+///
+/// Every saved field (`cwd`→`missing_dir`, `worktree`, `session_id`,
+/// `title`, `kind`) is carried onto the placeholder `Tab` unchanged (not
+/// reset to `None`) so a later `persist()` round-trip (`app.rs`'s `persist`,
+/// Step 2) writes the SAME `SavedTab` back out — `cwd: missing_dir` in
+/// particular, not `repo_root` — instead of quietly forgetting the original
+/// path/session/worktree. That's what lets the banner (and the option to
+/// recover once whatever broke is fixed, e.g. a remounted drive) survive
+/// another restart rather than silently downgrading to "just another
+/// main-checkout tab" on the next `persist()`.
+pub fn spawn_dead_tab(
     ctx: &eframe::egui::Context,
-    id: u64,
+    saved: &crate::state::SavedTab,
     repo_root: &Path,
-    missing: PathBuf,
-    title: String,
-    kind: TabKind,
-    worktree: Option<WorktreeInfo>,
-    session_id: Option<String>,
+    reason: String,
 ) -> anyhow::Result<Tab> {
-    let args: Vec<String> = ["/c", "echo", "saved", "directory", "missing", "&", "exit", "1"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let term = TabTerm::spawn(ctx, id, "cmd.exe", &args, repo_root)?;
+    let args: Vec<String> =
+        ["/c", "echo", "pTerminal", "placeholder", "tab", "-", "see", "banner", "above", "&", "exit", "1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    let term = TabTerm::spawn(ctx, saved.tab_id, "cmd.exe", &args, repo_root)?;
     Ok(Tab {
-        id,
-        title,
-        kind,
+        id: saved.tab_id,
+        title: saved.title.clone(),
+        kind: match saved.kind {
+            crate::state::SavedTabKind::Agent => TabKind::Agent,
+            crate::state::SavedTabKind::Shell => TabKind::Shell,
+        },
         term,
         status: AgentStatus::Unknown,
-        worktree,
+        worktree: saved.worktree.clone(),
         cwd: repo_root.to_path_buf(),
         root_pids: vec![],
         spawned_at: std::time::Instant::now(),
         cpu: 0.0,
         mem: 0,
-        session_id,
-        missing_dir: Some(missing),
+        session_id: saved.session_id.clone(),
+        missing_dir: Some(saved.cwd.clone()),
+        dead_reason: Some(reason),
         children: vec![],
         events_seen: 0,
     })
+}
+
+/// Applies the subagent-child half of a batch of freshly-seen hook records
+/// to `children` (final-review finding 5 — extracted out of
+/// `PtApp::drain_events` so the ordering rules below are testable without a
+/// live app, an egui context, or a real ConPTY child):
+///
+/// - `PreToolUse` **with** a `tool_desc` starts a child, pushed at the back
+///   so `children` stays oldest-first. A `PreToolUse` without one carries no
+///   description to render and is ignored outright.
+/// - `SubagentStop` completes the OLDEST still-running child — the first
+///   entry with `done_at == None` scanned from the front. Claude Code's
+///   `SubagentStop` payload doesn't identify *which* subagent stopped, so
+///   with N parallel children running this is a heuristic, not a fact:
+///   oldest-first is the least-surprising resolution (it matches the common
+///   sequential start/stop/start/stop case exactly, and for parallel runs it
+///   keeps the *count* of running children correct even when an individual
+///   row's timing is attributed to the wrong sibling).
+/// - A `SubagentStop` with nothing running is ignored (no panic, no
+///   retroactive completion of an already-finished child).
+///
+/// `records` must be only the records not yet seen for this tab — the caller
+/// slices `records[events_seen..]`. `now` is passed in rather than read here
+/// so every child started/stopped from one batch shares a single timestamp
+/// and tests can pin it.
+pub fn apply_subagent_events(
+    children: &mut Vec<SubTab>,
+    records: &[hooks::EventRecord],
+    now: std::time::Instant,
+) {
+    for rec in records {
+        match rec.event.as_str() {
+            "PreToolUse" => {
+                if let Some(desc) = &rec.tool_desc {
+                    children.push(SubTab { desc: desc.clone(), started: now, done_at: None });
+                }
+            }
+            "SubagentStop" => {
+                if let Some(child) = children.iter_mut().find(|c| c.done_at.is_none()) {
+                    child.done_at = Some(now);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Tab {
@@ -536,6 +613,20 @@ impl Tab {
     /// `spawn_shell` do, same reasoning as the events-file truncation below:
     /// a fresh child means fresh bookkeeping, not leftover state from the
     /// dead process.
+    ///
+    /// **Never call this on a dead placeholder** (`missing_dir.is_some()`,
+    /// see [`spawn_dead_tab`]) — final-review finding 4. A placeholder never
+    /// went through `spawn_agent`, so `.claude/settings.local.json` in
+    /// `self.cwd` (the workspace's MAIN checkout) was never written for this
+    /// tab id. Respawning an agent placeholder in place would launch a real
+    /// `claude` under whatever hook settings happen to be sitting in that
+    /// checkout: at best status capture is dead, at worst those settings
+    /// belong to a DIFFERENT live direct-mode tab, and this session's events
+    /// would append to that tab's events file — where `drain_events` would
+    /// read them back and overwrite the other tab's `session_id`. `app.rs`
+    /// routes placeholders to `respawn_missing_dir_tab` (a genuine
+    /// `spawn_agent`, hook settings and all) instead, and hides the Restart
+    /// button for them so the path isn't reachable from the UI at all.
     pub fn respawn(&mut self, ctx: &eframe::egui::Context) -> anyhow::Result<()> {
         let term = match self.kind {
             TabKind::Agent => {
@@ -550,6 +641,7 @@ impl Tab {
         self.spawned_at = std::time::Instant::now();
         self.session_id = None;
         self.missing_dir = None;
+        self.dead_reason = None;
         self.children = vec![];
         self.events_seen = 0;
         Ok(())
@@ -720,38 +812,45 @@ mod tests {
         assert_eq!(term.exited(), Some(7));
     }
 
-    // --- Task 5: spawn_missing_dir_placeholder ------------------------------
+    // --- Task 5: spawn_dead_tab --------------------------------------------
 
     /// Locks in the placeholder's contract (Step 5/`app.rs`'s missing-dir
     /// banner depends on all of this): it runs in `repo_root` (never the
-    /// missing path — that's the whole reason it exists), always exits
+    /// saved path — that's the whole reason it exists), always exits
     /// `1` (the banner's "Respawn"/"Close" buttons only make sense once
-    /// the diagnostic has finished), and carries the saved `missing`/
-    /// `worktree`/`session_id` straight onto the `Tab` unchanged so a
-    /// later `persist()` round-trip doesn't quietly forget them.
+    /// the diagnostic has finished), and carries every saved field
+    /// (`cwd`→`missing_dir`, `title`, `kind`, `worktree`, `session_id`)
+    /// straight onto the `Tab` unchanged so a later `persist()` round-trip
+    /// doesn't quietly forget them.
     #[test]
-    fn missing_dir_placeholder_exits_1_and_carries_saved_fields() {
+    fn dead_tab_exits_1_and_carries_saved_fields() {
         let ctx = eframe::egui::Context::default();
         let missing = PathBuf::from("D:\\pterminal-test-missing-dir-does-not-exist");
         let wt = WorktreeInfo { path: PathBuf::from("D:\\wt\\x"), branch: "pt/x".into() };
-        let mut tab = spawn_missing_dir_placeholder(
+        let saved = crate::state::SavedTab {
+            tab_id: 9,
+            kind: crate::state::SavedTabKind::Agent,
+            title: "my-agent".to_string(),
+            cwd: missing.clone(),
+            worktree: Some(wt.clone()),
+            session_id: Some("sess-1".to_string()),
+        };
+        let mut tab = spawn_dead_tab(
             &ctx,
-            9,
+            &saved,
             Path::new("C:\\"),
-            missing.clone(),
-            "my-agent".to_string(),
-            TabKind::Agent,
-            Some(wt.clone()),
-            Some("sess-1".to_string()),
+            "saved directory missing: D:\\pterminal-test-missing-dir-does-not-exist".to_string(),
         )
         .expect("spawn placeholder");
 
+        assert_eq!(tab.id, 9);
         assert_eq!(tab.cwd, PathBuf::from("C:\\"));
         assert_eq!(tab.missing_dir, Some(missing));
         assert_eq!(tab.title, "my-agent");
         assert_eq!(tab.kind, TabKind::Agent);
         assert_eq!(tab.worktree, Some(wt));
         assert_eq!(tab.session_id, Some("sess-1".to_string()));
+        assert!(tab.dead_reason.as_deref().unwrap().starts_with("saved directory missing"));
         assert!(tab.children.is_empty());
 
         assert!(
@@ -762,6 +861,155 @@ mod tests {
             "placeholder's diagnostic command never exited",
         );
         assert_eq!(tab.term.exited(), Some(1));
+    }
+
+    /// FINAL-REVIEW FINDING 3: a placeholder built for a *spawn failure*
+    /// (not a missing directory) must carry the saved `cwd` into
+    /// `missing_dir` even though that directory still exists — that field is
+    /// what `PtApp::persist` writes back as the saved tab's `cwd`, so
+    /// anything else would silently rewrite the saved tab to point at the
+    /// main checkout. The Shell kind also has to survive the
+    /// `SavedTabKind`→`TabKind` mapping.
+    #[test]
+    fn dead_tab_for_a_spawn_failure_preserves_an_existing_saved_cwd() {
+        let ctx = eframe::egui::Context::default();
+        let existing = PathBuf::from("C:\\Windows");
+        let saved = crate::state::SavedTab {
+            tab_id: 11,
+            kind: crate::state::SavedTabKind::Shell,
+            title: "shell".to_string(),
+            cwd: existing.clone(),
+            worktree: None,
+            session_id: None,
+        };
+        let mut tab = spawn_dead_tab(&ctx, &saved, Path::new("C:\\"), "resume failed: boom".to_string())
+            .expect("spawn placeholder");
+
+        assert_eq!(tab.kind, TabKind::Shell);
+        assert_eq!(tab.missing_dir, Some(existing), "the saved cwd must survive a spawn failure");
+        assert_eq!(tab.dead_reason.as_deref(), Some("resume failed: boom"));
+
+        assert!(
+            wait_for(|| {
+                tab.term.poll();
+                tab.term.exited().is_some()
+            }),
+            "placeholder's diagnostic command never exited",
+        );
+    }
+
+    // --- Final review finding 5: subagent bookkeeping ordering --------------
+
+    fn rec(event: &str, tool_desc: Option<&str>) -> hooks::EventRecord {
+        hooks::EventRecord {
+            event: event.to_string(),
+            session_id: None,
+            tool_desc: tool_desc.map(str::to_string),
+        }
+    }
+
+    /// Two subagents running in parallel: each `SubagentStop` completes the
+    /// OLDEST still-running child, so the first stop lands on "a" and only
+    /// the second lands on "b". Applied in three separate batches (the way
+    /// `drain_events` sees them as the events file grows) so the
+    /// intermediate state — exactly one child done — is observable.
+    #[test]
+    fn subagent_parallel_stops_complete_oldest_first() {
+        let now = Instant::now();
+        let mut children: Vec<SubTab> = Vec::new();
+
+        apply_subagent_events(&mut children, &[rec("PreToolUse", Some("a")), rec("PreToolUse", Some("b"))], now);
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].desc, "a");
+        assert_eq!(children[1].desc, "b");
+        assert!(children.iter().all(|c| c.done_at.is_none()));
+
+        apply_subagent_events(&mut children, &[rec("SubagentStop", None)], now);
+        assert!(children[0].done_at.is_some(), "the first stop must complete the OLDEST child");
+        assert!(children[1].done_at.is_none(), "the younger child must still be running");
+
+        apply_subagent_events(&mut children, &[rec("SubagentStop", None)], now);
+        assert!(children[1].done_at.is_some(), "the second stop must complete the remaining child");
+        assert_eq!(children.len(), 2, "stops must never add or remove rows");
+    }
+
+    /// The common sequential shape — start/stop/start/stop in one batch —
+    /// pairs each stop with the child that was running at the time, leaving
+    /// both done and in start order.
+    #[test]
+    fn subagent_sequential_start_stop_pairs_each_child() {
+        let now = Instant::now();
+        let mut children: Vec<SubTab> = Vec::new();
+        apply_subagent_events(
+            &mut children,
+            &[
+                rec("PreToolUse", Some("first")),
+                rec("SubagentStop", None),
+                rec("PreToolUse", Some("second")),
+                rec("SubagentStop", None),
+            ],
+            now,
+        );
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].desc, "first");
+        assert_eq!(children[1].desc, "second");
+        assert!(children[0].done_at.is_some());
+        assert!(children[1].done_at.is_some());
+    }
+
+    /// A `SubagentStop` with nothing running is ignored: it must neither
+    /// panic on an empty list nor retroactively re-complete a child that
+    /// already finished (which would reset its elapsed time in the UI).
+    #[test]
+    fn subagent_stop_with_nothing_running_is_ignored() {
+        let now = Instant::now();
+        let mut children: Vec<SubTab> = Vec::new();
+
+        apply_subagent_events(&mut children, &[rec("SubagentStop", None)], now);
+        assert!(children.is_empty(), "a stop with no children must not invent one");
+
+        apply_subagent_events(&mut children, &[rec("PreToolUse", Some("only")), rec("SubagentStop", None)], now);
+        let done_at = children[0].done_at.expect("child should be done");
+
+        apply_subagent_events(&mut children, &[rec("SubagentStop", None)], now + Duration::from_secs(5));
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].done_at, Some(done_at), "an extra stop must not re-stamp a finished child");
+    }
+
+    /// `PreToolUse` without a `tool_desc` carries nothing to render, so it
+    /// starts no child at all — and therefore must not consume a later
+    /// `SubagentStop` either.
+    #[test]
+    fn subagent_pretooluse_without_tool_desc_is_ignored() {
+        let now = Instant::now();
+        let mut children: Vec<SubTab> = Vec::new();
+
+        apply_subagent_events(&mut children, &[rec("PreToolUse", None)], now);
+        assert!(children.is_empty(), "a PreToolUse with no description must not start a child");
+
+        apply_subagent_events(
+            &mut children,
+            &[rec("PreToolUse", None), rec("PreToolUse", Some("real")), rec("SubagentStop", None)],
+            now,
+        );
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].desc, "real");
+        assert!(children[0].done_at.is_some(), "the stop must land on the only real child");
+    }
+
+    /// Events with no subagent meaning must pass straight through — the
+    /// status events that share the same file are the drain loop's other
+    /// consumer, not this function's.
+    #[test]
+    fn subagent_ignores_unrelated_events() {
+        let now = Instant::now();
+        let mut children: Vec<SubTab> = Vec::new();
+        apply_subagent_events(
+            &mut children,
+            &[rec("SessionStart", None), rec("UserPromptSubmit", None), rec("Stop", None), rec("Notification", None)],
+            now,
+        );
+        assert!(children.is_empty());
     }
 
     #[test]
