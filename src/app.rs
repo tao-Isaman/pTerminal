@@ -714,16 +714,70 @@ impl PtApp {
         );
 
         match result {
-            Ok(tab) => {
-                let ws = &mut self.workspaces[ws_index];
-                ws.tabs.push(tab);
-                ws.active_tab = ws.tabs.len() - 1;
-                self.pending_claim = Some(PendingClaim { ws_index, tab_id: id, before });
-                self.active_ws = ws_index;
-                self.persist();
-            }
+            Ok(tab) => self.finish_resume_spawn(ws_index, id, before, tab, &cmd.session_id),
             Err(e) => self.error = Some(format!("resume: {e}")),
         }
+    }
+
+    /// Finishes a successful resume spawn (Task 2, split out of
+    /// `handle_resume_command` for testability — see below): carries the
+    /// transferred `session_id` onto `tab`, pushes it, arms the
+    /// `PendingClaim`, switches the active workspace, and persists.
+    ///
+    /// **Critical fix (found in review):** `spawn_agent`/`spawn_shell`
+    /// always start a fresh `Tab` with `session_id: None`, regardless of
+    /// `SpawnSpec::resume_session` — correct for a brand-new spawn, wrong
+    /// here, since `claude --resume <sid>` continues the exact session
+    /// `session_id` names. The assignment below runs BEFORE `push`/`persist`
+    /// so an early `persist()` (this one, or any other firing before this
+    /// session's own `SessionStart` hook has a chance to report the id back)
+    /// writes the transferred id into `saved_tabs`, not `None`. Same bug
+    /// class `resume_saved_tabs`'s "REVIEW FINDING 1" already fixed for the
+    /// resume-on-launch path (see that function's docs) — this was the same
+    /// gap on the resume-via-CLI path, just not yet closed. Without it,
+    /// closing the app in the pre-`SessionStart` window and relaunching
+    /// would resume the saved tab with `resume_session: None` —
+    /// `agent_args("", None)` builds a bare `["/c", "claude"]`, silently
+    /// starting a brand-new session instead of continuing the transferred
+    /// one. This is almost certainly what actually produced the unexplained
+    /// bare-`claude` tab in this task's own live-verification incident (see
+    /// `task-2-report.md`'s fix-report addendum): the first, killed
+    /// resume attempt's tab had its session id nulled out by an early
+    /// `persist()` in exactly this window, and the second (contaminated)
+    /// startup drain resumed it — from `state.json`, not from a fresh
+    /// command file — with `resume_session: None`.
+    ///
+    /// **Why this is its own function.** `handle_resume_command`'s real
+    /// spawn goes through `spawn_agent`, which runs `claude --resume <sid>`
+    /// — confirmed live (see the report) to hang indefinitely for an
+    /// unresolvable session id rather than exit non-interactively, and
+    /// `TabTerm` exposes no way to force-kill a child from the outside. A
+    /// unit test driving `handle_resume_command` end-to-end would therefore
+    /// either hang the test suite or leak a real orphaned `claude.exe`
+    /// process (the exact failure this codebase's own
+    /// `resume_carries_saved_session_id_onto_the_tab_before_any_hook_fires`
+    /// test already had to route around, via `SavedTabKind::Shell`, for the
+    /// analogous `resume_saved_tabs` fix). Splitting the actual
+    /// bug-and-fix — the ordering of this assignment relative to
+    /// `push`/`persist` — into its own function lets a test drive it with a
+    /// safe, fast, `spawn_shell`-built `Tab` instead, with zero risk of
+    /// hanging or leaking a process, while still exercising the exact code
+    /// path that was broken.
+    fn finish_resume_spawn(
+        &mut self,
+        ws_index: usize,
+        id: u64,
+        before: HashSet<u32>,
+        mut tab: Tab,
+        session_id: &str,
+    ) {
+        tab.session_id = Some(session_id.to_string());
+        let ws = &mut self.workspaces[ws_index];
+        ws.tabs.push(tab);
+        ws.active_tab = ws.tabs.len() - 1;
+        self.pending_claim = Some(PendingClaim { ws_index, tab_id: id, before });
+        self.active_ws = ws_index;
+        self.persist();
     }
 
     /// Directories the filesystem watcher should cover: the hooks events
@@ -2680,5 +2734,57 @@ mod tests {
         let err = app.error.expect("expected an error banner");
         assert!(err.contains("resume: directory does not exist"), "unexpected banner text: {err}");
         assert!(err.contains(&missing.display().to_string()), "banner should name the missing dir: {err}");
+    }
+
+    // ---- finish_resume_spawn (critical fix: transferred session id) ----
+    //
+    // Drives the exact code that was broken (`handle_resume_command`'s
+    // former `Ok` arm, now split into `finish_resume_spawn`) without going
+    // through a real `claude --resume <sid>` spawn: confirmed live (see
+    // `task-2-report.md`'s fix-report addendum) that `claude --resume`
+    // hangs indefinitely for ANY session id — valid, bogus, or otherwise —
+    // rather than exiting non-interactively, and `TabTerm` has no way to
+    // force-kill a child from outside. `spawn_shell` (`powershell.exe`)
+    // stands in for "a `Tab` a successful spawn produced" instead: fast,
+    // deterministic, and cleanly closeable via `exit_and_drain`, the same
+    // convention `resume_carries_saved_session_id_onto_the_tab_before_any_hook_fires`
+    // already established for the analogous `resume_saved_tabs` fix.
+
+    #[test]
+    fn finish_resume_spawn_carries_the_transferred_session_id_before_persist() {
+        let ctx = eframe::egui::Context::default();
+        let base = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_tabs(base.path().to_path_buf(), repo.path().to_path_buf(), vec![]);
+
+        let tab = term::spawn_shell(&ctx, 999, repo.path()).expect("spawn_shell");
+        app.finish_resume_spawn(0, 999, HashSet::new(), tab, "transferred-session-abc");
+
+        assert_eq!(app.workspaces[0].tabs.len(), 1, "the tab must have been pushed");
+        assert_eq!(
+            app.workspaces[0].tabs[0].session_id,
+            Some("transferred-session-abc".to_string()),
+            "the transferred session id must be carried onto the tab immediately \
+             (before any SessionStart hook), not left at None",
+        );
+        assert_eq!(app.active_ws, 0, "the target workspace must become active");
+
+        // Recreates the exact failure mode the finding describes: an early
+        // persist() (already run inside `finish_resume_spawn` itself, mirroring
+        // `handle_resume_command`'s real call) must round-trip the SAME id
+        // through `state.json`, not null it.
+        assert_eq!(
+            app.workspaces[0].meta.saved_tabs[0].session_id,
+            Some("transferred-session-abc".to_string()),
+            "an early persist() must not null out the transferred session id",
+        );
+        let (reloaded, _) = state::load(&app.base);
+        assert_eq!(
+            reloaded.workspaces[0].saved_tabs[0].session_id,
+            Some("transferred-session-abc".to_string()),
+            "the id written to state.json on disk must survive the early persist too",
+        );
+
+        exit_and_drain(&mut app.workspaces[0].tabs[0].term);
     }
 }
