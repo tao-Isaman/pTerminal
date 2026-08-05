@@ -147,6 +147,14 @@ fn paths_match(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// The `msg_offset` a workspace freshly added at `repo` should start at: the
+/// CURRENT byte length of `repo`'s `messages.jsonl`, or `0` when the file
+/// doesn't exist yet. Used by [`PtApp::finish_add_workspace`] — see the
+/// re-add rule documented there for why unconditional `0` is wrong.
+fn initial_msg_offset(repo: &Path) -> u64 {
+    std::fs::metadata(shared_ctx::messages_path(repo)).map(|m| m.len()).unwrap_or(0)
+}
+
 pub struct PtApp {
     pub base: PathBuf,
     pub workspaces: Vec<WsRt>,
@@ -931,6 +939,16 @@ impl PtApp {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| folder.display().to_string());
         let is_git = crate::git::is_git_repo(&folder);
+        // Re-add rule (spec): a workspace added at THIS folder must not
+        // replay message history that accumulated before it existed (e.g. a
+        // previous instance of this same workspace was closed and messages
+        // kept arriving, or the folder already has a `messages.jsonl` from
+        // some other tool/process) into whatever fresh agent tab gets
+        // spawned next — `deliver_messages` only ever reads forward from
+        // `msg_offset`, so starting it at the file's CURRENT length rather
+        // than unconditional `0` is what skips the backlog while still
+        // delivering anything appended from this point on.
+        let msg_offset = initial_msg_offset(&folder);
         self.workspaces.push(WsRt {
             meta: state::Workspace {
                 name,
@@ -940,12 +958,92 @@ impl PtApp {
                 kept_worktrees: vec![],
                 saved_tabs: vec![],
                 active_tab: 0,
-                msg_offset: 0,
+                msg_offset,
             },
             tabs: vec![],
             active_tab: 0,
         });
         self.active_ws = self.workspaces.len() - 1;
+        self.rebuild_watcher();
+        self.persist();
+    }
+
+    /// Closes workspace `ws_index`: removes it from `self.workspaces`
+    /// entirely (dropping its `Tab`s drops their PTYs — child processes end
+    /// exactly like any other tab close, no explicit kill needed), then
+    /// re-points `active_ws` and clears every piece of transient state that
+    /// carries a now-possibly-stale index or identity into the removed
+    /// workspace or the ones that shifted because of it.
+    ///
+    /// **No-op when `ws_index` is out of range** — returns before touching
+    /// anything (`self.workspaces`, `active_ws`, the transient fields below,
+    /// `persist`/`rebuild_watcher`), so a stale index racing a concurrent
+    /// close can never panic or silently corrupt state.
+    ///
+    /// **`active_ws` re-pointing** (spec: "same workspace stays active when
+    /// possible"): a removal strictly BELOW `active_ws` shifts every later
+    /// index down by one, so `active_ws` is decremented to keep pointing at
+    /// the SAME workspace. A removal AT `active_ws` (the active workspace
+    /// itself is being closed) has no "same workspace" to keep pointing at,
+    /// so it clamps to the removed position, capped at the new last index —
+    /// `0` if the list is now empty (`workspaces.get(active_ws)` is safe
+    /// everywhere downstream, including the empty case). A removal ABOVE
+    /// `active_ws` doesn't shift anything at or below it, so `active_ws` is
+    /// left untouched.
+    ///
+    /// **`pending_submit` filtering is by tab id, not index**, and the
+    /// removed workspace's tab ids are captured BEFORE the removal —
+    /// otherwise there would be nothing left to compare against. This
+    /// mirrors `CloseDraft`/`PendingClaim`'s own identity-over-index
+    /// convention (see their docs) and is necessary for the same underlying
+    /// reason: every workspace after `ws_index` has its index shift the
+    /// moment `remove` runs.
+    ///
+    /// **`roster_written`/`partial_pending` are cleared outright**, not
+    /// re-keyed. Both are keyed by workspace INDEX (`maintain_roster`'s
+    /// last-written-JSON cache and `deliver_messages`' retry-a-partial-line
+    /// set), which the same index shift invalidates for every workspace
+    /// after the removed one — surviving entries would silently point at
+    /// the WRONG workspace. Cheap to just drop: both self-repopulate from
+    /// scratch on the very next relevant frame (one extra `agents.json`
+    /// write / one extra partial-line check, at most).
+    ///
+    /// **HARD RULE (spec): state-only.** This method never shells out to
+    /// git and never touches the filesystem beyond the same two IO paths
+    /// every other mutation in this module already goes through —
+    /// `persist()` (writes `state.json`) and `rebuild_watcher()`
+    /// (re-subscribes the filesystem watcher; creates the directories it
+    /// watches, same as `finish_add_workspace`, but deletes nothing). No
+    /// worktree removal, no branch deletion, no file edits — "forget",
+    /// never "destroy".
+    ///
+    /// Unused outside tests until Task 2 wires a UI trigger (context menu +
+    /// confirmation dialog) to it.
+    #[allow(dead_code)] // consumed in Task 2
+    pub fn close_workspace(&mut self, ws_index: usize) {
+        if ws_index >= self.workspaces.len() {
+            return;
+        }
+        let removed_tab_ids: HashSet<u64> =
+            self.workspaces[ws_index].tabs.iter().map(|t| t.id).collect();
+        self.workspaces.remove(ws_index);
+
+        self.active_ws = if ws_index < self.active_ws {
+            self.active_ws - 1
+        } else if ws_index == self.active_ws {
+            if self.workspaces.is_empty() { 0 } else { ws_index.min(self.workspaces.len() - 1) }
+        } else {
+            self.active_ws
+        };
+
+        self.new_tab = None;
+        self.closing = None;
+        self.selected_child = None;
+        self.pending_claim = None;
+        self.roster_written.clear();
+        self.partial_pending.clear();
+        self.pending_submit.retain(|(tab_id, _)| !removed_tab_ids.contains(tab_id));
+
         self.rebuild_watcher();
         self.persist();
     }
@@ -2384,6 +2482,58 @@ mod tests {
         }
     }
 
+    /// A `PtApp` with `workspaces` set verbatim and `active_ws` as given —
+    /// `app_with_tabs`'s single-hardcoded-workspace shape doesn't fit
+    /// `close_workspace` tests, which need more than one workspace to
+    /// exercise index re-pointing. Every other field is the same
+    /// cheapest-value-that-type-checks convention `app_with_tabs` uses.
+    fn app_with_workspaces(base: PathBuf, workspaces: Vec<WsRt>, active_ws: usize) -> PtApp {
+        let (_tx, sampler_rx) = std::sync::mpsc::channel();
+        PtApp {
+            base,
+            workspaces,
+            active_ws,
+            next_tab_id: 90_500,
+            sampler: sampler_rx,
+            last_snap: vec![],
+            machine: MachineStats::default(),
+            watcher: None,
+            pending_claim: None,
+            pending_folder_pick: None,
+            show_ctx_panel: false,
+            ctx_panel_text: String::new(),
+            ctx_panel_has_focus: false,
+            ctx_panel_loaded_for: None,
+            error: None,
+            new_tab: None,
+            closing: None,
+            roster_written: HashMap::new(),
+            partial_pending: HashSet::new(),
+            selected_child: None,
+            pending_submit: Vec::new(),
+        }
+    }
+
+    /// A bare, tab-less workspace named `name` rooted at `repo`, for
+    /// `close_workspace` tests that only care about workspace identity
+    /// (which one survived) and index bookkeeping, not tab contents.
+    fn ws_with_name(repo: PathBuf, name: &str) -> WsRt {
+        WsRt {
+            meta: state::Workspace {
+                name: name.to_string(),
+                repo_path: repo,
+                is_git: false,
+                default_isolate: false,
+                kept_worktrees: vec![],
+                saved_tabs: vec![],
+                active_tab: 0,
+                msg_offset: 0,
+            },
+            tabs: vec![],
+            active_tab: 0,
+        }
+    }
+
     /// Writes a one-line `messages.jsonl` under `repo` and returns `repo`.
     fn seed_message(repo: &std::path::Path, to: &str) {
         std::fs::create_dir_all(repo.join(".pterminal")).expect("mkdir .pterminal");
@@ -2786,5 +2936,141 @@ mod tests {
         );
 
         exit_and_drain(&mut app.workspaces[0].tabs[0].term);
+    }
+
+    // ---- close_workspace (Task 1) ----
+    //
+    // `app_with_workspaces`/`ws_with_name` build multi-workspace `PtApp`s
+    // directly (no watcher, no sampler) — `close_workspace` itself still
+    // calls the real `rebuild_watcher`/`persist`, exercising the same IO
+    // paths every other mutation in this module already goes through.
+
+    #[test]
+    fn close_workspace_below_active_decrements_active_and_removes_it_everywhere() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let ws0 = ws_with_name(base.path().join("ws0"), "ws0");
+        let ws1 = ws_with_name(base.path().join("ws1"), "ws1");
+        let ws2 = ws_with_name(base.path().join("ws2"), "ws2");
+        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws0, ws1, ws2], 2);
+
+        app.close_workspace(0);
+
+        assert_eq!(app.workspaces.len(), 2, "exactly the closed workspace must be removed");
+        assert_eq!(app.workspaces[0].meta.name, "ws1");
+        assert_eq!(app.workspaces[1].meta.name, "ws2");
+        assert_eq!(app.active_ws, 1, "closing a workspace below active_ws must decrement it");
+
+        let (reloaded, _) = state::load(&app.base);
+        assert_eq!(reloaded.workspaces.len(), 2, "the removal must round-trip through persist()");
+        assert!(
+            reloaded.workspaces.iter().all(|w| w.name != "ws0"),
+            "the closed workspace must not survive in persisted state: {:?}",
+            reloaded.workspaces.iter().map(|w| &w.name).collect::<Vec<_>>()
+        );
+        assert_eq!(reloaded.active_ws, 1);
+    }
+
+    #[test]
+    fn close_workspace_active_clamps_and_clears_transient_state() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let ws0 = ws_with_name(base.path().join("ws0"), "ws0");
+        let ws1 = ws_with_name(base.path().join("ws1"), "ws1");
+        let ws2 = ws_with_name(base.path().join("ws2"), "ws2");
+        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws0, ws1, ws2], 2);
+        app.selected_child = Some((1, 0));
+        app.pending_claim = Some(PendingClaim { ws_index: 2, tab_id: 1, before: HashSet::new() });
+        app.new_tab = Some(NewTabDraft { ws_index: 2, prompt: String::new(), isolate: false, shell: false });
+        app.closing = Some(CloseDraft { ws_index: 2, tab_id: 1, dirty: false, confirm_discard: false });
+        app.roster_written.insert(2, "stale-roster-json".to_string());
+        app.partial_pending.insert(2);
+
+        app.close_workspace(2);
+
+        assert_eq!(app.workspaces.len(), 2);
+        assert_eq!(
+            app.active_ws, 1,
+            "closing the active (last) workspace must clamp to the new last index"
+        );
+        assert!(app.selected_child.is_none());
+        assert!(app.pending_claim.is_none());
+        assert!(app.new_tab.is_none());
+        assert!(app.closing.is_none());
+        assert!(app.roster_written.is_empty(), "index-keyed roster cache must not survive an index shift");
+        assert!(app.partial_pending.is_empty(), "index-keyed partial-line set must not survive an index shift");
+    }
+
+    #[test]
+    fn close_workspace_out_of_range_is_a_no_op() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let ws0 = ws_with_name(base.path().join("ws0"), "ws0");
+        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws0], 0);
+        app.new_tab = Some(NewTabDraft { ws_index: 0, prompt: "keep-me".to_string(), isolate: false, shell: false });
+
+        app.close_workspace(5);
+
+        assert_eq!(app.workspaces.len(), 1, "an out-of-range index must remove nothing");
+        assert_eq!(app.active_ws, 0);
+        assert!(
+            app.new_tab.is_some(),
+            "an out-of-range close must be a true no-op, not just skip the removal step"
+        );
+    }
+
+    #[test]
+    fn close_workspace_drops_pending_submit_entries_for_its_own_tabs_only() {
+        use std::time::{Duration, Instant};
+        let ctx = eframe::egui::Context::default();
+        let base = tempfile::tempdir().expect("tempdir");
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+
+        // `tab_a` lives in the workspace `close_workspace` removes below —
+        // dropping a `Tab` does NOT kill its child (see
+        // `term::tests::forwarding_thread_ends_when_terminal_is_dropped`'s
+        // "child still running" comment), so it's exited and drained BEFORE
+        // the close, same as `a_queued_enter_for_a_gone_tab_is_dropped`'s
+        // "gone" tab — otherwise the removal would leak a live
+        // `powershell.exe`. `tab_b` survives the close (drained below,
+        // after) since it lives in the surviving workspace.
+        let mut tab_a = term::spawn_shell(&ctx, 90_510, dir_a.path()).expect("spawn shell a");
+        exit_and_drain(&mut tab_a.term);
+        let tab_b = term::spawn_shell(&ctx, 90_511, dir_b.path()).expect("spawn shell b");
+        let mut ws0 = ws_with_name(dir_a.path().to_path_buf(), "ws0");
+        ws0.tabs.push(tab_a);
+        let mut ws1 = ws_with_name(dir_b.path().to_path_buf(), "ws1");
+        ws1.tabs.push(tab_b);
+
+        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws0, ws1], 1);
+        let due = Instant::now() + Duration::from_millis(500);
+        app.pending_submit = vec![(90_510, due), (90_511, due)];
+
+        app.close_workspace(0);
+
+        assert_eq!(
+            app.pending_submit,
+            vec![(90_511, due)],
+            "only tab ids belonging to the closed workspace may be dropped"
+        );
+
+        exit_and_drain(&mut app.workspaces[0].tabs[0].term);
+    }
+
+    // ---- initial_msg_offset (re-add rule) ----
+
+    #[test]
+    fn initial_msg_offset_is_the_existing_files_byte_length() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_path_buf();
+        seed_message(&repo, "someone");
+        let expected = std::fs::metadata(shared_ctx::messages_path(&repo)).expect("metadata").len();
+        assert!(expected > 0, "test assumption: seed_message must write a non-empty file");
+
+        assert_eq!(initial_msg_offset(&repo), expected);
+    }
+
+    #[test]
+    fn initial_msg_offset_is_zero_when_the_file_is_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(initial_msg_offset(dir.path()), 0);
     }
 }
