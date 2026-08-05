@@ -195,7 +195,7 @@ impl PtApp {
                     // "terminated" would overclaim a guarantee this codebase
                     // doesn't make.
                     ui.label(format!(
-                        "{tab_count} running tab(s) will be closed (nothing on disk is touched)"
+                        "{tab_count} running tab(s) will be closed (processes only — nothing on disk is touched)"
                     ));
                     ui.label("Worktrees stay on disk; kept-worktree reminders are forgotten");
                     ui.label("Agent sessions remain resumable: pterminal resume --id <sid>");

@@ -56,8 +56,9 @@ pTerminal — a confirmation dialog shows how many tabs are running and what hap
   "kept worktree" reminders for that workspace are forgotten. Nothing is deleted from disk, no
   git branch or worktree is removed, and `state.json` simply drops the entry.
 - **Agent sessions remain resumable** — a closed workspace's agents aren't gone from Claude
-  Code's own session store, so `pterminal resume --id <session-id> --dir <path>` still pulls one
-  back into a (new or existing) workspace afterward.
+  Code's own session store, so `pterminal resume --id <session-id> [--dir <path>]` still pulls one
+  back into a (new or existing) workspace afterward (`--dir` defaults to the current directory,
+  same as "Transfer a session" above).
 
 Other workspaces and their tabs are untouched; if the active workspace is the one closed,
 selection lands on a surviving workspace (or the "add a workspace to begin" empty state if it
