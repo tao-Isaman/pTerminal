@@ -212,7 +212,10 @@ other workspace's agents on your behalf.
     The orchestrator can target any real workspace this way; a workspace
     agent can only target its **own** workspace by name
     (`<own-workspace>/*`) — naming any other workspace is refused, the same
-    as addressing an agent that doesn't exist.
+    as addressing an agent that doesn't exist. Unlike bare `all`, this form
+    does **not** exclude the sender: a workspace agent broadcasting to its
+    own `<own-workspace>/*` is included among the recipients, since it's
+    just a normal agent in its own workspace's agent list.
   - A broadcast that matches zero agents (bare `all` in a workspace with no
     peers, or `<ws>/*` naming an empty or unknown workspace) isn't silently
     dropped either — it surfaces once as `'<to>' (no matching agents)` via
