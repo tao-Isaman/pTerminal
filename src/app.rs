@@ -327,6 +327,34 @@ fn initial_msg_offset(repo: &Path) -> u64 {
     std::fs::metadata(shared_ctx::messages_path(repo)).map(|m| m.len()).unwrap_or(0)
 }
 
+/// The `shared.md` excerpt embedded in one workspace's `status.md` row group
+/// (Task 2: richer live status, `messages::WsStatus::shared_excerpt`): the
+/// last ~200 chars of `repo`'s `shared.md`, flattened to a single line via
+/// [`messages::flatten`] (same collapse `read_new`'s callers already use for
+/// message bodies) and re-trimmed after truncation in case the cut lands
+/// inside a run of flattened whitespace.
+///
+/// An absent `shared.md` (the common case — a fresh workspace, or one no
+/// agent has written to yet) is NOT treated as a failure: it returns `""`,
+/// which [`messages::orchestrator_status`] renders as the placeholder
+/// `(empty)`. Any OTHER read error (permissions, a directory sitting where
+/// the file should be, ...) is a genuine failure and returns the literal
+/// `"(unavailable)"` instead — already non-empty, so the formatter passes it
+/// through unchanged.
+fn shared_excerpt_for(repo_path: &Path) -> String {
+    match std::fs::read_to_string(shared_ctx::shared_md_path(repo_path)) {
+        Ok(content) => {
+            let flat = messages::flatten(&content);
+            let n = flat.chars().count();
+            let start = n.saturating_sub(200);
+            let tail: String = flat.chars().skip(start).collect();
+            tail.trim().to_string()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => "(unavailable)".to_string(),
+    }
+}
+
 /// Builds the reserved orchestrator's `Workspace` record (editor-
 /// orchestrator feature, Task 2): rooted at `shared_ctx::orchestrator_dir()`
 /// — not a git repo, since it's pTerminal's own scratch directory, not a
@@ -1772,9 +1800,24 @@ impl PtApp {
                             if tab.id != id || tab.kind != TabKind::Agent {
                                 continue;
                             }
-                            if tab.status != AgentStatus::Exited {
-                                tab.status = status;
-                            }
+                            // Task 2 (richer live status): `last_activity`
+                            // only advances to "now" when `status` actually
+                            // differs from the tab's prior status — see
+                            // `term::next_status_and_activity`'s docs for
+                            // why (keeps status.md's `last active HH:MM:SS`
+                            // stable, i.e. no per-poll churn, while nothing
+                            // has actually changed). Otherwise unchanged
+                            // from before: an already-`Exited` tab's status
+                            // (and now its `last_activity` too) never moves
+                            // again.
+                            let (new_status, new_last_activity) = term::next_status_and_activity(
+                                tab.status,
+                                tab.last_activity,
+                                status,
+                                std::time::SystemTime::now(),
+                            );
+                            tab.status = new_status;
+                            tab.last_activity = new_last_activity;
                             if let Some(sid) = hooks::latest_session_id(&records) {
                                 if tab.session_id.as_deref() != Some(sid.as_str()) {
                                     tab.session_id = Some(sid);
@@ -2026,11 +2069,21 @@ impl PtApp {
             .map(|(_, ws)| messages::WsStatus {
                 name: ws.meta.name.clone(),
                 repo_path: ws.meta.repo_path.clone(),
+                shared_excerpt: shared_excerpt_for(&ws.meta.repo_path),
                 agents: ws
                     .tabs
                     .iter()
                     .filter(|t| t.kind == TabKind::Agent)
-                    .map(|t| (t.title.clone(), messages::status_str(t.status).to_string(), t.cwd.clone()))
+                    .map(|t| {
+                        let subagent_count = t.children.iter().filter(|c| c.done_at.is_none()).count();
+                        (
+                            t.title.clone(),
+                            messages::status_str(t.status).to_string(),
+                            t.cwd.clone(),
+                            subagent_count,
+                            messages::fmt_hms(t.last_activity),
+                        )
+                    })
                     .collect(),
             })
             .collect();
@@ -4704,6 +4757,62 @@ mod tests {
         assert_eq!(initial_msg_offset(dir.path()), 0);
     }
 
+    // ---- Task 2 (richer live status): shared_excerpt_for ----
+    //
+    // Pure(-ish) — one filesystem read, no egui/Tab/ctx — so the three
+    // outcomes the brief distinguishes (absent file, short/long content,
+    // genuine read failure) are each directly testable.
+
+    #[test]
+    fn shared_excerpt_for_missing_shared_md_is_empty_string() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert_eq!(
+            shared_excerpt_for(dir.path()),
+            "",
+            "an absent shared.md must be the empty string, not the '(unavailable)' failure text"
+        );
+    }
+
+    #[test]
+    fn shared_excerpt_for_short_content_returns_full_flattened_trimmed_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = shared_ctx::shared_md_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "line one\r\nline two\n").unwrap();
+
+        assert_eq!(shared_excerpt_for(dir.path()), "line one line two");
+    }
+
+    #[test]
+    fn shared_excerpt_for_long_content_returns_only_the_last_200_chars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = shared_ctx::shared_md_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // 50 'a's (to be dropped) followed by 200 distinct tail chars.
+        let head = "a".repeat(50);
+        let tail: String = (0..200).map(|i| char::from(b'0' + (i % 10) as u8)).collect();
+        std::fs::write(&path, format!("{head}{tail}")).unwrap();
+
+        let got = shared_excerpt_for(dir.path());
+
+        assert_eq!(got, tail, "must keep only the last ~200 chars, dropping the older head");
+        assert_eq!(got.len(), 200);
+    }
+
+    /// A `shared.md` "file" that's actually a directory makes
+    /// `std::fs::read_to_string` fail with something other than
+    /// `NotFound` — the genuine read-failure branch, which renders the
+    /// literal `"(unavailable)"` rather than the empty string.
+    #[test]
+    fn shared_excerpt_for_unreadable_path_is_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = shared_ctx::shared_md_path(dir.path());
+        std::fs::create_dir_all(&path).expect("create a directory AT the shared.md path");
+
+        assert_eq!(shared_excerpt_for(dir.path()), "(unavailable)");
+    }
+
     // ---- Task 3 (editor-orchestrator): status.md generation, README
     // auto-brief, and the F2 status view ----
     //
@@ -4826,9 +4935,13 @@ mod tests {
         let text = std::fs::read_to_string(shared_ctx::status_md_path(&orch_dir)).expect("status.md written");
         assert!(text.contains("## real0"), "{text}");
         assert!(
-            text.contains(&format!("real0/builder — working — cwd {}", real_dir.path().display())),
+            text.contains(&format!(
+                "real0/builder — working — cwd {} — 0 subagents — last active ",
+                real_dir.path().display()
+            )),
             "{text}"
         );
+        assert!(text.contains("shared.md: (empty)"), "no shared.md was ever written for real0: {text}");
         assert!(!text.contains("## orchestrator"), "the orchestrator's own workspace must be excluded: {text}");
         assert!(!text.contains("orchestrator/orchestrator"), "{text}");
         assert!(!text.contains("real0/shell"), "a shell tab must never appear in status.md: {text}");
@@ -4879,6 +4992,70 @@ mod tests {
         assert!(after.contains("idle"), "{after}");
 
         exit_and_drain(&mut app.workspaces[1].tabs[0].term);
+        let _ = std::fs::remove_dir_all(&orch_dir);
+    }
+
+    /// Task 2 (richer live status): `refresh_orchestrator_status` must
+    /// report a non-zero subagent count derived from `tab.children` (only
+    /// the still-running ones, i.e. `done_at.is_none()`), a `last active
+    /// HH:MM:SS` line, and the workspace's `shared.md` excerpt (truncated to
+    /// its last ~200 chars, flattened, trimmed) — the three new fields this
+    /// task adds on top of Task 3's baseline status.md.
+    #[test]
+    fn refresh_orchestrator_status_includes_subagent_count_last_active_and_shared_excerpt() {
+        let _guard = lock_orchestrator_dir();
+        let orch_dir = shared_ctx::orchestrator_dir();
+        let _ = std::fs::remove_dir_all(&orch_dir);
+        let ctx = eframe::egui::Context::default();
+        let base = tempfile::tempdir().expect("tempdir");
+        let real_dir = tempfile::tempdir().expect("tempdir");
+
+        // A shared.md long enough that only its TAIL should show up.
+        let head = "x".repeat(50);
+        let tail: String = (0..200).map(|i| char::from(b'A' + (i % 26) as u8)).collect();
+        let shared_path = shared_ctx::shared_md_path(real_dir.path());
+        std::fs::create_dir_all(shared_path.parent().unwrap()).unwrap();
+        std::fs::write(&shared_path, format!("{head}{tail}")).unwrap();
+
+        let mut orch_ws = ws_with_name(orch_dir.clone(), "orchestrator");
+        orch_ws.meta.is_orchestrator = true;
+
+        let mut real_ws = ws_with_name(real_dir.path().to_path_buf(), "real0");
+        let mut builder = agent_tab(&ctx, 90_650, real_dir.path(), "builder", AgentStatus::Working);
+        builder.children.push(term::SubTab {
+            desc: "finished task".into(),
+            started: std::time::Instant::now(),
+            done_at: Some(std::time::Instant::now()),
+        });
+        builder.children.push(term::SubTab {
+            desc: "still running".into(),
+            started: std::time::Instant::now(),
+            done_at: None,
+        });
+        real_ws.tabs.push(builder);
+
+        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![orch_ws, real_ws], 0);
+
+        app.refresh_orchestrator_status();
+
+        let text = std::fs::read_to_string(shared_ctx::status_md_path(&orch_dir)).expect("status.md written");
+        assert!(
+            text.contains("1 subagents"),
+            "only the still-running child (done_at: None) must count: {text}"
+        );
+        assert!(text.contains(&format!("shared.md: {tail}")), "{text}");
+
+        let marker = "last active ";
+        let idx = text.find(marker).expect("a last active field must be present");
+        let hms = &text[idx + marker.len()..idx + marker.len() + 8];
+        assert_eq!(hms.as_bytes()[2], b':', "expected HH:MM:SS, got {hms}");
+        assert_eq!(hms.as_bytes()[5], b':', "expected HH:MM:SS, got {hms}");
+
+        for ws in app.workspaces.iter_mut() {
+            for tab in ws.tabs.iter_mut() {
+                exit_and_drain(&mut tab.term);
+            }
+        }
         let _ = std::fs::remove_dir_all(&orch_dir);
     }
 

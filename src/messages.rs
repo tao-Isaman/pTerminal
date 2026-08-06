@@ -139,9 +139,12 @@ pub fn status_str(s: AgentStatus) -> &'static str {
 }
 
 /// One workspace's row group in the orchestrator's `status.md` (Task 3,
-/// editor-orchestrator): its display name, its checkout root, and every
-/// live AGENT tab it has as `(title, status_str-wire status, cwd)` triples.
-/// Building this is entirely the CALLER's job
+/// editor-orchestrator; widened by Task 2, richer live status): its display
+/// name, its checkout root, a short excerpt of its `shared.md` (already
+/// prepared by the caller — see [`orchestrator_status`]'s docs for exactly
+/// how empty/unreadable are told apart), and every live AGENT tab it has as
+/// `(title, status_str-wire status, cwd, subagent_count, last_active
+/// HH:MM:SS)` tuples. Building this is entirely the CALLER's job
 /// (`PtApp::refresh_orchestrator_status`): it must already have filtered
 /// out shell/editor tabs (only agent tabs belong in `agents`) and must
 /// never construct one of these for the orchestrator's own workspace
@@ -150,18 +153,36 @@ pub fn status_str(s: AgentStatus) -> &'static str {
 pub struct WsStatus {
     pub name: String,
     pub repo_path: PathBuf,
-    pub agents: Vec<(String, String, PathBuf)>,
+    pub agents: Vec<(String, String, PathBuf, usize, String)>,
+    /// The last ~200 chars of this workspace's `shared.md`, newlines
+    /// flattened to spaces and trimmed — already prepared by the caller
+    /// (`app::shared_excerpt_for`). Empty string (absent or empty file)
+    /// renders as `(empty)`; the caller uses the literal `"(unavailable)"`
+    /// for a read failure that isn't "file doesn't exist", which passes
+    /// through unchanged since it's already non-empty.
+    pub shared_excerpt: String,
 }
 
 /// Formats the orchestrator's `status.md` body from `entries`: one
 /// `## <name>  (<path>)` header per workspace, in `entries`' order,
-/// followed by one `- <name>/<title> — <status> — cwd <cwd>` line per agent
-/// tab in that workspace (in `agents`' order). A workspace with an empty
-/// `agents` list still gets its header, just no bullet lines under it — no
-/// synthetic "no agents" placeholder line. `entries` itself being empty
-/// (no other workspace open yet) yields a short human-readable placeholder
-/// string instead of `""`, so the F2 panel / status.md file always has
-/// something legible to show rather than going blank.
+/// followed immediately by a `shared.md: <excerpt>` line (`ws.shared_excerpt`
+/// verbatim, or the placeholder `(empty)` when it's the empty string), then
+/// one `- <name>/<title> — <status> — cwd <cwd> — <N> subagents — last
+/// active <hms>` line per agent tab in that workspace (in `agents`' order).
+/// A workspace with an empty `agents` list still gets its header and
+/// `shared.md:` line, just no bullet lines under it — no synthetic "no
+/// agents" placeholder line. `entries` itself being empty (no other
+/// workspace open yet) yields a short human-readable placeholder string
+/// instead of `""`, so the F2 panel / status.md file always has something
+/// legible to show rather than going blank.
+///
+/// **Churn guard (Task 2's headline risk).** This function is pure: the
+/// same `entries` always produce byte-identical output. The caller
+/// (`PtApp::refresh_orchestrator_status`) only bumps a tab's `last_active`
+/// on a real status change and only recomputes `shared_excerpt` from
+/// `shared.md`'s current contents, so between real events every input here
+/// is unchanged — which is what lets that caller's own change-detect skip
+/// rewriting `status.md` every frame.
 pub fn orchestrator_status(entries: &[WsStatus]) -> String {
     if entries.is_empty() {
         return "# Orchestrator status\n\n(no workspaces yet)\n".to_string();
@@ -169,12 +190,39 @@ pub fn orchestrator_status(entries: &[WsStatus]) -> String {
     let mut out = String::from("# Orchestrator status\n\n");
     for ws in entries {
         out.push_str(&format!("## {}  ({})\n\n", ws.name, ws.repo_path.display()));
-        for (title, status, cwd) in &ws.agents {
-            out.push_str(&format!("- {}/{} — {} — cwd {}\n", ws.name, title, status, cwd.display()));
+        let excerpt = if ws.shared_excerpt.is_empty() { "(empty)" } else { ws.shared_excerpt.as_str() };
+        out.push_str(&format!("shared.md: {excerpt}\n\n"));
+        for (title, status, cwd, subagent_count, last_active) in &ws.agents {
+            out.push_str(&format!(
+                "- {}/{} — {} — cwd {} — {} subagents — last active {}\n",
+                ws.name,
+                title,
+                status,
+                cwd.display(),
+                subagent_count,
+                last_active,
+            ));
         }
         out.push('\n');
     }
     out
+}
+
+/// UTC `HH:MM:SS` for `t`, wrapping at 24h (`% 86400`) — used to render
+/// [`crate::term::Tab::last_activity`] into status.md's `last active <hms>`
+/// field. `t` before `UNIX_EPOCH` (an `Err` from `duration_since`) renders
+/// the dashed placeholder `"--:--:--"` rather than panicking; in practice
+/// this can't happen for a real `SystemTime::now()` capture, but a pure
+/// function over an arbitrary `SystemTime` input has to account for it
+/// anyway.
+pub fn fmt_hms(t: std::time::SystemTime) -> String {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => {
+            let s = d.as_secs() % 86400;
+            format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+        }
+        Err(_) => "--:--:--".to_string(),
+    }
 }
 
 /// One workspace's resolvable data for [`resolve_target`] (Task 4:
@@ -916,24 +964,29 @@ mod tests {
         assert_eq!(status_str(AgentStatus::Unknown), "unknown");
     }
 
-    /// Task 3 (editor-orchestrator): two workspaces, each with agent tabs —
-    /// exact markdown, byte for byte, so any accidental whitespace/ordering
-    /// drift is caught immediately.
+    /// Task 3 (editor-orchestrator), widened for Task 2 (richer live status):
+    /// two workspaces, each with agent tabs — exact markdown, byte for byte,
+    /// so any accidental whitespace/ordering drift is caught immediately.
+    /// Also exercises the empty-`shared_excerpt` → `(empty)` placeholder
+    /// (bravo) alongside a non-empty one (alpha), in the one exact-markdown
+    /// test, since both are the same code path with different inputs.
     #[test]
     fn orchestrator_status_two_workspaces_with_agents_exact_markdown() {
         let entries = vec![
             WsStatus {
                 name: "alpha".into(),
                 repo_path: PathBuf::from("C:\\wt\\alpha"),
+                shared_excerpt: "note: alpha context".into(),
                 agents: vec![
-                    ("builder".into(), "working".into(), PathBuf::from("C:\\wt\\alpha")),
-                    ("reviewer".into(), "idle".into(), PathBuf::from("C:\\wt\\alpha-wt2")),
+                    ("builder".into(), "working".into(), PathBuf::from("C:\\wt\\alpha"), 2, "01:02:03".into()),
+                    ("reviewer".into(), "idle".into(), PathBuf::from("C:\\wt\\alpha-wt2"), 0, "04:05:06".into()),
                 ],
             },
             WsStatus {
                 name: "bravo".into(),
                 repo_path: PathBuf::from("C:\\wt\\bravo"),
-                agents: vec![("solo".into(), "needs_you".into(), PathBuf::from("C:\\wt\\bravo"))],
+                shared_excerpt: "".into(),
+                agents: vec![("solo".into(), "needs_you".into(), PathBuf::from("C:\\wt\\bravo"), 1, "07:08:09".into())],
             },
         ];
 
@@ -941,27 +994,32 @@ mod tests {
 
         let expected = "# Orchestrator status\n\n\
             ## alpha  (C:\\wt\\alpha)\n\n\
-            - alpha/builder — working — cwd C:\\wt\\alpha\n\
-            - alpha/reviewer — idle — cwd C:\\wt\\alpha-wt2\n\n\
+            shared.md: note: alpha context\n\n\
+            - alpha/builder — working — cwd C:\\wt\\alpha — 2 subagents — last active 01:02:03\n\
+            - alpha/reviewer — idle — cwd C:\\wt\\alpha-wt2 — 0 subagents — last active 04:05:06\n\n\
             ## bravo  (C:\\wt\\bravo)\n\n\
-            - bravo/solo — needs_you — cwd C:\\wt\\bravo\n\n";
+            shared.md: (empty)\n\n\
+            - bravo/solo — needs_you — cwd C:\\wt\\bravo — 1 subagents — last active 07:08:09\n\n";
         assert_eq!(text, expected);
     }
 
     /// A workspace with no agent tabs (only shell/editor "tabs", already
     /// filtered out by the caller before this struct is even built) still
-    /// gets its header line, but contributes zero `- ` bullet lines.
+    /// gets its header line and its `shared.md:` line, but contributes zero
+    /// `- ` bullet lines.
     #[test]
     fn orchestrator_status_workspace_with_no_agent_tabs_has_header_and_no_agent_lines() {
         let entries = vec![WsStatus {
             name: "empty-ws".into(),
             repo_path: PathBuf::from("C:\\wt\\empty-ws"),
+            shared_excerpt: "".into(),
             agents: vec![],
         }];
 
         let text = orchestrator_status(&entries);
 
         assert!(text.contains("## empty-ws  (C:\\wt\\empty-ws)"), "{text}");
+        assert!(text.contains("shared.md: (empty)"), "{text}");
         assert!(
             !text.contains(" — "),
             "a workspace with no agent tabs must contribute no agent bullet line: {text}"
@@ -975,5 +1033,62 @@ mod tests {
         let text = orchestrator_status(&[]);
         assert!(!text.is_empty(), "empty input must still yield something legible, not an empty string");
         assert!(text.to_lowercase().contains("no workspaces"), "{text}");
+    }
+
+    /// Churn guard (Task 2's headline risk): calling `orchestrator_status`
+    /// twice with structurally-identical inputs — including identical
+    /// `last_active` strings, since those come from `messages::fmt_hms`
+    /// applied to a tab's `last_activity`, which the caller only bumps on a
+    /// real status change — must yield byte-identical output both times.
+    /// This is what lets `PtApp::refresh_orchestrator_status`'s
+    /// change-detect (`orchestrator_status_written`) skip the file rewrite
+    /// while nothing has actually changed.
+    #[test]
+    fn orchestrator_status_same_inputs_produce_identical_string() {
+        let build = || {
+            vec![WsStatus {
+                name: "alpha".into(),
+                repo_path: PathBuf::from("C:\\wt\\alpha"),
+                shared_excerpt: "steady state".into(),
+                agents: vec![("builder".into(), "working".into(), PathBuf::from("C:\\wt\\alpha"), 1, "01:02:03".into())],
+            }]
+        };
+
+        let a = orchestrator_status(&build());
+        let b = orchestrator_status(&build());
+
+        assert_eq!(a, b, "identical inputs must produce byte-identical output — no per-call churn");
+    }
+
+    // ---- fmt_hms (Task 2: richer live status) ----
+    //
+    // Pure UTC HH:MM:SS formatting off a fixed `SystemTime`, used to render
+    // `Tab::last_activity` into the `last active <hms>` status.md field.
+
+    #[test]
+    fn fmt_hms_epoch_is_00_00_00() {
+        assert_eq!(fmt_hms(std::time::UNIX_EPOCH), "00:00:00");
+    }
+
+    #[test]
+    fn fmt_hms_epoch_plus_3661_secs_is_01_01_01() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(3661);
+        assert_eq!(fmt_hms(t), "01:01:01");
+    }
+
+    /// 90_000s past the epoch is 1 day + 3600s — the day component must be
+    /// dropped via `% 86400`, not overflow into a >24 hour string.
+    #[test]
+    fn fmt_hms_wraps_past_24_hours_via_mod_86400() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(90_000);
+        assert_eq!(fmt_hms(t), "01:00:00");
+    }
+
+    /// A `SystemTime` before `UNIX_EPOCH` makes `duration_since` return
+    /// `Err` — must render the dashed placeholder, never panic.
+    #[test]
+    fn fmt_hms_pre_epoch_is_dashes() {
+        let t = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert_eq!(fmt_hms(t), "--:--:--");
     }
 }

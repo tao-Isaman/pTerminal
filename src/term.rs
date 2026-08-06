@@ -281,6 +281,17 @@ pub struct Tab {
     /// been consumed for `children` bookkeeping — the drain loop only looks
     /// at `records[events_seen..]` each frame.
     pub events_seen: usize,
+    /// Wall-clock time of this tab's last STATUS CHANGE (Task 2: richer live
+    /// status) — set at construction (every spawn constructor and
+    /// [`Tab::respawn`]) and thereafter only advanced by
+    /// [`next_status_and_activity`] when a freshly parsed status actually
+    /// differs from the prior one. Rendered into the orchestrator's
+    /// `status.md` via `messages::fmt_hms`. Deliberately NOT bumped on every
+    /// poll/frame — that's the whole point: it answers "when did this tab's
+    /// status last change", not "when did we last look at it", which is
+    /// what keeps status.md stable (no per-second churn) while a tab sits
+    /// idle.
+    pub last_activity: std::time::SystemTime,
 }
 
 /// Builds the `cmd /c claude ...` argv for an agent tab: a fresh prompt-driven
@@ -429,6 +440,7 @@ pub fn spawn_agent(
             dead_reason: None,
             children: vec![],
             events_seen: 0,
+            last_activity: std::time::SystemTime::now(),
         })
     })();
 
@@ -480,6 +492,7 @@ pub fn spawn_shell(
         dead_reason: None,
         children: vec![],
         events_seen: 0,
+        last_activity: std::time::SystemTime::now(),
     })
 }
 
@@ -548,6 +561,7 @@ pub fn spawn_dead_tab(
         dead_reason: Some(reason),
         children: vec![],
         events_seen: 0,
+        last_activity: std::time::SystemTime::now(),
     })
 }
 
@@ -671,7 +685,39 @@ impl Tab {
         self.dead_reason = None;
         self.children = vec![];
         self.events_seen = 0;
+        self.last_activity = std::time::SystemTime::now();
         Ok(())
+    }
+}
+
+/// Decides the `(status, last_activity)` pair to store back onto a tab,
+/// given its PRIOR `(status, last_activity)` and a freshly parsed `status`
+/// (Task 2: richer live status). Called from `PtApp::drain_events` right
+/// where a tab's status used to be assigned unconditionally
+/// (`if tab.status != AgentStatus::Exited { tab.status = status; }`) —
+/// this preserves that exact guard (an exited tab's status, and now its
+/// `last_activity` too, never changes again) and layers one rule on top:
+/// `last_activity` only advances to `now` when `status` actually DIFFERS
+/// from `prior_status`. An unchanged status leaves `last_activity` exactly
+/// where it was — this is what keeps the orchestrator's `status.md` (whose
+/// `last active HH:MM:SS` line is `messages::fmt_hms(tab.last_activity)`)
+/// byte-identical between polls while nothing has actually changed, instead
+/// of rewriting the file (with a fresh "now") on every single poll. Pure
+/// and `Tab`-free, same reasoning as [`apply_subagent_events`]'s
+/// extraction: testable without a live app, egui context, or ConPTY child.
+pub fn next_status_and_activity(
+    prior_status: AgentStatus,
+    prior_last_activity: std::time::SystemTime,
+    status: AgentStatus,
+    now: std::time::SystemTime,
+) -> (AgentStatus, std::time::SystemTime) {
+    if prior_status == AgentStatus::Exited {
+        return (prior_status, prior_last_activity);
+    }
+    if status != prior_status {
+        (status, now)
+    } else {
+        (status, prior_last_activity)
     }
 }
 
@@ -852,6 +898,7 @@ mod tests {
     #[test]
     fn dead_tab_exits_1_and_carries_saved_fields() {
         let ctx = eframe::egui::Context::default();
+        let before = std::time::SystemTime::now();
         let missing = PathBuf::from("D:\\pterminal-test-missing-dir-does-not-exist");
         let wt = WorktreeInfo { path: PathBuf::from("D:\\wt\\x"), branch: "pt/x".into() };
         let saved = crate::state::SavedTab {
@@ -879,6 +926,7 @@ mod tests {
         assert_eq!(tab.session_id, Some("sess-1".to_string()));
         assert!(tab.dead_reason.as_deref().unwrap().starts_with("saved directory missing"));
         assert!(tab.children.is_empty());
+        assert!(tab.last_activity >= before, "a dead placeholder still stamps last_activity at construction time");
 
         assert!(
             wait_for(|| {
@@ -1037,6 +1085,99 @@ mod tests {
             now,
         );
         assert!(children.is_empty());
+    }
+
+    // --- Task 2: richer live status — Tab::last_activity ---------------------
+
+    /// Every real spawn constructor stamps `last_activity` at construction
+    /// time — seeds `messages::fmt_hms(tab.last_activity)` with a sane value
+    /// before any status change has ever been observed, instead of leaving
+    /// it at some zero/default time.
+    #[test]
+    fn spawn_shell_sets_last_activity_to_now() {
+        let ctx = eframe::egui::Context::default();
+        let before = std::time::SystemTime::now();
+
+        let mut tab = spawn_shell(&ctx, 90_800, Path::new("C:\\")).expect("spawn shell");
+
+        assert!(tab.last_activity >= before, "last_activity must be stamped at construction time, not left at a default");
+        assert!(
+            tab.last_activity.duration_since(before).expect("must not be before `before`") < Duration::from_secs(5),
+            "last_activity must be close to spawn time"
+        );
+
+        tab.term.write_input("exit\r");
+        assert!(wait_for(|| { tab.term.poll(); tab.term.exited().is_some() }), "shell never exited");
+    }
+
+    /// `respawn` resets `last_activity` to "now" along with every other
+    /// spawn-time bookkeeping field (`root_pids`, `spawned_at`,
+    /// `session_id`, ...) — a stale `last_activity` surviving a restart
+    /// would make status.md's `last active <hms>` line describe the DEAD
+    /// child's last status change forever, never the fresh one's.
+    #[test]
+    fn respawn_resets_last_activity_to_now() {
+        let ctx = eframe::egui::Context::default();
+        let mut tab = spawn_shell(&ctx, 90_801, Path::new("C:\\")).expect("spawn shell");
+        tab.last_activity = std::time::UNIX_EPOCH; // sentinel: far in the past
+        let before = std::time::SystemTime::now();
+
+        tab.respawn(&ctx).expect("respawn");
+
+        assert!(tab.last_activity >= before, "respawn must overwrite the stale sentinel with something close to now");
+
+        tab.term.write_input("exit\r");
+        assert!(wait_for(|| { tab.term.poll(); tab.term.exited().is_some() }), "shell never exited after respawn");
+    }
+
+    // --- Task 2: richer live status — next_status_and_activity ---------------
+    //
+    // Pure and Tab-free (same reasoning as `apply_subagent_events`'s
+    // extraction above): the "when does `last_activity` advance" rule is the
+    // headline churn risk called out in the task brief, so it gets its own
+    // dedicated, deterministic coverage rather than only being reachable
+    // through a live app + real ConPTY child + filesystem watcher.
+
+    const T0: std::time::SystemTime = std::time::UNIX_EPOCH;
+
+    /// A freshly parsed status equal to the prior one must leave
+    /// `last_activity` untouched — this is what keeps status.md's `last
+    /// active HH:MM:SS` (and therefore the whole file) byte-identical while
+    /// an agent's status hasn't actually changed.
+    #[test]
+    fn next_status_and_activity_unchanged_status_keeps_prior_last_activity() {
+        let now = T0 + Duration::from_secs(999);
+        let (status, last_activity) =
+            next_status_and_activity(AgentStatus::Working, T0, AgentStatus::Working, now);
+
+        assert_eq!(status, AgentStatus::Working);
+        assert_eq!(last_activity, T0, "unchanged status must not bump last_activity to `now`");
+    }
+
+    /// A freshly parsed status that DIFFERS from the prior one advances
+    /// `last_activity` to `now`.
+    #[test]
+    fn next_status_and_activity_changed_status_bumps_last_activity_to_now() {
+        let now = T0 + Duration::from_secs(999);
+        let (status, last_activity) =
+            next_status_and_activity(AgentStatus::Working, T0, AgentStatus::NeedsYou, now);
+
+        assert_eq!(status, AgentStatus::NeedsYou);
+        assert_eq!(last_activity, now, "a real status change must bump last_activity to `now`");
+    }
+
+    /// `Exited` is terminal: once a tab's prior status is `Exited`, neither
+    /// `status` nor `last_activity` may change again, regardless of what a
+    /// lingering/late hook-event read parses — mirrors the pre-existing `if
+    /// tab.status != AgentStatus::Exited` guard this function replaces.
+    #[test]
+    fn next_status_and_activity_exited_is_terminal_and_never_updates() {
+        let now = T0 + Duration::from_secs(999);
+        let (status, last_activity) =
+            next_status_and_activity(AgentStatus::Exited, T0, AgentStatus::Working, now);
+
+        assert_eq!(status, AgentStatus::Exited, "an exited tab's status must never be resurrected");
+        assert_eq!(last_activity, T0, "an exited tab's last_activity must never move either");
     }
 
     #[test]
