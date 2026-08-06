@@ -171,14 +171,24 @@ other workspace's agents on your behalf.
   reopening pTerminal doesn't lose the orchestrator's context, and there is
   always exactly one Orchestrator, never a duplicate.
 - **`status.md`** — pTerminal continuously maintains a live status report at
-  `%APPDATA%\pterminal\orchestrator\status.md`: one `## <workspace name>`
-  section per real workspace (the orchestrator's own entry excluded), each
-  listing its running agent tabs as `- <workspace>/<agent> — <status> — cwd
-  <path>`. It's regenerated whenever an agent's status changes and only
-  rewritten on disk when the content actually differs. Pressing **F2** while
-  the Orchestrator is the active workspace shows this file instead of the
-  usual `shared.md` — read-only (no save button; there's nothing to edit,
-  only to read), and it live-reloads the same way `shared.md` does elsewhere.
+  `%APPDATA%\pterminal\orchestrator\status.md`: one `## <workspace name>
+  (<path>)` section per real workspace (the orchestrator's own entry
+  excluded), immediately followed by a `shared.md: <excerpt>` line — the last
+  ~200 characters of that workspace's `shared.md`, newlines flattened to a
+  single line (`shared.md: (empty)` if there's no `shared.md` yet or it's
+  blank, `shared.md: (unavailable)` if it exists but couldn't be read) —
+  then one line per running agent tab: `- <workspace>/<title> — <status> —
+  cwd <cwd> — <N> subagents — last active HH:MM:SS`. `<N> subagents` is that
+  agent's currently-running Task-tool subagent count (back to `0` once they
+  finish); `last active` is an absolute UTC time that only advances when the
+  agent's status actually changes, so `status.md` does **not** churn — no
+  rewritten timestamp, no new file-modified event — while an agent just sits
+  idle. The whole file is regenerated whenever any agent's status changes
+  and only rewritten on disk when the content actually differs. Pressing
+  **F2** while the Orchestrator is the active workspace shows this file
+  instead of the usual `shared.md` — read-only (no save button; there's
+  nothing to edit, only to read), and it live-reloads the same way
+  `shared.md` does elsewhere.
 - **Addressing** — the orchestrator talks to workspace agents the same way
   agents talk to each other (see Messaging above), just with one extra
   addressing form: appending a line to its own `messages.jsonl` with
@@ -188,11 +198,33 @@ other workspace's agents on your behalf.
   message back by addressing the reserved name `"orchestrator"` — no
   workspace prefix needed, since there's only ever one — and it's typed
   straight into the orchestrator's own terminal.
+- **Broadcast addressing** — a message's `"to"` can also name more than one
+  agent at once. A broadcast is typed into each matching target's terminal
+  as `[broadcast from <from>] <text>` (instead of direct delivery's
+  `[message from <from>] <text>`), so it's always visually distinguishable
+  from a one-to-one message:
+  - `"to":"all"` appended to the **orchestrator's own** `messages.jsonl`
+    reaches every agent tab in every real workspace.
+  - `"to":"all"` appended to a **workspace agent's own** `messages.jsonl`
+    reaches only that agent's own workspace peers — never the sending agent
+    itself (no self-echo), and never another workspace.
+  - `"to":"<workspace>/*"` reaches every agent tab in that one workspace.
+    The orchestrator can target any real workspace this way; a workspace
+    agent can only target its **own** workspace by name
+    (`<own-workspace>/*`) — naming any other workspace is refused, the same
+    as addressing an agent that doesn't exist.
+  - A broadcast that matches zero agents (bare `all` in a workspace with no
+    peers, or `<ws>/*` naming an empty or unknown workspace) isn't silently
+    dropped either — it surfaces once as `'<to>' (no matching agents)` via
+    the same error banner as other undeliverable messages.
+  - `"all"` is reserved the same way `"orchestrator"` is: neither can ever
+    be used as a real agent tab's title, so a broadcast target never
+    collides with a genuine agent name.
 - **Errors, not silence** — addressing a workspace/agent pair that doesn't
   exist, a bare agent name that matches more than one running agent
-  (ambiguous), or the orchestrator trying to message itself, is never
-  silently dropped: it surfaces once via the same error banner other
-  undeliverable messages use.
+  (ambiguous), a broadcast that matches nobody, or the orchestrator trying
+  to message itself, is never silently dropped: it surfaces once via the
+  same error banner other undeliverable messages use.
 - **The full loop** — you prompt the orchestrator in its own tab → it
   addresses one or more workspace agents by `<workspace>/<agent>` → each
   agent works and, when done, replies back to `"orchestrator"` → you read the
