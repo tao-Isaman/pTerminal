@@ -321,8 +321,14 @@ pub fn agent_args(prompt: &str, resume: Option<&str>) -> Vec<String> {
 /// through this function, and `messages::resolve_target` treats that literal
 /// string as unconditionally special — a real agent tab titled it would be
 /// unreachable by its own name and would shadow the orchestrator.
+///
+/// **`"all"` is reserved too (Task 1: broadcast routing)** — same
+/// always-taken treatment, since `messages::resolve_target` treats `to ==
+/// "all"` as a broadcast address, not a literal agent name. A real agent
+/// titled `"all"` would be unreachable by its own name and would silently
+/// swallow every `to: "all"` broadcast intended for the whole roster.
 pub fn unique_title(base: &str, taken: &[String]) -> String {
-    if base != "orchestrator" && !taken.iter().any(|t| t == base) {
+    if base != "orchestrator" && base != "all" && !taken.iter().any(|t| t == base) {
         return base.to_string();
     }
     let mut n = 2;
@@ -1068,6 +1074,22 @@ mod tests {
     fn unique_title_reserves_orchestrator_and_still_skips_taken_dash_2() {
         let taken = vec!["orchestrator-2".to_string()];
         assert_eq!(unique_title("orchestrator", &taken), "orchestrator-3");
+    }
+
+    /// Task 1 (broadcast routing): `"all"` is a second reserved name — it
+    /// now addresses "every agent" via `resolve_target`'s `Broadcast`
+    /// handling, so a normal agent slug that happens to BE `"all"` must
+    /// never collide with (or be mistaken for) that reserved meaning, the
+    /// same way `"orchestrator"` is reserved above.
+    #[test]
+    fn unique_title_reserves_all_even_when_not_in_taken() {
+        assert_eq!(unique_title("all", &[]), "all-2");
+    }
+
+    #[test]
+    fn unique_title_reserves_all_and_still_skips_taken_dash_2() {
+        let taken = vec!["all-2".to_string()];
+        assert_eq!(unique_title("all", &taken), "all-3");
     }
 
     #[test]

@@ -192,8 +192,22 @@ pub struct WsAgents<'a> {
     pub agents: &'a [(usize, &'a str, bool)],
 }
 
+/// Who is asking [`resolve_target`] to route a message — reach differs by
+/// who's asking (Task 1: broadcast routing). The orchestrator can reach any
+/// real workspace; a plain agent can only reach its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sender {
+    /// The orchestrator's own outbox.
+    Orchestrator,
+    /// A real workspace agent's own outbox: `index` is that workspace's
+    /// `ws_index` (used to scope `all`/`<ws>/*`/bare-name lookups to just
+    /// this workspace), `from` is the sending agent's own tab title (used to
+    /// exclude it from a bare `all` broadcast — no self-echo).
+    Workspace { index: usize, from: String },
+}
+
 /// Where a message's `to` field routes, per [`resolve_target`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetResolution {
     /// A specific, unambiguous, non-exited agent tab.
     Deliver { ws_index: usize, tab_index: usize },
@@ -206,64 +220,177 @@ pub enum TargetResolution {
     /// across the real (non-orchestrator) workspaces.
     Ambiguous,
     /// No live match: `"<ws>/<agent>"` named a workspace or agent that
-    /// doesn't exist (or is exited), or a bare name matched no one.
+    /// doesn't exist (or is exited), a bare name matched no one, or a
+    /// broadcast target (`all` / `<ws>/*`) was denied outright by the
+    /// sender's reach (cross-workspace `<ws>/*` from a plain agent).
     Unknown,
+    /// `to == "all"` or `to == "<ws>/*"`: every non-exited agent tab that
+    /// matched, as `(ws_index, tab_index)` pairs — possibly empty (Task 1:
+    /// an empty vec is the caller's cue for one informational "no matching
+    /// agents" line, deliberately NOT [`TargetResolution::Unknown`], since a
+    /// broadcast that matched zero agents is still a broadcast that
+    /// happened, just to nobody).
+    Broadcast(Vec<(usize, usize)>),
 }
 
-/// Resolves an orchestrator outbound message's `to` field against
-/// `workspaces`. Never resolves to `orch_index`'s own tabs, even when that
-/// workspace is present in `workspaces` — see
+/// Resolves a message's `to` field against `workspaces`, from `sender`'s
+/// point of view. Never resolves to `orch_index`'s own tabs when `sender` is
+/// [`Sender::Orchestrator`], even when that workspace is present in
+/// `workspaces` — see
 /// `resolve_target_never_returns_the_orchestrators_own_tab_via_bare_name`/
-/// `..._via_slash_addressing` below.
+/// `..._via_slash_addressing` below. `orch_index` is meaningless to a
+/// [`Sender::Workspace`] lookup (which only ever looks at its own
+/// workspace), so callers routing a real workspace's own outbox may pass any
+/// sentinel that isn't a real workspace's own index.
 ///
 /// - `to == "orchestrator"` → [`TargetResolution::Orchestrator`],
-///   unconditionally and checked first. Safe to check before anything else
-///   because no REAL agent tab can ever be titled `"orchestrator"` —
-///   `term::unique_title` reserves that literal string (Task 4) — so this
-///   can never shadow a genuine agent.
-/// - `"<ws>/<agent>"` → the non-exited agent tab titled `<agent>` in the
-///   (non-`orch_index`) workspace named `<ws>`; [`TargetResolution::Unknown`]
-///   if no such workspace exists (excluding `orch_index`), or it exists but
-///   has no matching non-exited agent.
-/// - a bare `"<agent>"` → the unique non-exited agent tab titled `<agent>`
-///   across every (non-`orch_index`) workspace: exactly one match →
-///   [`TargetResolution::Deliver`], two or more → [`TargetResolution::Ambiguous`],
-///   zero → [`TargetResolution::Unknown`].
-pub fn resolve_target(to: &str, workspaces: &[WsAgents], orch_index: usize) -> TargetResolution {
+///   unconditionally and checked first, regardless of `sender`. Safe to
+///   check before anything else because no REAL agent tab can ever be
+///   titled `"orchestrator"` — `term::unique_title` reserves that literal
+///   string (Task 4) — so this can never shadow a genuine agent.
+/// - `to == "all"` (Task 1: broadcast routing):
+///   - [`Sender::Orchestrator`] → [`TargetResolution::Broadcast`] of every
+///     non-exited agent in every workspace except `orch_index`.
+///   - [`Sender::Workspace { index, from }`] → `Broadcast` of every
+///     non-exited agent in the workspace at `index`, EXCLUDING the tab
+///     titled `from` (no self-echo). Never reaches another workspace.
+/// - `to == "<ws>/*"` (Task 1):
+///   - [`Sender::Orchestrator`] → `Broadcast` of every non-exited agent in
+///     the (non-`orch_index`) workspace named `<ws>`; an unknown workspace
+///     yields an EMPTY `Broadcast`, not `Unknown` — a `/*` that named a
+///     real-but-empty or absent workspace is still a broadcast intent, so
+///     both cases collapse to the same "matched nobody" shape.
+///   - [`Sender::Workspace { index, .. }`] → allowed ONLY when `<ws>` is
+///     that sender's OWN workspace name; any other name (including a real,
+///     different workspace) is denied as [`TargetResolution::Unknown`]. When
+///     allowed, same as the orchestrator case for that one workspace — no
+///     self-exclusion here (unlike bare `all`), since the caller spelled out
+///     the workspace explicitly.
+/// - `"<ws>/<agent>"` (has a `/`, not a broadcast) → for
+///   [`Sender::Orchestrator`], unchanged: the non-exited agent tab titled
+///   `<agent>` in the (non-`orch_index`) workspace named `<ws>`,
+///   [`TargetResolution::Unknown`] if no such workspace or agent exists. For
+///   [`Sender::Workspace { index, .. }`], `<ws>` must equal that sender's own
+///   workspace name (any other name, including a real one, is `Unknown`) —
+///   single-target cross-workspace addressing stays denied for plain
+///   agents, unchanged from pre-Task-1 behavior.
+/// - a bare `"<agent>"` → for [`Sender::Orchestrator`], the unique
+///   non-exited agent tab titled `<agent>` across every (non-`orch_index`)
+///   workspace: exactly one match → [`TargetResolution::Deliver`], two or
+///   more → [`TargetResolution::Ambiguous`], zero → `Unknown`. For
+///   [`Sender::Workspace { index, .. }`], the non-exited agent titled
+///   `<agent>` in the sender's OWN workspace only — `Deliver` or `Unknown`;
+///   `Ambiguous` is impossible here since tab titles are unique per
+///   workspace (`term::unique_title`).
+pub fn resolve_target(to: &str, workspaces: &[WsAgents], orch_index: usize, sender: &Sender) -> TargetResolution {
     if to == "orchestrator" {
         return TargetResolution::Orchestrator;
     }
 
-    if let Some((ws_name, agent_name)) = to.split_once('/') {
-        let ws = workspaces.iter().find(|w| w.ws_index != orch_index && w.name == ws_name);
-        return match ws {
-            Some(w) => w
-                .agents
-                .iter()
-                .find(|&&(_, title, is_exited)| title == agent_name && !is_exited)
-                .map(|&(tab_index, _, _)| TargetResolution::Deliver { ws_index: w.ws_index, tab_index })
-                .unwrap_or(TargetResolution::Unknown),
-            None => TargetResolution::Unknown,
+    if to == "all" {
+        return match sender {
+            Sender::Orchestrator => {
+                let mut targets = Vec::new();
+                for w in workspaces {
+                    if w.ws_index == orch_index {
+                        continue;
+                    }
+                    for &(tab_index, _title, is_exited) in w.agents {
+                        if !is_exited {
+                            targets.push((w.ws_index, tab_index));
+                        }
+                    }
+                }
+                TargetResolution::Broadcast(targets)
+            }
+            Sender::Workspace { index, from } => {
+                let targets = workspaces
+                    .iter()
+                    .find(|w| w.ws_index == *index)
+                    .map(|w| {
+                        w.agents
+                            .iter()
+                            .filter(|&&(_, title, is_exited)| !is_exited && title != from.as_str())
+                            .map(|&(tab_index, _, _)| (w.ws_index, tab_index))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                TargetResolution::Broadcast(targets)
+            }
         };
     }
 
-    let mut found: Option<(usize, usize)> = None;
-    for w in workspaces {
-        if w.ws_index == orch_index {
-            continue;
-        }
-        for &(tab_index, title, is_exited) in w.agents {
-            if title == to && !is_exited {
-                if found.is_some() {
-                    return TargetResolution::Ambiguous;
+    if let Some(ws_name) = to.strip_suffix("/*") {
+        let broadcast_for = |w: &WsAgents| -> Vec<(usize, usize)> {
+            w.agents.iter().filter(|&&(_, _, is_exited)| !is_exited).map(|&(tab_index, _, _)| (w.ws_index, tab_index)).collect()
+        };
+        return match sender {
+            Sender::Orchestrator => {
+                let targets = workspaces
+                    .iter()
+                    .find(|w| w.ws_index != orch_index && w.name == ws_name)
+                    .map(broadcast_for)
+                    .unwrap_or_default();
+                TargetResolution::Broadcast(targets)
+            }
+            Sender::Workspace { index, .. } => match workspaces.iter().find(|w| w.ws_index == *index) {
+                Some(w) if w.name == ws_name => TargetResolution::Broadcast(broadcast_for(w)),
+                _ => TargetResolution::Unknown,
+            },
+        };
+    }
+
+    if let Some((ws_name, agent_name)) = to.split_once('/') {
+        let deliver_from = |w: &WsAgents| -> TargetResolution {
+            w.agents
+                .iter()
+                .find(|&&(_, title, is_exited)| title == agent_name && !is_exited)
+                .map(|&(tab_index, _, _)| TargetResolution::Deliver { ws_index: w.ws_index, tab_index })
+                .unwrap_or(TargetResolution::Unknown)
+        };
+        return match sender {
+            Sender::Orchestrator => workspaces
+                .iter()
+                .find(|w| w.ws_index != orch_index && w.name == ws_name)
+                .map(deliver_from)
+                .unwrap_or(TargetResolution::Unknown),
+            Sender::Workspace { index, .. } => match workspaces.iter().find(|w| w.ws_index == *index) {
+                Some(w) if w.name == ws_name => deliver_from(w),
+                _ => TargetResolution::Unknown,
+            },
+        };
+    }
+
+    match sender {
+        Sender::Orchestrator => {
+            let mut found: Option<(usize, usize)> = None;
+            for w in workspaces {
+                if w.ws_index == orch_index {
+                    continue;
                 }
-                found = Some((w.ws_index, tab_index));
+                for &(tab_index, title, is_exited) in w.agents {
+                    if title == to && !is_exited {
+                        if found.is_some() {
+                            return TargetResolution::Ambiguous;
+                        }
+                        found = Some((w.ws_index, tab_index));
+                    }
+                }
+            }
+            match found {
+                Some((ws_index, tab_index)) => TargetResolution::Deliver { ws_index, tab_index },
+                None => TargetResolution::Unknown,
             }
         }
-    }
-    match found {
-        Some((ws_index, tab_index)) => TargetResolution::Deliver { ws_index, tab_index },
-        None => TargetResolution::Unknown,
+        Sender::Workspace { index, .. } => match workspaces.iter().find(|w| w.ws_index == *index) {
+            Some(w) => w
+                .agents
+                .iter()
+                .find(|&&(_, title, is_exited)| title == to && !is_exited)
+                .map(|&(tab_index, _, _)| TargetResolution::Deliver { ws_index: w.ws_index, tab_index })
+                .unwrap_or(TargetResolution::Unknown),
+            None => TargetResolution::Unknown,
+        },
     }
 }
 
@@ -292,7 +419,7 @@ mod tests {
         let alpha_agents = [(0usize, "builder", false)];
         let workspaces = [ws(0, "alpha", &alpha_agents)];
 
-        let got = resolve_target("alpha/builder", &workspaces, 99);
+        let got = resolve_target("alpha/builder", &workspaces, 99, &Sender::Orchestrator);
 
         assert_eq!(got, TargetResolution::Deliver { ws_index: 0, tab_index: 0 });
     }
@@ -302,7 +429,7 @@ mod tests {
         let alpha_agents = [(0usize, "builder", false)];
         let workspaces = [ws(0, "alpha", &alpha_agents)];
 
-        let got = resolve_target("bravo/builder", &workspaces, 99);
+        let got = resolve_target("bravo/builder", &workspaces, 99, &Sender::Orchestrator);
 
         assert_eq!(got, TargetResolution::Unknown);
     }
@@ -312,7 +439,7 @@ mod tests {
         let alpha_agents = [(0usize, "builder", false)];
         let workspaces = [ws(0, "alpha", &alpha_agents)];
 
-        let got = resolve_target("alpha/reviewer", &workspaces, 99);
+        let got = resolve_target("alpha/reviewer", &workspaces, 99, &Sender::Orchestrator);
 
         assert_eq!(got, TargetResolution::Unknown);
     }
@@ -323,7 +450,7 @@ mod tests {
         let bravo_agents = [(0usize, "solo", false)];
         let workspaces = [ws(0, "alpha", &alpha_agents), ws(1, "bravo", &bravo_agents)];
 
-        let got = resolve_target("solo", &workspaces, 99);
+        let got = resolve_target("solo", &workspaces, 99, &Sender::Orchestrator);
 
         assert_eq!(got, TargetResolution::Deliver { ws_index: 1, tab_index: 0 });
     }
@@ -334,7 +461,7 @@ mod tests {
         let bravo_agents = [(0usize, "dup", false)];
         let workspaces = [ws(0, "alpha", &alpha_agents), ws(1, "bravo", &bravo_agents)];
 
-        let got = resolve_target("dup", &workspaces, 99);
+        let got = resolve_target("dup", &workspaces, 99, &Sender::Orchestrator);
 
         assert_eq!(got, TargetResolution::Ambiguous);
     }
@@ -344,7 +471,7 @@ mod tests {
         let alpha_agents = [(0usize, "orchestrator", false)]; // must never matter — checked first
         let workspaces = [ws(0, "alpha", &alpha_agents)];
 
-        let got = resolve_target("orchestrator", &workspaces, 99);
+        let got = resolve_target("orchestrator", &workspaces, 99, &Sender::Orchestrator);
 
         assert_eq!(got, TargetResolution::Orchestrator);
     }
@@ -354,7 +481,7 @@ mod tests {
         let alpha_agents = [(0usize, "gone", true)];
         let workspaces = [ws(0, "alpha", &alpha_agents)];
 
-        let got = resolve_target("alpha/gone", &workspaces, 99);
+        let got = resolve_target("alpha/gone", &workspaces, 99, &Sender::Orchestrator);
 
         assert_eq!(got, TargetResolution::Unknown, "an exited agent must never be a delivery target");
     }
@@ -365,7 +492,7 @@ mod tests {
         let bravo_agents = [(0usize, "dup", false)];
         let workspaces = [ws(0, "alpha", &alpha_agents), ws(1, "bravo", &bravo_agents)];
 
-        let got = resolve_target("dup", &workspaces, 99);
+        let got = resolve_target("dup", &workspaces, 99, &Sender::Orchestrator);
 
         assert_eq!(
             got,
@@ -384,7 +511,7 @@ mod tests {
         let alpha_agents = [(0usize, "builder", false)];
         let workspaces = [ws(0, "orchestrator", &orch_agents), ws(1, "alpha", &alpha_agents)];
 
-        let got = resolve_target("clone", &workspaces, 0);
+        let got = resolve_target("clone", &workspaces, 0, &Sender::Orchestrator);
 
         assert_eq!(got, TargetResolution::Unknown, "the orchestrator's own tab must never be a delivery target");
     }
@@ -397,7 +524,7 @@ mod tests {
         let orch_agents = [(0usize, "clone", false)];
         let workspaces = [ws(0, "orchestrator", &orch_agents)];
 
-        let got = resolve_target("orchestrator/clone", &workspaces, 0);
+        let got = resolve_target("orchestrator/clone", &workspaces, 0, &Sender::Orchestrator);
 
         assert_eq!(got, TargetResolution::Unknown);
     }
@@ -412,9 +539,192 @@ mod tests {
         let alpha_agents = [(0usize, "dup", false)];
         let workspaces = [ws(0, "orchestrator", &orch_agents), ws(1, "alpha", &alpha_agents)];
 
-        let got = resolve_target("dup", &workspaces, 0);
+        let got = resolve_target("dup", &workspaces, 0, &Sender::Orchestrator);
 
         assert_eq!(got, TargetResolution::Deliver { ws_index: 1, tab_index: 0 });
+    }
+
+    // ---- resolve_target: broadcast targets (Task 1: broadcast routing) ----
+    //
+    // `to == "all"` and `to == "<ws>/*"` now resolve to
+    // `TargetResolution::Broadcast(Vec<(ws_index, tab_index)>)` instead of a
+    // single `Deliver`, and reach depends on WHO is asking — the new
+    // `Sender` parameter distinguishes the orchestrator's outbox (reach:
+    // every real workspace) from a plain agent's own outbox (reach: its own
+    // workspace only, self-excluded on bare `all`). RED evidence for this
+    // block lives in the Task 1 report: at the time these were written,
+    // neither `Sender` nor `TargetResolution::Broadcast` existed, and
+    // `resolve_target` only took 3 arguments, so the crate failed to
+    // compile (`E0433`/`E0599`/`E0061`) until both were implemented below.
+
+    #[test]
+    fn resolve_target_all_from_orchestrator_broadcasts_every_non_exited_agent_in_every_real_workspace() {
+        let alpha_agents = [(0usize, "builder", false), (1usize, "gone", true)];
+        let bravo_agents = [(0usize, "solo", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents), ws(1, "bravo", &bravo_agents)];
+
+        let got = resolve_target("all", &workspaces, 99, &Sender::Orchestrator);
+
+        match got {
+            TargetResolution::Broadcast(mut targets) => {
+                targets.sort();
+                assert_eq!(targets, vec![(0, 0), (1, 0)], "exited 'gone' must be excluded");
+            }
+            other => panic!("expected Broadcast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_all_from_orchestrator_excludes_the_orchestrators_own_workspace() {
+        let orch_agents = [(0usize, "clone", false)];
+        let alpha_agents = [(0usize, "builder", false)];
+        let workspaces = [ws(0, "orchestrator", &orch_agents), ws(1, "alpha", &alpha_agents)];
+
+        let got = resolve_target("all", &workspaces, 0, &Sender::Orchestrator);
+
+        assert_eq!(got, TargetResolution::Broadcast(vec![(1, 0)]));
+    }
+
+    #[test]
+    fn resolve_target_all_from_workspace_sender_broadcasts_own_workspace_excluding_self() {
+        let alpha_agents = [(0usize, "builder", false), (1usize, "reviewer", false), (2usize, "gone", true)];
+        let bravo_agents = [(0usize, "solo", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents), ws(1, "bravo", &bravo_agents)];
+        let sender = Sender::Workspace { index: 0, from: "builder".to_string() };
+
+        let got = resolve_target("all", &workspaces, 99, &sender);
+
+        assert_eq!(
+            got,
+            TargetResolution::Broadcast(vec![(0, 1)]),
+            "must exclude the sender's own tab and never reach into bravo"
+        );
+    }
+
+    #[test]
+    fn resolve_target_all_from_workspace_sender_with_no_other_agents_is_empty_broadcast() {
+        let alpha_agents = [(0usize, "solo", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents)];
+        let sender = Sender::Workspace { index: 0, from: "solo".to_string() };
+
+        let got = resolve_target("all", &workspaces, 99, &sender);
+
+        assert_eq!(got, TargetResolution::Broadcast(vec![]));
+    }
+
+    #[test]
+    fn resolve_target_ws_star_from_orchestrator_broadcasts_that_workspaces_agents() {
+        let alpha_agents = [(0usize, "builder", false), (1usize, "gone", true)];
+        let bravo_agents = [(0usize, "solo", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents), ws(1, "bravo", &bravo_agents)];
+
+        let got = resolve_target("alpha/*", &workspaces, 99, &Sender::Orchestrator);
+
+        assert_eq!(got, TargetResolution::Broadcast(vec![(0, 0)]));
+    }
+
+    #[test]
+    fn resolve_target_ws_star_from_orchestrator_unknown_workspace_is_empty_broadcast_not_unknown() {
+        let alpha_agents = [(0usize, "builder", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents)];
+
+        let got = resolve_target("nosuch/*", &workspaces, 99, &Sender::Orchestrator);
+
+        assert_eq!(got, TargetResolution::Broadcast(vec![]), "unknown workspace is informational-empty, not Unknown");
+    }
+
+    #[test]
+    fn resolve_target_ws_star_naming_own_workspace_from_workspace_sender_broadcasts() {
+        let alpha_agents = [(0usize, "builder", false), (1usize, "sender-tab", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents)];
+        let sender = Sender::Workspace { index: 0, from: "sender-tab".to_string() };
+
+        let got = resolve_target("alpha/*", &workspaces, 99, &sender);
+
+        // Explicit `<own-ws>/*` addressing does NOT self-exclude (unlike bare
+        // `all`) — the sender's own tab is just a normal agent in its own
+        // workspace's agent list.
+        match got {
+            TargetResolution::Broadcast(mut targets) => {
+                targets.sort();
+                assert_eq!(targets, vec![(0, 0), (0, 1)]);
+            }
+            other => panic!("expected Broadcast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_ws_star_naming_another_workspace_from_workspace_sender_is_unknown() {
+        let alpha_agents = [(0usize, "builder", false)];
+        let bravo_agents = [(0usize, "solo", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents), ws(1, "bravo", &bravo_agents)];
+        let sender = Sender::Workspace { index: 0, from: "builder".to_string() };
+
+        let got = resolve_target("bravo/*", &workspaces, 99, &sender);
+
+        assert_eq!(got, TargetResolution::Unknown, "cross-workspace broadcast is denied for plain agents");
+    }
+
+    #[test]
+    fn resolve_target_ws_slash_agent_from_workspace_sender_own_workspace_still_delivers() {
+        let alpha_agents = [(0usize, "builder", false), (1usize, "reviewer", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents)];
+        let sender = Sender::Workspace { index: 0, from: "builder".to_string() };
+
+        let got = resolve_target("alpha/reviewer", &workspaces, 99, &sender);
+
+        assert_eq!(got, TargetResolution::Deliver { ws_index: 0, tab_index: 1 });
+    }
+
+    #[test]
+    fn resolve_target_ws_slash_agent_naming_another_workspace_from_workspace_sender_is_unknown() {
+        let alpha_agents = [(0usize, "builder", false)];
+        let bravo_agents = [(0usize, "solo", false)];
+        let workspaces = [ws(0, "alpha", &alpha_agents), ws(1, "bravo", &bravo_agents)];
+        let sender = Sender::Workspace { index: 0, from: "builder".to_string() };
+
+        let got = resolve_target("bravo/solo", &workspaces, 99, &sender);
+
+        assert_eq!(got, TargetResolution::Unknown, "single-target cross-workspace addressing stays denied too");
+    }
+
+    #[test]
+    fn resolve_target_bare_name_from_workspace_sender_resolves_within_own_workspace_only() {
+        let alpha_agents = [(0usize, "builder", false)];
+        let bravo_agents = [(0usize, "builder", false)]; // same title, different workspace
+        let workspaces = [ws(0, "alpha", &alpha_agents), ws(1, "bravo", &bravo_agents)];
+        let sender = Sender::Workspace { index: 1, from: "someone-else".to_string() };
+
+        let got = resolve_target("builder", &workspaces, 99, &sender);
+
+        assert_eq!(
+            got,
+            TargetResolution::Deliver { ws_index: 1, tab_index: 0 },
+            "must resolve bravo's own 'builder', never alpha's, and never be Ambiguous"
+        );
+    }
+
+    #[test]
+    fn resolve_target_bare_name_from_workspace_sender_unknown_outside_own_workspace() {
+        let alpha_agents = [(0usize, "builder", false)];
+        let bravo_agents: [(usize, &str, bool); 0] = [];
+        let workspaces = [ws(0, "alpha", &alpha_agents), ws(1, "bravo", &bravo_agents)];
+        let sender = Sender::Workspace { index: 1, from: "someone".to_string() };
+
+        let got = resolve_target("builder", &workspaces, 99, &sender);
+
+        assert_eq!(got, TargetResolution::Unknown);
+    }
+
+    #[test]
+    fn resolve_target_literal_orchestrator_from_workspace_sender_still_returns_orchestrator_variant() {
+        let alpha_agents = [(0usize, "orchestrator", false)]; // must never matter
+        let workspaces = [ws(0, "alpha", &alpha_agents)];
+        let sender = Sender::Workspace { index: 0, from: "someone".to_string() };
+
+        let got = resolve_target("orchestrator", &workspaces, 99, &sender);
+
+        assert_eq!(got, TargetResolution::Orchestrator);
     }
 
     use std::path::PathBuf;
