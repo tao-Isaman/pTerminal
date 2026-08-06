@@ -341,14 +341,57 @@ fn initial_msg_offset(repo: &Path) -> u64 {
 /// the file should be, ...) is a genuine failure and returns the literal
 /// `"(unavailable)"` instead — already non-empty, so the formatter passes it
 /// through unchanged.
-fn shared_excerpt_for(repo_path: &Path) -> String {
-    match std::fs::read_to_string(shared_ctx::shared_md_path(repo_path)) {
+///
+/// **Final-review finding (per-frame full-file re-read).** This used to
+/// unconditionally `read_to_string` the whole file and flatten it every call
+/// — and `refresh_orchestrator_status` calls this once per workspace, every
+/// single frame. `shared.md` only grows over a session, so that was
+/// allocator traffic (full-file read + flatten) scaling with session length
+/// times workspace count, for an excerpt that's almost always unchanged
+/// frame-to-frame. `cache` (per-app `PtApp::shared_excerpt_cache`, keyed by
+/// this exact path) makes the common case a single `std::fs::metadata` stat:
+/// on a `(len, mtime)` match against the cached entry, the cached excerpt is
+/// cloned (a ≤200-char `String`, not the file) and returned without ever
+/// opening the file for reading. Only a stat mismatch — or no entry yet —
+/// falls through to the real read+flatten+truncate, which then refreshes the
+/// cache entry. The three placeholder outcomes above are unchanged: they're
+/// decided the same way, just off `metadata`'s error kind where possible
+/// (`NotFound` also prunes any stale cache entry for the path) instead of
+/// `read_to_string`'s, with a fallback to the read's own error kind for the
+/// rare metadata-succeeds-but-read-fails race (e.g. deleted between the stat
+/// and the read).
+fn shared_excerpt_for(
+    repo_path: &Path,
+    cache: &mut HashMap<PathBuf, (u64, std::time::SystemTime, String)>,
+) -> String {
+    let path = shared_ctx::shared_md_path(repo_path);
+    let meta = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            cache.remove(&path);
+            return String::new();
+        }
+        Err(_) => return "(unavailable)".to_string(),
+    };
+    let len = meta.len();
+    if let Ok(mtime) = meta.modified() {
+        if let Some((cached_len, cached_mtime, cached_excerpt)) = cache.get(&path) {
+            if *cached_len == len && *cached_mtime == mtime {
+                return cached_excerpt.clone();
+            }
+        }
+    }
+    match std::fs::read_to_string(&path) {
         Ok(content) => {
             let flat = messages::flatten(&content);
             let n = flat.chars().count();
             let start = n.saturating_sub(200);
             let tail: String = flat.chars().skip(start).collect();
-            tail.trim().to_string()
+            let excerpt = tail.trim().to_string();
+            if let Ok(mtime) = meta.modified() {
+                cache.insert(path, (len, mtime, excerpt.clone()));
+            }
+            excerpt
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(_) => "(unavailable)".to_string(),
@@ -499,6 +542,29 @@ pub struct PtApp {
     /// there is at most one orchestrator, so a plain `Option<String>`
     /// suffices. See [`PtApp::refresh_orchestrator_status`]'s docs.
     pub orchestrator_status_written: Option<String>,
+    /// **Final-review finding (per-frame `shared.md` re-read).** Per-workspace
+    /// cache for [`shared_excerpt_for`], keyed by `shared.md`'s own path
+    /// rather than workspace index: `(file length, mtime, computed excerpt)`.
+    /// Without this, `refresh_orchestrator_status` re-read and re-flattened
+    /// every workspace's ENTIRE `shared.md` every single frame — cost scaling
+    /// with session length (the file only grows) × workspace count, even
+    /// though the excerpt is unchanged almost every frame. Each refresh now
+    /// does one cheap `std::fs::metadata` stat per workspace; the (len,
+    /// mtime) pair is compared against the cached entry, and the actual
+    /// read+flatten+truncate only runs on a real mismatch (or a first-time
+    /// miss).
+    ///
+    /// Keyed by path rather than index — unlike `roster_written` — so a
+    /// `close_workspace` index shift can't make a survivor's cache entry
+    /// silently point at the wrong workspace: there is nothing to re-key,
+    /// since the key IS the workspace's `shared.md` path. A closed
+    /// workspace's entry is simply never looked up again; it's a few dozen
+    /// stale bytes, not a correctness hazard, so `close_workspace` does not
+    /// need to (and does not) clear this map the way it clears
+    /// `roster_written`. A path whose file is deleted out from under it also
+    /// self-prunes: [`shared_excerpt_for`] removes the entry on a `NotFound`
+    /// stat.
+    pub shared_excerpt_cache: HashMap<PathBuf, (u64, std::time::SystemTime, String)>,
     /// Workspace indices whose last [`PtApp::deliver_messages`] call left a
     /// trailing partial (not-yet-newline-terminated) line unconsumed in
     /// `messages.jsonl`. Retried on the next heartbeat frame even without a
@@ -641,6 +707,7 @@ impl PtApp {
             closing_editor: None,
             roster_written: HashMap::new(),
             orchestrator_status_written: None,
+            shared_excerpt_cache: HashMap::new(),
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
@@ -1995,8 +2062,15 @@ impl PtApp {
         self.maintain_roster();
         // Task 3 (editor-orchestrator): same idea, one level up — keep the
         // orchestrator's own `status.md` in sync with every OTHER
-        // workspace's live agent roster. Same cheap/debounced/no-op-most-
-        // frames shape as `maintain_roster` just above.
+        // workspace's live agent roster. Debounced the same way
+        // `maintain_roster` is (status.md is only rewritten on a real
+        // change), but NOT "cheap/no-op" on the read side the way that
+        // comment used to claim: it costs one `std::fs::metadata` stat per
+        // OTHER workspace's `shared.md` every frame, and a real
+        // read+flatten+truncate only when that stat's `(len, mtime)` has
+        // changed since the last call — see `shared_excerpt_for`'s and
+        // `PtApp::shared_excerpt_cache`'s docs for why a full-file re-read
+        // every frame was the actual prior behavior and why it had to go.
         self.refresh_orchestrator_status();
     }
 
@@ -2046,8 +2120,8 @@ impl PtApp {
     /// (title, `status_str`-wire status, cwd) — a no-op when there's no
     /// orchestrator workspace at all (nothing to write, nowhere to write
     /// it). The orchestrator's OWN workspace is excluded by construction
-    /// (`enumerate().filter(|(i, _)| *i != orch_idx)` below skips it before
-    /// a `messages::WsStatus` is ever built for it) — SHELL/editor "tabs"
+    /// (the loop below `continue`s past index `orch_idx` before a
+    /// `messages::WsStatus` is ever built for it) — SHELL/editor "tabs"
     /// are excluded the same way `maintain_roster` excludes them from
     /// `agents.json`, via the `TabKind::Agent` filter.
     ///
@@ -2061,32 +2135,39 @@ impl PtApp {
     /// non-spammy-banner reasoning as `maintain_roster`'s docs.
     fn refresh_orchestrator_status(&mut self) {
         let Some(orch_idx) = self.orchestrator_index() else { return };
-        let entries: Vec<messages::WsStatus> = self
-            .workspaces
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != orch_idx)
-            .map(|(_, ws)| messages::WsStatus {
+        // A plain `for` loop rather than the `iter().map().collect()` chain
+        // this used to be: `shared_excerpt_for` now needs `&mut
+        // self.shared_excerpt_cache` per workspace, and a closure can't hold
+        // that mutable borrow of one `self` field while `self.workspaces`'s
+        // own iterator (a different field) is live across the same
+        // expression as cleanly as a loop body can.
+        let mut entries: Vec<messages::WsStatus> = Vec::with_capacity(self.workspaces.len());
+        for (i, ws) in self.workspaces.iter().enumerate() {
+            if i == orch_idx {
+                continue;
+            }
+            let agents = ws
+                .tabs
+                .iter()
+                .filter(|t| t.kind == TabKind::Agent)
+                .map(|t| {
+                    let subagent_count = t.children.iter().filter(|c| c.done_at.is_none()).count();
+                    (
+                        t.title.clone(),
+                        messages::status_str(t.status).to_string(),
+                        t.cwd.clone(),
+                        subagent_count,
+                        messages::fmt_hms(t.last_activity),
+                    )
+                })
+                .collect();
+            entries.push(messages::WsStatus {
                 name: ws.meta.name.clone(),
                 repo_path: ws.meta.repo_path.clone(),
-                shared_excerpt: shared_excerpt_for(&ws.meta.repo_path),
-                agents: ws
-                    .tabs
-                    .iter()
-                    .filter(|t| t.kind == TabKind::Agent)
-                    .map(|t| {
-                        let subagent_count = t.children.iter().filter(|c| c.done_at.is_none()).count();
-                        (
-                            t.title.clone(),
-                            messages::status_str(t.status).to_string(),
-                            t.cwd.clone(),
-                            subagent_count,
-                            messages::fmt_hms(t.last_activity),
-                        )
-                    })
-                    .collect(),
-            })
-            .collect();
+                shared_excerpt: shared_excerpt_for(&ws.meta.repo_path, &mut self.shared_excerpt_cache),
+                agents,
+            });
+        }
         let text = messages::orchestrator_status(&entries);
         if self.orchestrator_status_written.as_ref() == Some(&text) {
             return;
@@ -3635,6 +3716,7 @@ mod tests {
             closing_editor: None,
             roster_written: HashMap::new(),
             orchestrator_status_written: None,
+            shared_excerpt_cache: HashMap::new(),
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
@@ -3719,6 +3801,7 @@ mod tests {
             closing_editor: None,
             roster_written: HashMap::new(),
             orchestrator_status_written: None,
+            shared_excerpt_cache: HashMap::new(),
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
@@ -3756,6 +3839,7 @@ mod tests {
             closing_editor: None,
             roster_written: HashMap::new(),
             orchestrator_status_written: None,
+            shared_excerpt_cache: HashMap::new(),
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
@@ -4766,9 +4850,10 @@ mod tests {
     #[test]
     fn shared_excerpt_for_missing_shared_md_is_empty_string() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let mut cache = HashMap::new();
 
         assert_eq!(
-            shared_excerpt_for(dir.path()),
+            shared_excerpt_for(dir.path(), &mut cache),
             "",
             "an absent shared.md must be the empty string, not the '(unavailable)' failure text"
         );
@@ -4780,8 +4865,9 @@ mod tests {
         let path = shared_ctx::shared_md_path(dir.path());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "line one\r\nline two\n").unwrap();
+        let mut cache = HashMap::new();
 
-        assert_eq!(shared_excerpt_for(dir.path()), "line one line two");
+        assert_eq!(shared_excerpt_for(dir.path(), &mut cache), "line one line two");
     }
 
     #[test]
@@ -4793,8 +4879,9 @@ mod tests {
         let head = "a".repeat(50);
         let tail: String = (0..200).map(|i| char::from(b'0' + (i % 10) as u8)).collect();
         std::fs::write(&path, format!("{head}{tail}")).unwrap();
+        let mut cache = HashMap::new();
 
-        let got = shared_excerpt_for(dir.path());
+        let got = shared_excerpt_for(dir.path(), &mut cache);
 
         assert_eq!(got, tail, "must keep only the last ~200 chars, dropping the older head");
         assert_eq!(got.len(), 200);
@@ -4803,14 +4890,89 @@ mod tests {
     /// A `shared.md` "file" that's actually a directory makes
     /// `std::fs::read_to_string` fail with something other than
     /// `NotFound` — the genuine read-failure branch, which renders the
-    /// literal `"(unavailable)"` rather than the empty string.
+    /// literal `"(unavailable)"` rather than the empty string. `metadata`
+    /// succeeds on a directory (so the cache-lookup stat doesn't short-
+    /// circuit this), and the fall-through `read_to_string` is what actually
+    /// fails.
     #[test]
     fn shared_excerpt_for_unreadable_path_is_unavailable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = shared_ctx::shared_md_path(dir.path());
         std::fs::create_dir_all(&path).expect("create a directory AT the shared.md path");
+        let mut cache = HashMap::new();
 
-        assert_eq!(shared_excerpt_for(dir.path()), "(unavailable)");
+        assert_eq!(shared_excerpt_for(dir.path(), &mut cache), "(unavailable)");
+    }
+
+    // ---- Final-review finding: shared_excerpt_for's (len, mtime) cache ----
+    //
+    // These exercise the cache hit/miss/prune decision directly, by seeding
+    // `cache` by hand rather than relying on two real filesystem writes
+    // landing in different mtime ticks (which real writes in a fast test
+    // aren't guaranteed to do).
+
+    /// Seed the cache with a deliberately WRONG excerpt keyed at the file's
+    /// OWN real, current `(len, mtime)`. If a hit is used at all, this
+    /// poisoned value is what must come back — proving the match short-
+    /// circuits the read+flatten+truncate path entirely rather than merely
+    /// happening to agree with it.
+    #[test]
+    fn shared_excerpt_for_reuses_cached_excerpt_on_len_and_mtime_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = shared_ctx::shared_md_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "on disk right now").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let mut cache = HashMap::new();
+        cache.insert(path.clone(), (meta.len(), meta.modified().unwrap(), "STALE-FROM-CACHE".to_string()));
+
+        assert_eq!(
+            shared_excerpt_for(dir.path(), &mut cache),
+            "STALE-FROM-CACHE",
+            "a (len, mtime) match must return the cached excerpt without re-reading the file"
+        );
+    }
+
+    /// A cache entry for a `(len, mtime)` pair that does NOT match the
+    /// file's real current metadata is a miss: the real content must be
+    /// read, and the cache entry refreshed to the new `(len, mtime,
+    /// excerpt)` afterward.
+    #[test]
+    fn shared_excerpt_for_recomputes_and_updates_cache_on_len_or_mtime_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = shared_ctx::shared_md_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "fresh content").unwrap();
+        let mut cache = HashMap::new();
+        cache.insert(
+            path.clone(),
+            (u64::MAX, std::time::SystemTime::UNIX_EPOCH, "STALE".to_string()),
+        );
+
+        let got = shared_excerpt_for(dir.path(), &mut cache);
+
+        assert_eq!(got, "fresh content", "a stat mismatch must fall through to a real read");
+        let meta = std::fs::metadata(&path).unwrap();
+        let (cached_len, cached_mtime, cached_excerpt) =
+            cache.get(&path).expect("a miss must repopulate the cache entry");
+        assert_eq!(*cached_len, meta.len());
+        assert_eq!(*cached_mtime, meta.modified().unwrap());
+        assert_eq!(cached_excerpt, "fresh content");
+    }
+
+    /// A stale cache entry for a path whose file no longer exists must be
+    /// dropped, not left to rot — the `NotFound` branch prunes it.
+    #[test]
+    fn shared_excerpt_for_prunes_cache_entry_when_file_is_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = shared_ctx::shared_md_path(dir.path());
+        let mut cache = HashMap::new();
+        cache.insert(path.clone(), (5, std::time::SystemTime::now(), "gone-but-cached".to_string()));
+
+        let got = shared_excerpt_for(dir.path(), &mut cache);
+
+        assert_eq!(got, "");
+        assert!(cache.get(&path).is_none(), "a NotFound stat must prune the now-stale cache entry");
     }
 
     // ---- Task 3 (editor-orchestrator): status.md generation, README
