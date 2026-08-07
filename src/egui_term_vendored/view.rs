@@ -32,6 +32,12 @@ enum InputAction {
 #[derive(Clone, Default)]
 pub struct TerminalViewState {
     is_dragged: bool,
+    // pTerminal delta 8: tracks whether a primary-button drag-select is in
+    // progress, independent of `is_dragged`'s MOUSE_MODE branch (see
+    // `process_left_button`). Consumed by the auto-scroll block in
+    // `process_input`. Set true on SelectStart (primary press), false on
+    // primary release.
+    is_selecting: bool,
     scroll_pixels: f32,
     current_mouse_position_on_grid: TerminalGridPoint,
 }
@@ -213,6 +219,69 @@ impl<'a> TerminalView<'a> {
                         layout.ctx.copy_text(data);
                     },
                     InputAction::Ignore => {},
+                }
+            }
+        }
+
+        // pTerminal delta 8: auto-scroll while drag-selecting past the top or
+        // bottom edge of the terminal rect (upstream has no auto-scroll at
+        // all — dragging past an edge just stopped extending the selection
+        // until the pointer came back inside). Runs every frame regardless of
+        // whether a PointerMoved event arrived this frame, so it keeps
+        // scrolling while the mouse is held still past the edge; gated on
+        // `layout.has_focus()` via the early return above so a background tab
+        // never auto-scrolls.
+        if state.is_selecting {
+            let (primary_down, pointer_pos) = layout
+                .ctx
+                .input(|i| (i.pointer.primary_down(), i.pointer.latest_pos()));
+
+            // pTerminal delta 8: self-heal `is_selecting` from egui's raw
+            // `primary_down()` instead of trusting only the ordinary release
+            // path. `process_left_button_released` only runs from the
+            // `if pointer_inside` event arm above, and `pointer_inside`
+            // (`layout.contains_pointer()`) is a snapshot of the CURRENT
+            // frame's pointer position — which is false, by construction,
+            // whenever the button is released while the pointer is past an
+            // edge. That is exactly how a drag-to-autoscroll gesture
+            // naturally ends (drag past the bottom, let go there), so
+            // without this check `is_selecting` would stay stuck `true` and
+            // the terminal would auto-scroll forever until an unrelated
+            // future click-inside-the-rect happened to reset it. Verified
+            // live: releasing past the bottom edge kept scrolling for
+            // several hundred more lines with this check absent; adding it
+            // stops the scroll on the very next frame after release.
+            if !primary_down {
+                state.is_selecting = false;
+            } else if let Some(pos) = pointer_pos {
+                let lines = autoscroll_lines(
+                    pos.y,
+                    layout.rect.top(),
+                    layout.rect.bottom(),
+                );
+                if lines != 0 {
+                    // `autoscroll_lines` is positive below the bottom edge
+                    // (matching the pointer's downward direction) and
+                    // negative above the top edge. `BackendCommand::Scroll`
+                    // follows alacritty's grid semantics instead, where a
+                    // positive delta *increases* `display_offset` (scrolls
+                    // toward the top/older scrollback) and a negative delta
+                    // decreases it (toward the bottom/newest output) — see
+                    // `Grid::scroll_display` and `process_mouse_wheel` above.
+                    // Dragging below the bottom must scroll toward the
+                    // newest lines, so the sign is flipped here.
+                    self.backend
+                        .process_command(BackendCommand::Scroll(-lines));
+
+                    let clamped_y =
+                        pos.y.clamp(layout.rect.top(), layout.rect.bottom());
+                    let cursor_x = pos.x - layout.rect.min.x;
+                    let cursor_y = clamped_y - layout.rect.min.y;
+                    self.backend.process_command(BackendCommand::SelectUpdate(
+                        cursor_x, cursor_y,
+                    ));
+
+                    layout.ctx.request_repaint();
                 }
             }
         }
@@ -567,6 +636,10 @@ fn process_left_button_pressed(
     position: Pos2,
 ) -> InputAction {
     state.is_dragged = true;
+    // pTerminal delta 8: mark the drag-select as active so the auto-scroll
+    // block in `process_input` knows to keep extending the selection while
+    // the pointer is held past an edge.
+    state.is_selecting = true;
     InputAction::BackendCall(build_start_select_command(layout, position))
 }
 
@@ -579,6 +652,8 @@ fn process_left_button_released(
     modifiers: &Modifiers,
 ) -> InputAction {
     state.is_dragged = false;
+    // pTerminal delta 8: end of drag-select — stop auto-scrolling.
+    state.is_selecting = false;
     if layout.double_clicked() || layout.triple_clicked() {
         InputAction::BackendCall(build_start_select_command(layout, position))
     } else {
@@ -664,6 +739,80 @@ mod ctrl_c_action_tests {
     #[test]
     fn no_selection_with_shift_does_nothing() {
         assert_eq!(ctrl_c_action(false, true), CopyAction::Nothing);
+    }
+}
+
+// pTerminal delta 8: `autoscroll_lines` is the pure decision helper for
+// auto-scrolling while drag-selecting past the top/bottom edge of the
+// terminal rect (upstream has no auto-scroll at all). See the delta-8 index
+// entry in mod.rs and the call site in `process_input` for the full picture.
+//
+// Sign convention: returns 0 inside `[rect_top, rect_bottom]` (inclusive of
+// both edges), negative above `rect_top`, positive below `rect_bottom` — the
+// sign matches the pointer's direction of travel past the edge, not
+// `BackendCommand::Scroll`'s sign (that flip happens at the call site; see
+// the comment in `process_input`). Magnitude grows with distance past the
+// edge and is capped to `1..=5` lines per frame so a pointer parked far off
+// the bottom of a huge monitor doesn't blow through the whole scrollback in
+// one frame.
+fn autoscroll_lines(pointer_y: f32, rect_top: f32, rect_bottom: f32) -> i32 {
+    let overshoot = if pointer_y < rect_top {
+        pointer_y - rect_top
+    } else if pointer_y > rect_bottom {
+        pointer_y - rect_bottom
+    } else {
+        return 0;
+    };
+
+    let magnitude = (1.0 + overshoot.abs() / 20.0) as i32;
+    let magnitude = magnitude.clamp(1, 5);
+    if overshoot < 0.0 {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+#[cfg(test)]
+mod autoscroll_lines_tests {
+    use super::autoscroll_lines;
+
+    const TOP: f32 = 100.0;
+    const BOTTOM: f32 = 400.0;
+
+    #[test]
+    fn inside_rect_is_zero() {
+        assert_eq!(autoscroll_lines(250.0, TOP, BOTTOM), 0);
+    }
+
+    #[test]
+    fn exactly_on_top_edge_is_zero() {
+        assert_eq!(autoscroll_lines(TOP, TOP, BOTTOM), 0);
+    }
+
+    #[test]
+    fn exactly_on_bottom_edge_is_zero() {
+        assert_eq!(autoscroll_lines(BOTTOM, TOP, BOTTOM), 0);
+    }
+
+    #[test]
+    fn slightly_above_top_is_negative_one() {
+        assert_eq!(autoscroll_lines(TOP - 1.0, TOP, BOTTOM), -1);
+    }
+
+    #[test]
+    fn far_above_top_is_capped_at_negative_five() {
+        assert_eq!(autoscroll_lines(TOP - 1000.0, TOP, BOTTOM), -5);
+    }
+
+    #[test]
+    fn slightly_below_bottom_is_positive_one() {
+        assert_eq!(autoscroll_lines(BOTTOM + 1.0, TOP, BOTTOM), 1);
+    }
+
+    #[test]
+    fn far_below_bottom_is_capped_at_positive_five() {
+        assert_eq!(autoscroll_lines(BOTTOM + 1000.0, TOP, BOTTOM), 5);
     }
 }
 

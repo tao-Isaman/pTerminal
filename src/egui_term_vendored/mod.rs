@@ -42,6 +42,21 @@
 //!    interrupts (^C) when there isn't, via the new pure `ctrl_c_action`
 //!    helper and `TerminalBackend::has_selection()` accessor in `view.rs`
 //!    and `backend/mod.rs` respectively.
+//! 8. `view.rs` — auto-scroll while drag-selecting past the top/bottom edge
+//!    of the terminal rect. Upstream has no auto-scroll at all: dragging the
+//!    pointer past an edge just stopped extending the selection until it
+//!    came back inside the rect. `TerminalViewState` gains `is_selecting`
+//!    (true from a primary-button `SelectStart` press to its release, set in
+//!    `process_left_button_pressed`/`process_left_button_released`), and
+//!    `process_input` gains a per-frame block (after the per-event loop, so
+//!    it also fires with no new events — i.e. while the pointer is held
+//!    still past the edge) that computes `autoscroll_lines(pointer_y,
+//!    rect_top, rect_bottom)`, issues `BackendCommand::Scroll` +
+//!    `BackendCommand::SelectUpdate` (y clamped to the edge) when non-zero,
+//!    and calls `request_repaint()` to keep the scroll going. Gated on
+//!    `layout.has_focus()` (the existing early-return at the top of
+//!    `process_input`), so a background tab never auto-scrolls. The new pure
+//!    `autoscroll_lines` helper is unit-tested.
 
 // This is library code kept as close to upstream as possible; not every item it
 // exports is used by pTerminal (yet).
