@@ -260,8 +260,9 @@ whatever the running program itself does with your input:
   the terminal at the cursor. Neither combination sends an Enter for you.
 - **Copy vs. interrupt** — `Ctrl+C` copies the current selection to the OS clipboard when
   there is one; with no selection, it sends an interrupt (`^C`) to the running process, same
-  as a plain terminal. `Ctrl+Shift+C` always copies the selection, regardless of context —
-  useful when you want to be certain you're not about to kill a foreground process.
+  as a plain terminal. `Ctrl+Shift+C` copies the selection when there is one and never sends
+  an interrupt (a no-op if nothing is selected) — useful when you want to be certain you're
+  not about to kill a foreground process.
 - **Auto-scroll while drag-selecting** — dragging a selection past the terminal's top or
   bottom edge scrolls the view toward the pointer and keeps extending the selection,
   including while the pointer is held still past the edge. Releasing the mouse button while
