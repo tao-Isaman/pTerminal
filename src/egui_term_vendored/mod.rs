@@ -56,7 +56,17 @@
 //!    and calls `request_repaint()` to keep the scroll going. Gated on
 //!    `layout.has_focus()` (the existing early-return at the top of
 //!    `process_input`), so a background tab never auto-scrolls. The new pure
-//!    `autoscroll_lines` helper is unit-tested.
+//!    `autoscroll_lines` helper is unit-tested. Both `is_selecting` (in the
+//!    auto-scroll block) and `is_dragged` (in `process_mouse_move`) are
+//!    self-healed from egui's raw `pointer.primary_down()`: releasing the
+//!    button while the pointer is past an edge — the ordinary way this drag
+//!    ends — leaves `pointer_inside` false for that frame, so the
+//!    `if pointer_inside`-gated release handler in `process_input` never
+//!    runs and never clears either flag. Without the self-heal, a stale
+//!    `is_selecting` would auto-scroll forever, and a stale `is_dragged`
+//!    would make the next plain hover (no button held) silently extend the
+//!    selection, since `PointerMoved` fires on hover regardless of button
+//!    state.
 
 // This is library code kept as close to upstream as possible; not every item it
 // exports is used by pTerminal (yet).

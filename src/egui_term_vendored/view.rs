@@ -833,6 +833,22 @@ fn process_mouse_move(
         terminal_content.grid.display_offset(),
     );
 
+    // pTerminal delta 8: self-heal `is_dragged` from egui's raw
+    // `primary_down()`, mirroring the `is_selecting` self-heal in
+    // `process_input`'s auto-scroll block (same root cause). `is_dragged` is
+    // only ever cleared by `process_left_button_released`, which runs from
+    // the `if pointer_inside` event arm in `process_input` — and
+    // `pointer_inside` is false exactly when the button is released while
+    // the pointer is past an edge, i.e. the ordinary way an auto-scroll drag
+    // ends. `PointerMoved` fires on a plain hover regardless of button
+    // state, so a stale `is_dragged` would make the very next hover back
+    // over the terminal (no button held at all) silently issue a
+    // `SelectUpdate`/`MouseReport` below, jumping or extending the
+    // selection. Checking the raw button state here closes that gap.
+    if state.is_dragged && !layout.ctx.input(|i| i.pointer.primary_down()) {
+        state.is_dragged = false;
+    }
+
     let mut actions = vec![];
     // Handle command or selection update based on terminal mode and modifiers
     if state.is_dragged {
