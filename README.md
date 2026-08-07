@@ -251,6 +251,28 @@ running *count* is always correct, but which description a stop event resolves a
 occasionally be the wrong one if they finish out of start order. Acceptable for a monitoring
 UI; not acceptable if you need a precise per-subagent audit trail.
 
+## Terminal shortcuts & mouse
+
+Shell and agent tabs share the same terminal widget, with these interactions on top of
+whatever the running program itself does with your input:
+
+- **Paste** — `Ctrl+V` and `Ctrl+Shift+V` both paste the OS clipboard's text straight into
+  the terminal at the cursor. Neither combination sends an Enter for you.
+- **Copy vs. interrupt** — `Ctrl+C` copies the current selection to the OS clipboard when
+  there is one; with no selection, it sends an interrupt (`^C`) to the running process, same
+  as a plain terminal. `Ctrl+Shift+C` always copies the selection, regardless of context —
+  useful when you want to be certain you're not about to kill a foreground process.
+- **Auto-scroll while drag-selecting** — dragging a selection past the terminal's top or
+  bottom edge scrolls the view toward the pointer and keeps extending the selection,
+  including while the pointer is held still past the edge. Releasing the mouse button while
+  still past the edge stops the scrolling cleanly instead of letting it run away.
+- **Right-click menu** — right-click anywhere in the terminal for **Copy** (greyed out when
+  nothing is selected), **Paste**, **Select All**, and **Clear** (empties both the visible
+  screen and the scrollback history). Multi-line selections and Select All copy with real
+  line breaks preserved, not one run-on padded string.
+- The right-click menu's Paste reads the OS clipboard via the `arboard` crate — the one place
+  it's used; `Ctrl+V`/`Ctrl+Shift+V` go through egui's own clipboard integration instead.
+
 ## Keys
 Ctrl+T new tab · Ctrl+W close · Ctrl+Tab cycle · Ctrl+1..9 jump · F2 shared context ·
 Ctrl+O open file · Ctrl+S save file
