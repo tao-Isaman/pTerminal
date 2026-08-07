@@ -36,6 +36,7 @@ use crate::hooks::{self, AgentStatus};
 use crate::resources::ProcSample;
 use crate::state::WorktreeInfo;
 use crate::git;
+use eframe::egui;
 use std::collections::HashSet;
 
 /// Scrollback retained per terminal, in lines.
@@ -140,12 +141,99 @@ impl TabTerm {
         // `TerminalView::new` borrows `ui` only to derive the widget id, so the view
         // has to be bound to a local before `ui` is borrowed again by `add`.
         let view = TerminalView::new(ui, &mut self.backend).set_focus(focused);
-        ui.add(view);
+        let response = ui.add(view);
+
+        // Task 3: right-click menu (Copy/Paste/Select All/Clear).
+        //
+        // **Borrow approach.** `Response::context_menu` takes `&self` and
+        // its own closure parameter is a FRESH `&mut Ui` for the popup's
+        // contents — it does not need (or capture) the outer `ui: &mut Ui`
+        // this method was given, and by the time `ui.add(view)` above
+        // returns, the `&mut self.backend` borrow it took has already
+        // ended. So the closure below is free to take `&mut self` (it's
+        // the only thing it touches) and call ordinary `&self`/`&mut self`
+        // methods on `TabTerm` directly — no action-enum indirection is
+        // needed here; the borrow checker has nothing left to object to.
+        //
+        // Right-click always opens this menu: the vendored view only ever
+        // reacts to `PointerButton::Primary` (`view.rs`'s
+        // `process_button_click`), so a secondary click is never consumed
+        // for mouse-reporting and reaches egui's own secondary-click
+        // detection on `response` untouched.
+        response.context_menu(|ui| {
+            if ui
+                .add_enabled(self.has_selection(), egui::Button::new("Copy"))
+                .clicked()
+            {
+                let text = self.copy_selection();
+                ui.ctx().copy_text(text);
+                ui.close_menu();
+            }
+            if ui.button("Paste").clicked() {
+                // Menu Paste reads the OS clipboard directly via `arboard`
+                // (unlike keyboard Ctrl+V, which rides egui's own
+                // `Event::Paste` — see `view.rs`'s `process_keyboard_event`).
+                // Best-effort: a clipboard that can't be opened or holds no
+                // text is silently a no-op rather than an error dialog.
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    if let Ok(text) = clipboard.get_text() {
+                        self.paste_str(&text);
+                    }
+                }
+                ui.close_menu();
+            }
+            if ui.button("Select All").clicked() {
+                self.select_all();
+                ui.close_menu();
+            }
+            if ui.button("Clear").clicked() {
+                self.clear_screen();
+                ui.close_menu();
+            }
+        });
     }
 
     /// `Some(code)` once the child process has exited.
     pub fn exited(&self) -> Option<i32> {
         self.exited
+    }
+
+    /// Whether there's an active selection — greys out the context menu's
+    /// "Copy" item when there's nothing to copy.
+    pub fn has_selection(&self) -> bool {
+        self.backend.has_selection()
+    }
+
+    /// The currently selected text, if any (empty string otherwise) — same
+    /// text the context menu's "Copy" and keyboard Ctrl+C put on the
+    /// clipboard.
+    pub fn copy_selection(&self) -> String {
+        self.backend.selectable_content()
+    }
+
+    /// Selects the entire buffer (scrollback + visible screen) — the
+    /// context menu's "Select All".
+    pub fn select_all(&mut self) {
+        self.backend.process_command(BackendCommand::SelectAll);
+    }
+
+    /// Clears the visible screen AND scrollback — the context menu's
+    /// "Clear".
+    pub fn clear_screen(&mut self) {
+        self.backend.process_command(BackendCommand::ClearScreen);
+    }
+
+    /// Writes `s` to the child's stdin as-is, with no appended `\r` — the
+    /// context menu's "Paste". Distinct from [`TabTerm::write_input`] only
+    /// in name/call site (both end up at the identical
+    /// `BackendCommand::Write`); kept separate because they answer
+    /// different questions at their call sites ("paste this" vs. "submit
+    /// this program-generated text"), and `write_input`'s doc comment about
+    /// `\r`-must-arrive-as-its-own-burst is specific to programmatic
+    /// message delivery, not clipboard paste.
+    pub fn paste_str(&mut self, s: &str) {
+        self.backend
+            .process_command(BackendCommand::Write(s.as_bytes().to_vec()));
     }
 
     /// Writes raw bytes to the child's stdin, the same path `view.rs` uses

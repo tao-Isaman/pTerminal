@@ -12,6 +12,9 @@ default-run = "pterminal"
 # 0.31.x — `cargo tree -i egui` must keep showing exactly one egui version.
 alacritty_terminal = "0.25.1"
 anyhow = "1.0.104"
+# Right-click terminal menu's "Paste" reads the OS clipboard directly
+# (keyboard Ctrl+V does not — it uses egui's built-in `Event::Paste`).
+arboard = "3.6.1"
 dirs = "6.0.0"
 eframe = "0.31.1"
 egui = "0.31.1"

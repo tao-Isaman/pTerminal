@@ -15,6 +15,11 @@ use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{
     self, cell::Cell, test::TermSize, viewport_to_point, Term, TermMode,
 };
+// pTerminal delta 9: `Handler` brings `Term::clear_screen` into scope (it's
+// a `vte::ansi::Handler` trait method, normally invoked by the escape-code
+// parser as the child prints `\x1b[2J` etc.) so `BackendCommand::ClearScreen`
+// can call it directly. `ClearMode` is its argument type.
+use alacritty_terminal::vte::ansi::{ClearMode, Handler};
 use alacritty_terminal::{tty, Grid};
 use egui::Modifiers;
 use settings::BackendSettings;
@@ -44,6 +49,10 @@ pub enum BackendCommand {
     Resize(Size, Size),
     SelectStart(SelectionType, f32, f32),
     SelectUpdate(f32, f32),
+    // pTerminal delta 9: right-click menu primitives — see the delta index
+    // entry in mod.rs and `TerminalBackend::select_all`/`clear_screen`.
+    SelectAll,
+    ClearScreen,
     ProcessLink(LinkAction, Point),
     MouseReport(MouseButton, Modifiers, Point, bool),
 }
@@ -263,6 +272,12 @@ impl TerminalBackend {
             BackendCommand::SelectUpdate(x, y) => {
                 self.update_selection(&mut term, x, y);
             },
+            BackendCommand::SelectAll => {
+                self.select_all(&mut term);
+            },
+            BackendCommand::ClearScreen => {
+                self.clear_screen(&mut term);
+            },
             BackendCommand::ProcessLink(link_action, point) => {
                 self.process_link_action(&term, link_action, point);
             },
@@ -295,11 +310,44 @@ impl TerminalBackend {
         self.last_content().selectable_range.is_some()
     }
 
+    // pTerminal delta 9: walks the selection's own absolute range
+    // (`grid.iter_from(range.start)`, stopping just past `range.end`)
+    // instead of upstream's `content.grid.display_iter()`, which only
+    // visits whatever the viewport happened to be scrolled to at the last
+    // `sync()`. `content.grid` is a full clone of the grid (scrollback
+    // included — see `sync()`), so the data was always there; only the
+    // upstream iterator choice was viewport-bound. That was harmless for a
+    // small selection made and copied without scrolling in between, but
+    // `BackendCommand::SelectAll`'s whole point is a selection that
+    // deliberately spans far more than one screen, and Ctrl+C/the menu's
+    // Copy call this same method — so left unfixed, "Select All" would
+    // silently copy only whatever ~50 lines were on screen at the moment
+    // of the last render, not the buffer its own highlight implies. Caught
+    // by this method's own unit test (see `tests` below) before this fix
+    // was written: the test failed with exactly that symptom (an oldest,
+    // scrolled-off marker missing from the copied text) against the
+    // unmodified upstream implementation.
+    //
+    // Live verification then caught a second bug in this fix itself:
+    // `Grid::iter_from(point)` does NOT yield `point` — its `next()`
+    // (`grid/mod.rs`) advances the cursor BEFORE returning a cell, so the
+    // first item produced is the cell AFTER `point`. `display_iter()`
+    // (upstream, unmodified) already works around this by starting its
+    // internal cursor one line early; a naive `iter_from(range.start)`
+    // here does not, and silently drops the selection's very first
+    // character (confirmed live: Select All then Copy on a buffer
+    // starting with "Windows PowerShell" produced "indows PowerShell").
+    // Fixed by reading `range.start`'s cell directly via `grid[point]`
+    // (same `Index<Point>` used by `open_link`, above) before the loop.
     pub fn selectable_content(&self) -> String {
         let content = self.last_content();
         let mut result = String::new();
         if let Some(range) = content.selectable_range {
-            for indexed in content.grid.display_iter() {
+            result.push(content.grid.index(range.start).c);
+            for indexed in content.grid.iter_from(range.start) {
+                if indexed.point > range.end {
+                    break;
+                }
                 if range.contains(indexed.point) {
                     result.push(indexed.c);
                 }
@@ -492,6 +540,41 @@ impl TerminalBackend {
         }
     }
 
+    // pTerminal delta 9: selects the ENTIRE buffer (scrollback + visible
+    // screen) for the right-click menu's "Select All". Mirrors
+    // `start_selection`'s `Selection::new` + `update` pattern — a fresh
+    // `Selection` anchors both ends at one point, so the end has to be
+    // moved out to the bottom-right corner afterward; there's no
+    // "span the whole grid" constructor. `topmost_line()`/`bottommost_line()`
+    // /`last_column()` come from the already-imported `Dimensions` trait,
+    // implemented for `Term` itself (`term/mod.rs`, `impl<T> Dimensions for
+    // Term<T>`), so no locking/indirection beyond what's already in scope.
+    fn select_all(&mut self, terminal: &mut Term<EventProxy>) {
+        let start = Point::new(terminal.topmost_line(), Column(0));
+        let end = Point::new(terminal.bottommost_line(), terminal.last_column());
+        let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+        selection.update(end, Side::Right);
+        terminal.selection = Some(selection);
+    }
+
+    // pTerminal delta 9: clears the visible screen AND scrollback for the
+    // right-click menu's "Clear". `clear_screen` is normally driven by an
+    // ANSI escape sequence from the child process (e.g. `\x1b[2J`); calling
+    // it directly here mutates the grid without the child knowing, exactly
+    // like every other `BackendCommand` that reaches into `Term` outside the
+    // escape-sequence path (e.g. `SelectStart`/`Scroll`). `ClearMode::All`
+    // clears the visible viewport (the whole alt-screen region if one is
+    // active) and always drops any active selection; `ClearMode::Saved`
+    // additionally discards the scrollback history (a no-op when there is
+    // none) via `Grid::clear_history`, which also resets `display_offset`
+    // to 0. Verified: both calls compile against alacritty_terminal 0.25.1
+    // and the unit test below confirms the buffer is actually empty
+    // afterward, not just that the selection was cleared.
+    fn clear_screen(&mut self, terminal: &mut Term<EventProxy>) {
+        terminal.clear_screen(ClearMode::All);
+        terminal.clear_screen(ClearMode::Saved);
+    }
+
     fn selection_side(&self, x: f32) -> Side {
         let cell_x = x as usize % self.size.cell_width as usize;
         let half_cell_width = (self.size.cell_width as f32 / 2.0) as usize;
@@ -629,5 +712,218 @@ pub struct EventProxy(mpsc::Sender<Event>);
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         let _ = self.0.send(event.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Waits for `cond` to hold, polling every 10 ms. `false` on timeout.
+    /// Mirrors the identical helper already used by `term.rs`'s tests; this
+    /// module has no access to that one (it's private to a different file),
+    /// and duplicating six lines beats making it `pub` just for tests.
+    fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    /// Spawns a real `cmd.exe` child directly through `TerminalBackend` —
+    /// no egui `Ui`/`TerminalView` involved. `sync()` and `process_command`
+    /// are both plain, UI-free methods, so a headless `Term` backed by a
+    /// real PTY child is fully constructible and drivable from a unit test;
+    /// only the context-menu wiring around `SelectAll`/`ClearScreen`
+    /// (`term.rs`'s `TabTerm::ui`) needs a live egui frame and is
+    /// live-verified instead.
+    fn spawn_backend(id: u64) -> TerminalBackend {
+        let ctx = egui::Context::default();
+        let (tx, _rx) = mpsc::channel();
+        TerminalBackend::new(
+            id,
+            ctx,
+            tx,
+            BackendSettings {
+                shell: "cmd.exe".to_string(),
+                args: vec![],
+                working_directory: None,
+                scrolling_history: 1000,
+            },
+            Arc::new(AtomicBool::new(true)),
+        )
+        .expect("spawn cmd.exe")
+    }
+
+    /// Polls `sync()` until the FULL grid (not just the visible viewport)
+    /// contains `needle`, proving the child's output actually landed before
+    /// the test acts on it — a fresh `cmd.exe` prints its banner and later
+    /// output asynchronously, so a fixed sleep would be flaky. Walks the
+    /// whole addressable buffer (`topmost_line()..=bottommost_line()`) via
+    /// `iter_from`, not `display_iter()`, so this also works for a marker
+    /// that has already scrolled out of the visible window.
+    fn grid_contains(backend: &mut TerminalBackend, needle: &str) -> bool {
+        wait_for(|| full_grid_text(backend).contains(needle))
+    }
+
+    fn full_grid_text(backend: &mut TerminalBackend) -> String {
+        let content = backend.sync();
+        let start = Point::new(content.grid.topmost_line(), Column(0));
+        content.grid.iter_from(start).map(|i| i.c).collect()
+    }
+
+    /// Waits for the grid to stop changing across a few consecutive polls.
+    /// `grid_contains`/`wait_for_output` only prove a SPECIFIC piece of text
+    /// has landed — they say nothing about whatever the child writes right
+    /// AFTER that (e.g. a `for /l` loop's last echoed line is immediately
+    /// followed by the interpreter unwinding the loop and printing a fresh
+    /// prompt, which arrives over the PTY channel asynchronously and can
+    /// still be in flight the instant the loop's last line becomes visible).
+    /// Caught for real: this test was flaky without it — `ClearScreen` ran
+    /// while that trailing prompt was still arriving, so it never got
+    /// cleared and the "buffer is empty after Clear" assertion failed on a
+    /// leftover `<cwd>>` prompt line. Used only to synchronize the test with
+    /// the real child process; not part of the feature under test.
+    fn wait_for_quiescence(backend: &mut TerminalBackend) {
+        let mut last = full_grid_text(backend);
+        let mut stable_polls = 0;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && stable_polls < 5 {
+            std::thread::sleep(Duration::from_millis(20));
+            let now = full_grid_text(backend);
+            if now == last {
+                stable_polls += 1;
+            } else {
+                stable_polls = 0;
+                last = now;
+            }
+        }
+    }
+
+    #[test]
+    fn select_all_covers_scrolled_off_history_and_clear_screen_empties_it() {
+        let mut backend = spawn_backend(910);
+
+        // A unique, non-numeric marker on its own line, printed BEFORE the
+        // flood below so it is the oldest thing in the buffer.
+        backend.process_command(BackendCommand::Write(
+            b"echo pterminal-oldest-line-marker\r".to_vec(),
+        ));
+        assert!(
+            grid_contains(&mut backend, "pterminal-oldest-line-marker"),
+            "the first marker never reached the grid"
+        );
+
+        // Print more lines than fit in the default 50-line viewport so the
+        // marker above is pushed into scrollback (no longer visible) by
+        // the time the loop finishes — this is what distinguishes a real
+        // "select the WHOLE buffer" from "select whatever's on screen
+        // right now". (Numeric suffixes deliberately aren't used to name
+        // an "early" line to assert on: "marker-1" is a substring of
+        // "marker-10".."marker-19", so it wouldn't prove anything.)
+        backend.process_command(BackendCommand::Write(
+            b"for /l %i in (1,1,80) do @echo pterminal-flood-%i\r".to_vec(),
+        ));
+        assert!(
+            grid_contains(&mut backend, "pterminal-flood-80"),
+            "the loop's last line never reached the grid"
+        );
+        // The `for /l` loop's last echo and the interpreter's subsequent
+        // fresh prompt line arrive as separate, asynchronous PTY writes —
+        // wait for the stream to go quiet before touching the buffer, or
+        // `ClearScreen` below can race a still-arriving trailing prompt.
+        wait_for_quiescence(&mut backend);
+
+        // Sanity-check the test's own premise: the oldest marker really
+        // has scrolled out of the CURRENTLY VISIBLE viewport by now, so
+        // the assertions below actually exercise "reaches into
+        // scrollback" rather than passing vacuously.
+        let visible_only: String = {
+            let content = backend.sync();
+            content.grid.display_iter().map(|i| i.c).collect()
+        };
+        assert!(
+            !visible_only.contains("pterminal-oldest-line-marker"),
+            "test setup didn't actually scroll the marker out of the \
+             visible viewport — the premise this test relies on doesn't \
+             hold, increase the flood count"
+        );
+
+        assert!(!backend.has_selection(), "nothing should be selected yet");
+
+        backend.process_command(BackendCommand::SelectAll);
+        backend.sync();
+        assert!(
+            backend.has_selection(),
+            "SelectAll must set an active selection"
+        );
+
+        let selected = backend.selectable_content();
+        assert!(
+            selected.contains("pterminal-oldest-line-marker"),
+            "Select All + Copy must reach the oldest line even though it \
+             has scrolled out of the visible viewport; got {} chars",
+            selected.len()
+        );
+        assert!(
+            selected.contains("pterminal-flood-80"),
+            "Select All + Copy must also cover the most recent, visible \
+             line"
+        );
+
+        backend.process_command(BackendCommand::ClearScreen);
+        backend.sync();
+        assert!(
+            !backend.has_selection(),
+            "ClearScreen must drop the active selection along with the \
+             content it was covering"
+        );
+
+        // Re-select-all after clearing: an empty result proves the grid
+        // itself (visible screen AND scrollback) was actually wiped, not
+        // just the selection.
+        backend.process_command(BackendCommand::SelectAll);
+        backend.sync();
+        let after_clear = backend.selectable_content();
+        assert!(
+            after_clear.trim().is_empty(),
+            "ClearScreen must empty the whole buffer, including \
+             scrollback; got: {after_clear:?}"
+        );
+    }
+
+    /// Regression test for the `Grid::iter_from` off-by-one caught during
+    /// live verification: `selectable_content()`'s fixed range-walking loop
+    /// only advances the cursor and never separately visits `range.start`
+    /// itself, so the selection's very first character was silently
+    /// dropped (live repro: Select All then Copy on a buffer starting with
+    /// "Windows PowerShell" produced "indows PowerShell"). A default,
+    /// freshly-spawned `TerminalBackend` has no scrollback yet
+    /// (`history_size() == 0`), so `topmost_line() == Line(0)` and
+    /// `bottommost_line() == Line(49)` (the default `TerminalSize`'s
+    /// `num_lines`) — Select All's range is then exactly the visible
+    /// 50-line × 80-column grid, so `selectable_content()`'s length is a
+    /// precise, deterministic 4000 if and only if every cell — including
+    /// the very first — was actually visited.
+    #[test]
+    fn select_all_on_a_fresh_backend_does_not_drop_the_first_character() {
+        let mut backend = spawn_backend(911);
+
+        backend.process_command(BackendCommand::SelectAll);
+        backend.sync();
+        assert!(backend.has_selection());
+
+        let selected = backend.selectable_content();
+        assert_eq!(
+            selected.len(),
+            50 * 80,
+            "expected exactly one full 50x80 screen's worth of characters \
+             (a dropped first cell would read 3999 here); got: {selected:?}"
+        );
     }
 }

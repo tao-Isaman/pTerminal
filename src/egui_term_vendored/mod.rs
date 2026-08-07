@@ -67,6 +67,26 @@
 //!    would make the next plain hover (no button held) silently extend the
 //!    selection, since `PointerMoved` fires on hover regardless of button
 //!    state.
+//! 9. `backend/mod.rs` — right-click menu primitives: `BackendCommand::SelectAll`
+//!    (sets `term.selection` to a `Selection` spanning the whole addressable
+//!    buffer, `topmost_line()`/`Column(0)` to `bottommost_line()`/`last_column()`,
+//!    mirroring `start_selection`'s `Selection::new` + `update` construction)
+//!    and `BackendCommand::ClearScreen` (`Term::clear_screen(ClearMode::All)`
+//!    then `ClearMode::Saved` — the visible viewport and the scrollback
+//!    history respectively; both are `vte::ansi::Handler` trait methods,
+//!    brought into scope with `use ...vte::ansi::Handler`). Also fixes
+//!    `selectable_content()`, which upstream walks via
+//!    `content.grid.display_iter()` — bound to whatever the viewport was
+//!    scrolled to at the last `sync()`, not the actual selection. Harmless
+//!    for a small selection copied without an intervening scroll, but
+//!    exactly wrong for `SelectAll`'s whole-buffer selection (and for any
+//!    selection extending into scrollback): it now walks
+//!    `content.grid.iter_from(range.start)` bounded by `range.end`, using
+//!    the selection's own absolute coordinates instead of the current
+//!    display offset. Caught by this delta's own unit test, which failed
+//!    against the unmodified upstream method before the fix (an oldest,
+//!    scrolled-off marker line was missing from the copied text) and
+//!    passes after it.
 
 // This is library code kept as close to upstream as possible; not every item it
 // exports is used by pTerminal (yet).
