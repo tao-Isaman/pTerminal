@@ -160,37 +160,50 @@ impl TabTerm {
         // `process_button_click`), so a secondary click is never consumed
         // for mouse-reporting and reaches egui's own secondary-click
         // detection on `response` untouched.
-        response.context_menu(|ui| {
-            if ui
-                .add_enabled(self.has_selection(), egui::Button::new("Copy"))
-                .clicked()
-            {
-                let text = self.copy_selection();
-                ui.ctx().copy_text(text);
-                ui.close_menu();
-            }
-            if ui.button("Paste").clicked() {
-                // Menu Paste reads the OS clipboard directly via `arboard`
-                // (unlike keyboard Ctrl+V, which rides egui's own
-                // `Event::Paste` — see `view.rs`'s `process_keyboard_event`).
-                // Best-effort: a clipboard that can't be opened or holds no
-                // text is silently a no-op rather than an error dialog.
-                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                    if let Ok(text) = clipboard.get_text() {
-                        self.paste_str(&text);
-                    }
+        //
+        // **FINAL-REVIEW FIX: gate on `focused`.** `egui::Response::context_menu`
+        // fires on secondary-click regardless of keyboard focus, so unlike
+        // every other input path here (which rides `view.set_focus(focused)`
+        // above and `view.rs`'s own `if !layout.has_focus() { return }`),
+        // right-click was reaching Paste/Clear even while a dialog was open
+        // (`focused == false` — see `app.rs`'s `focused` computation) or,
+        // for a background tab, even when it wasn't the one on screen. Only
+        // attaching the menu when `focused` is true makes the right-click
+        // path respect the same "no terminal interaction right now" rule as
+        // keystrokes and selection.
+        if focused {
+            response.context_menu(|ui| {
+                if ui
+                    .add_enabled(self.has_selection(), egui::Button::new("Copy"))
+                    .clicked()
+                {
+                    let text = self.copy_selection();
+                    ui.ctx().copy_text(text);
+                    ui.close_menu();
                 }
-                ui.close_menu();
-            }
-            if ui.button("Select All").clicked() {
-                self.select_all();
-                ui.close_menu();
-            }
-            if ui.button("Clear").clicked() {
-                self.clear_screen();
-                ui.close_menu();
-            }
-        });
+                if ui.button("Paste").clicked() {
+                    // Menu Paste reads the OS clipboard directly via `arboard`
+                    // (unlike keyboard Ctrl+V, which rides egui's own
+                    // `Event::Paste` — see `view.rs`'s `process_keyboard_event`).
+                    // Best-effort: a clipboard that can't be opened or holds no
+                    // text is silently a no-op rather than an error dialog.
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        if let Ok(text) = clipboard.get_text() {
+                            self.paste_str(&text);
+                        }
+                    }
+                    ui.close_menu();
+                }
+                if ui.button("Select All").clicked() {
+                    self.select_all();
+                    ui.close_menu();
+                }
+                if ui.button("Clear").clicked() {
+                    self.clear_screen();
+                    ui.close_menu();
+                }
+            });
+        }
     }
 
     /// `Some(code)` once the child process has exited.
