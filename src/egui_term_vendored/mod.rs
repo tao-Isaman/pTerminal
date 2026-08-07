@@ -33,6 +33,15 @@
 //!    when `open::that` failed. It runs on the UI thread, so Ctrl+clicking a
 //!    `mailto:`/unknown-scheme link with no registered handler crashed the
 //!    whole app. The failure is now ignored (`let _ = open::that(url);`).
+//! 7. `view.rs` + `backend/mod.rs` — keyboard copy/paste semantics. Paste
+//!    (`Event::Paste`) used to gate on COMMAND|SHIFT and otherwise send a
+//!    literal ^V byte (0x16); it now unconditionally writes the pasted text,
+//!    so both Ctrl+V and Ctrl+Shift+V paste. Copy (`Event::Copy`) used to
+//!    gate on COMMAND|SHIFT and otherwise always send ^C (0x03), even with an
+//!    active selection; it now copies when there's a selection and
+//!    interrupts (^C) when there isn't, via the new pure `ctrl_c_action`
+//!    helper and `TerminalBackend::has_selection()` accessor in `view.rs`
+//!    and `backend/mod.rs` respectively.
 
 // This is library code kept as close to upstream as possible; not every item it
 // exports is used by pTerminal (yet).

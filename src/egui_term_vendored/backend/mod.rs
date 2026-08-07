@@ -287,6 +287,14 @@ impl TerminalBackend {
         viewport_to_point(display_offset, Point::new(line, col))
     }
 
+    // pTerminal delta 7: exposes whether there's an active selection without
+    // building the selected string, so `view.rs`'s Ctrl+C handler can decide
+    // copy-vs-interrupt via `ctrl_c_action` without paying for
+    // `selectable_content()`'s grid walk when there's nothing selected.
+    pub fn has_selection(&self) -> bool {
+        self.last_content().selectable_range.is_some()
+    }
+
     pub fn selectable_content(&self) -> String {
         let content = self.last_content();
         let mut result = String::new();

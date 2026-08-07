@@ -365,27 +365,40 @@ fn process_keyboard_event(
         egui::Event::Text(text) => {
             process_text_event(&text, modifiers, backend, bindings_layout)
         },
+        // pTerminal delta 7: paste unconditionally writes the pasted text to
+        // the PTY on every platform. Upstream gated this on COMMAND|SHIFT and
+        // otherwise sent a literal ^V byte (0x16) as a "hotfix" — that made
+        // plain Ctrl+V a no-op-looking keystroke instead of a paste, which is
+        // not how any terminal emulator behaves. Ctrl+V and Ctrl+Shift+V both
+        // paste now.
         egui::Event::Paste(text) => InputAction::BackendCall(
-            #[cfg(not(any(target_os = "ios", target_os = "macos")))]
-            if modifiers.contains(Modifiers::COMMAND | Modifiers::SHIFT) {
-                BackendCommand::Write(text.as_bytes().to_vec())
-            } else {
-                // Hotfix - Send ^V when there's not selection on view.
-                BackendCommand::Write([0x16].to_vec())
-            },
-            #[cfg(any(target_os = "ios", target_os = "macos"))]
-            {
-                BackendCommand::Write(text.as_bytes().to_vec())
-            },
+            BackendCommand::Write(text.as_bytes().to_vec()),
         ),
+        // pTerminal delta 7: Ctrl+C now copies when there is a selection and
+        // interrupts (sends ^C, 0x03) when there isn't, matching common
+        // terminal emulator behavior. Upstream gated copying on COMMAND|SHIFT
+        // and otherwise always sent ^C — pressing plain Ctrl+C with an active
+        // selection would interrupt the running program instead of copying.
+        // Ctrl+Shift+C still copies (via `ctrl_c_action`'s `shift` param,
+        // which only matters when there's no selection: it suppresses the
+        // ^C interrupt so Shift+Ctrl+C is a no-op rather than killing the
+        // foreground process).
         egui::Event::Copy => {
             #[cfg(not(any(target_os = "ios", target_os = "macos")))]
-            if modifiers.contains(Modifiers::COMMAND | Modifiers::SHIFT) {
-                let content = backend.selectable_content();
-                InputAction::WriteToClipboard(content)
-            } else {
-                // Hotfix - Send ^C when there's not selection on view.
-                InputAction::BackendCall(BackendCommand::Write([0x3].to_vec()))
+            {
+                let act = ctrl_c_action(
+                    backend.has_selection(),
+                    modifiers.contains(Modifiers::SHIFT),
+                );
+                match act {
+                    CopyAction::Copy => InputAction::WriteToClipboard(
+                        backend.selectable_content(),
+                    ),
+                    CopyAction::Interrupt => InputAction::BackendCall(
+                        BackendCommand::Write(vec![0x03]),
+                    ),
+                    CopyAction::Nothing => InputAction::Ignore,
+                }
             }
             #[cfg(any(target_os = "ios", target_os = "macos"))]
             {
@@ -604,6 +617,54 @@ fn build_start_select_command(
         cursor_position.x - layout.rect.min.x,
         cursor_position.y - layout.rect.min.y,
     )
+}
+
+// pTerminal delta 7: Ctrl+C should copy-or-interrupt depending on selection
+// state (previously it always sent ^C when COMMAND|SHIFT wasn't held, even
+// with an active selection). This pure helper decides the outcome so it can
+// be unit tested without a live `Term`; the impure parts (reading
+// `backend.has_selection()`, writing to the clipboard, sending the byte) stay
+// in `process_keyboard_event`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyAction {
+    Copy,
+    Interrupt,
+    Nothing,
+}
+
+pub fn ctrl_c_action(has_selection: bool, shift: bool) -> CopyAction {
+    if has_selection {
+        CopyAction::Copy
+    } else if shift {
+        CopyAction::Nothing
+    } else {
+        CopyAction::Interrupt
+    }
+}
+
+#[cfg(test)]
+mod ctrl_c_action_tests {
+    use super::{ctrl_c_action, CopyAction};
+
+    #[test]
+    fn selection_no_shift_copies() {
+        assert_eq!(ctrl_c_action(true, false), CopyAction::Copy);
+    }
+
+    #[test]
+    fn selection_with_shift_copies() {
+        assert_eq!(ctrl_c_action(true, true), CopyAction::Copy);
+    }
+
+    #[test]
+    fn no_selection_no_shift_interrupts() {
+        assert_eq!(ctrl_c_action(false, false), CopyAction::Interrupt);
+    }
+
+    #[test]
+    fn no_selection_with_shift_does_nothing() {
+        assert_eq!(ctrl_c_action(false, true), CopyAction::Nothing);
+    }
 }
 
 fn process_mouse_move(
