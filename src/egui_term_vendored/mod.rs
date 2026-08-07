@@ -87,6 +87,34 @@
 //!    against the unmodified upstream method before the fix (an oldest,
 //!    scrolled-off marker line was missing from the copied text) and
 //!    passes after it.
+//!
+//!    **Follow-up (code review, same delta index entry):** that
+//!    `iter_from`-based fix carried two further bugs of its own, both
+//!    fixed by replacing the hand-rolled loop entirely with
+//!    alacritty_terminal's own `Term::selection_to_string()`
+//!    (`term/mod.rs:529`, an inherent `impl<T> Term<T>` method — no new
+//!    trait import needed). First, an `iter_from` off-by-one dropped the
+//!    selection's very first character (`Grid::iter_from(point)` advances
+//!    past `point` before yielding, so a naive `iter_from(range.start)`
+//!    skips it — caught live: Select All + Copy on a buffer starting with
+//!    "Windows PowerShell" produced "indows PowerShell"). Second, and the
+//!    more serious of the two: the loop appended every selected cell with
+//!    nothing between rows, so ANY multi-row selection — an ordinary 2+
+//!    line drag-select, not just Select All — copied as one run-on
+//!    string, each source row space-padded out to the full column width;
+//!    unusable when pasted. `Term::selection_to_string()` fixes both by
+//!    construction: it reads the live `Term::selection` field directly,
+//!    then walks per line via its own `bounds_to_string`/`line_to_string`,
+//!    which insert `\n` between rows, trim each row to its own occupied
+//!    length (`LineLength::line_length` — no more full-width space
+//!    padding), and suppress that `\n` when a row's last cell carries
+//!    `Flags::WRAPLINE` so a soft-wrapped line isn't broken by a spurious
+//!    newline. Both `view.rs`'s Ctrl+C (`WriteToClipboard`) and the
+//!    context menu's Copy (`term.rs`) call this same method, so fixing it
+//!    here fixed both paths. Covered by a dedicated regression test
+//!    (`selectable_content_joins_multiple_selected_rows_with_newlines`)
+//!    that failed with a run-on, space-padded string against the
+//!    pre-fix code and passes now.
 
 // This is library code kept as close to upstream as possible; not every item it
 // exports is used by pTerminal (yet).

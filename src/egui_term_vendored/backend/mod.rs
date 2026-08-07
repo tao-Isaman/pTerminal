@@ -310,50 +310,51 @@ impl TerminalBackend {
         self.last_content().selectable_range.is_some()
     }
 
-    // pTerminal delta 9: walks the selection's own absolute range
-    // (`grid.iter_from(range.start)`, stopping just past `range.end`)
-    // instead of upstream's `content.grid.display_iter()`, which only
-    // visits whatever the viewport happened to be scrolled to at the last
-    // `sync()`. `content.grid` is a full clone of the grid (scrollback
-    // included — see `sync()`), so the data was always there; only the
-    // upstream iterator choice was viewport-bound. That was harmless for a
-    // small selection made and copied without scrolling in between, but
-    // `BackendCommand::SelectAll`'s whole point is a selection that
-    // deliberately spans far more than one screen, and Ctrl+C/the menu's
-    // Copy call this same method — so left unfixed, "Select All" would
-    // silently copy only whatever ~50 lines were on screen at the moment
-    // of the last render, not the buffer its own highlight implies. Caught
-    // by this method's own unit test (see `tests` below) before this fix
-    // was written: the test failed with exactly that symptom (an oldest,
-    // scrolled-off marker missing from the copied text) against the
-    // unmodified upstream implementation.
+    // pTerminal delta 9: delegates to alacritty_terminal 0.25's own
+    // `Term::selection_to_string(&self) -> Option<String>`
+    // (`term/mod.rs:529`, an inherent method on `impl<T> Term<T>` — no
+    // `EventListener` bound required) instead of a hand-rolled
+    // `grid.iter_from` walk. That hand-rolled walk went through two
+    // distinct, real bugs before landing here:
     //
-    // Live verification then caught a second bug in this fix itself:
-    // `Grid::iter_from(point)` does NOT yield `point` — its `next()`
-    // (`grid/mod.rs`) advances the cursor BEFORE returning a cell, so the
-    // first item produced is the cell AFTER `point`. `display_iter()`
-    // (upstream, unmodified) already works around this by starting its
-    // internal cursor one line early; a naive `iter_from(range.start)`
-    // here does not, and silently drops the selection's very first
-    // character (confirmed live: Select All then Copy on a buffer
-    // starting with "Windows PowerShell" produced "indows PowerShell").
-    // Fixed by reading `range.start`'s cell directly via `grid[point]`
-    // (same `Index<Point>` used by `open_link`, above) before the loop.
+    // 1. Upstream's ORIGINAL `selectable_content()` (unmodified vendored
+    //    code, before this delta touched it) walked
+    //    `content.grid.display_iter()` — bound to whatever the viewport
+    //    happened to be scrolled to at the last `sync()`, not the actual
+    //    selection. Harmless for a small on-screen selection, but exactly
+    //    wrong for `BackendCommand::SelectAll`, whose whole point is a
+    //    selection spanning far more than one screen. Caught by this
+    //    delta's own unit test before any fix existed: an oldest,
+    //    scrolled-off marker was missing from the copied text.
+    // 2. This delta's OWN first fix — walking `content.grid.iter_from`
+    //    manually, bounded by the selection's `SelectionRange` — replaced
+    //    bug #1 with two further bugs of its own: an `iter_from`
+    //    off-by-one that dropped the selection's first character (fixed,
+    //    then caught for real via a regression test), and — the subject
+    //    of THIS revision — appending every selected cell with nothing
+    //    between rows, so a multi-row selection (an ordinary 2+ line
+    //    drag-select, or Select All) copied as one run-on string, each
+    //    source row space-padded out to the full column width. Unusable
+    //    when pasted. Both `view.rs`'s Ctrl+C (`WriteToClipboard`) and the
+    //    context menu's Copy (`term.rs`) call this same method, so either
+    //    path reproduced it.
+    //
+    // `Term::selection_to_string()` reads the LIVE `Term::selection` field
+    // directly (via `Selection::to_range`, not a display-bound snapshot),
+    // then walks per line via its own `bounds_to_string`/`line_to_string`
+    // helpers, which (a) insert `\n` between rows, (b) trim each row to
+    // its own occupied length (`LineLength::line_length` — trailing blank
+    // cells are dropped, so no more space-padding to full column width),
+    // and (c) suppress that trailing `\n` when the row's last cell
+    // carries `Flags::WRAPLINE`, so a soft-wrapped line (one logical line
+    // that overflowed the terminal width and continues on the next grid
+    // row) is NOT broken by a spurious newline. All three behaviors are
+    // upstream's own long-standing, unit-tested implementation (see its
+    // `term/mod.rs` `selection_to_string` tests) — not reproduced by hand
+    // here, eliminating the class of off-by-one/run-on bugs above by
+    // construction rather than by another manual patch.
     pub fn selectable_content(&self) -> String {
-        let content = self.last_content();
-        let mut result = String::new();
-        if let Some(range) = content.selectable_range {
-            result.push(content.grid.index(range.start).c);
-            for indexed in content.grid.iter_from(range.start) {
-                if indexed.point > range.end {
-                    break;
-                }
-                if range.contains(indexed.point) {
-                    result.push(indexed.c);
-                }
-            }
-        }
-        result
+        self.term.lock().selection_to_string().unwrap_or_default()
     }
 
     pub fn sync(&mut self) -> &RenderableContent {
@@ -898,18 +899,29 @@ mod tests {
     }
 
     /// Regression test for the `Grid::iter_from` off-by-one caught during
-    /// live verification: `selectable_content()`'s fixed range-walking loop
-    /// only advances the cursor and never separately visits `range.start`
-    /// itself, so the selection's very first character was silently
-    /// dropped (live repro: Select All then Copy on a buffer starting with
-    /// "Windows PowerShell" produced "indows PowerShell"). A default,
-    /// freshly-spawned `TerminalBackend` has no scrollback yet
-    /// (`history_size() == 0`), so `topmost_line() == Line(0)` and
-    /// `bottommost_line() == Line(49)` (the default `TerminalSize`'s
-    /// `num_lines`) — Select All's range is then exactly the visible
-    /// 50-line × 80-column grid, so `selectable_content()`'s length is a
-    /// precise, deterministic 4000 if and only if every cell — including
-    /// the very first — was actually visited.
+    /// live verification (Select All then Copy on a buffer starting with
+    /// "Windows PowerShell" produced "indows PowerShell" — the selection's
+    /// very first character silently dropped). That hand-rolled
+    /// range-walking loop is gone now (superseded by the Task 3 review fix
+    /// below: `selectable_content()` delegates to
+    /// `Term::selection_to_string()` and no longer walks the grid by
+    /// hand), so this specific bug class cannot recur structurally — the
+    /// test is kept as a precise-shape regression check, with its expected
+    /// value recomputed for `selection_to_string()`'s real semantics
+    /// instead of the old hand-rolled loop's.
+    ///
+    /// A default, freshly-spawned `TerminalBackend` has no scrollback yet
+    /// (`history_size() == 0`) and — read synchronously, before the
+    /// child's own startup banner can arrive over the PTY channel — a
+    /// still-completely-blank grid, so Select All's range is exactly the
+    /// visible 50-line × 80-column grid with every cell blank.
+    /// `Term::selection_to_string()` trims each blank row to an empty
+    /// string (`LineLength::line_length` finds no non-space cell) and
+    /// joins the 50 (empty) rows with `\n`, giving exactly 49 newline
+    /// characters: 50 rows joined by 49 separators, zero characters of
+    /// actual content. (Under the OLD hand-rolled loop this asserted
+    /// `4000 == 50 * 80` — every cell's literal space, one run-on string,
+    /// nothing between rows; a dropped first cell read 3999.)
     #[test]
     fn select_all_on_a_fresh_backend_does_not_drop_the_first_character() {
         let mut backend = spawn_backend(911);
@@ -919,11 +931,79 @@ mod tests {
         assert!(backend.has_selection());
 
         let selected = backend.selectable_content();
+        let expected = "\n".repeat(49);
         assert_eq!(
-            selected.len(),
-            50 * 80,
-            "expected exactly one full 50x80 screen's worth of characters \
-             (a dropped first cell would read 3999 here); got: {selected:?}"
+            selected, expected,
+            "expected 50 blank rows joined by '\\n' (49 separators, no \
+             padding, no dropped first cell); got: {selected:?}"
+        );
+    }
+
+    /// THE review-finding regression test: a multi-row selection must copy
+    /// with real line breaks between rows, not as one run-on,
+    /// space-padded string. Before this fix, `selectable_content()`
+    /// appended every selected cell with nothing between rows, so an
+    /// ordinary 2+ line drag-select (or Select All) copied as a single
+    /// line, each source row padded out to the full column width — this
+    /// test fails against that code with
+    /// `"line1" + " ".repeat(75) + "line2"` instead of `"line1\nline2"`
+    /// (confirmed as genuine RED before the fix landed; see the fix
+    /// report). Both copy paths (`view.rs`'s Ctrl+C `WriteToClipboard` and
+    /// the context menu's Copy in `term.rs`) call this same method, so
+    /// fixing it here fixes both.
+    ///
+    /// Bypasses the PTY child entirely for determinism: `ClearScreen`
+    /// wipes whatever the shell has printed asynchronously so far, then
+    /// `Handler::goto`/`input`/`carriage_return`/`linefeed` (the same
+    /// trait already used by `TerminalBackend::clear_screen`, driving the
+    /// grid exactly as an incoming escape sequence would) write two known
+    /// lines directly, and a hand-built `Selection` (mirroring
+    /// `select_all`'s own `Selection::new`/`update` pattern) selects
+    /// precisely those two rows — no dependency on the shell's own output
+    /// timing or content.
+    #[test]
+    fn selectable_content_joins_multiple_selected_rows_with_newlines() {
+        let mut backend = spawn_backend(912);
+
+        // Start from a known-empty, known-cursor-position buffer regardless
+        // of whatever the shell has already printed asynchronously.
+        backend.process_command(BackendCommand::ClearScreen);
+        {
+            let term = backend.term.clone();
+            let mut term = term.lock();
+            term.goto(0, 0);
+            for ch in "line1".chars() {
+                term.input(ch);
+            }
+            term.carriage_return();
+            term.linefeed();
+            for ch in "line2".chars() {
+                term.input(ch);
+            }
+        }
+        backend.sync();
+
+        // Select exactly the two rows just written: (0,0) through "line2"'s
+        // last column (4) on line 1. Mirrors `select_all`'s own
+        // `Selection::new` + `update` construction.
+        {
+            let term = backend.term.clone();
+            let mut term = term.lock();
+            let start = Point::new(Line(0), Column(0));
+            let end = Point::new(Line(1), Column(4));
+            let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+            selection.update(end, Side::Right);
+            term.selection = Some(selection);
+        }
+        backend.sync();
+        assert!(backend.has_selection());
+
+        let selected = backend.selectable_content();
+        assert_eq!(
+            selected, "line1\nline2",
+            "a known 2-line selection must copy with a real line break \
+             between rows, not as one run-on, space-padded string; got: \
+             {selected:?}"
         );
     }
 }
