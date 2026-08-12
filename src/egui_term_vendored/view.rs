@@ -14,7 +14,6 @@ use egui::{Id, PointerButton};
 use crate::egui_term_vendored::backend::BackendCommand;
 use crate::egui_term_vendored::backend::TerminalBackend;
 use crate::egui_term_vendored::backend::{LinkAction, MouseButton, SelectionType};
-use crate::egui_term_vendored::bindings::Binding;
 use crate::egui_term_vendored::bindings::{BindingAction, BindingsLayout, InputKind};
 use crate::egui_term_vendored::font::TerminalFont;
 use crate::egui_term_vendored::theme::TerminalTheme;
@@ -42,14 +41,25 @@ pub struct TerminalViewState {
     current_mouse_position_on_grid: TerminalGridPoint,
 }
 
+// pTerminal perf delta: the theme and keybinding table are compile-time
+// constants (pTerminal never customizes them — the `set_theme`/`set_font`/
+// `add_bindings` builders were never called and are deleted), yet upstream
+// rebuilt both on every `TerminalView::new`, i.e. every frame: ~27 palette
+// `String`s + a 240-entry HashMap + ~150 bindings with per-insert linear
+// scans. Built once now, shared by every terminal.
+static DEFAULT_THEME: std::sync::LazyLock<TerminalTheme> =
+    std::sync::LazyLock::new(TerminalTheme::default);
+static DEFAULT_BINDINGS: std::sync::LazyLock<BindingsLayout> =
+    std::sync::LazyLock::new(BindingsLayout::new);
+
 pub struct TerminalView<'a> {
     widget_id: Id,
     has_focus: bool,
     size: Vec2,
     backend: &'a mut TerminalBackend,
     font: TerminalFont,
-    theme: TerminalTheme,
-    bindings_layout: BindingsLayout,
+    theme: &'static TerminalTheme,
+    bindings_layout: &'static BindingsLayout,
 }
 
 impl Widget for TerminalView<'_> {
@@ -76,10 +86,10 @@ impl Widget for TerminalView<'_> {
 
 impl<'a> TerminalView<'a> {
     pub fn new(ui: &mut egui::Ui, backend: &'a mut TerminalBackend) -> Self {
-        let widget_id = ui.make_persistent_id(format!(
-            "{}{}",
-            EGUI_TERM_WIDGET_ID_PREFIX, backend.id
-        ));
+        // pTerminal perf delta: hash the prefix + id directly instead of
+        // allocating a `format!` string every frame.
+        let widget_id =
+            ui.make_persistent_id((EGUI_TERM_WIDGET_ID_PREFIX, backend.id));
 
         Self {
             widget_id,
@@ -87,41 +97,14 @@ impl<'a> TerminalView<'a> {
             size: ui.available_size(),
             backend,
             font: TerminalFont::default(),
-            theme: TerminalTheme::default(),
-            bindings_layout: BindingsLayout::new(),
+            theme: &DEFAULT_THEME,
+            bindings_layout: &DEFAULT_BINDINGS,
         }
-    }
-
-    #[inline]
-    pub fn set_theme(mut self, theme: TerminalTheme) -> Self {
-        self.theme = theme;
-        self
-    }
-
-    #[inline]
-    pub fn set_font(mut self, font: TerminalFont) -> Self {
-        self.font = font;
-        self
     }
 
     #[inline]
     pub fn set_focus(mut self, has_focus: bool) -> Self {
         self.has_focus = has_focus;
-        self
-    }
-
-    #[inline]
-    pub fn set_size(mut self, size: Vec2) -> Self {
-        self.size = size;
-        self
-    }
-
-    #[inline]
-    pub fn add_bindings(
-        mut self,
-        bindings: Vec<(Binding<InputKind>, BindingAction)>,
-    ) -> Self {
-        self.bindings_layout.add_bindings(bindings);
         self
     }
 
@@ -136,10 +119,16 @@ impl<'a> TerminalView<'a> {
     }
 
     fn resize(self, layout: &Response) -> Self {
-        self.backend.process_command(BackendCommand::Resize(
-            Size::from(layout.rect.size()),
-            self.font.font_measure(&layout.ctx),
-        ));
+        // pTerminal perf delta: skip the command (and its terminal-mutex
+        // lock) entirely on the ~every frame where nothing changed —
+        // upstream's size check lived inside `resize()`, *after* the lock
+        // was already taken.
+        let layout_size = Size::from(layout.rect.size());
+        let font_size = self.font.font_measure(&layout.ctx);
+        if self.backend.needs_resize(layout_size, font_size) {
+            self.backend
+                .process_command(BackendCommand::Resize(layout_size, font_size));
+        }
 
         self
     }
@@ -158,7 +147,27 @@ impl<'a> TerminalView<'a> {
         let pointer_inside = layout.contains_pointer();
 
         let modifiers = layout.ctx.input(|i| i.modifiers);
-        let events = layout.ctx.input(|i| i.events.clone());
+        // pTerminal perf delta: upstream cloned the frame's ENTIRE event
+        // vector (owned `String` payloads included); only the kinds handled
+        // below are worth cloning.
+        let events: Vec<egui::Event> = layout.ctx.input(|i| {
+            i.events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Text(_)
+                            | egui::Event::Key { .. }
+                            | egui::Event::Copy
+                            | egui::Event::Paste(_)
+                            | egui::Event::MouseWheel { .. }
+                            | egui::Event::PointerButton { .. }
+                            | egui::Event::PointerMoved(_)
+                    )
+                })
+                .cloned()
+                .collect()
+        });
         for event in events {
             let mut input_actions = vec![];
 
@@ -302,6 +311,11 @@ impl<'a> TerminalView<'a> {
         let cell_width = content.terminal_size.cell_width as f32;
         let global_bg =
             self.theme.get_color(Color::Named(NamedColor::Background));
+        // pTerminal perf delta: upstream called `painter.fonts(|c| c.clone())`
+        // once per non-blank cell — an exclusive write-lock on the whole egui
+        // `Context` per cell per frame. `Fonts` is an `Arc` wrapper; one clone
+        // up front serves the entire loop.
+        let fonts = painter.fonts(|f| f.clone());
 
         let mut shapes = vec![Shape::Rect(RectShape::filled(
             Rect::from_min_max(layout_min, layout_max),
@@ -309,8 +323,11 @@ impl<'a> TerminalView<'a> {
             global_bg,
         ))];
 
-        for indexed in content.grid.display_iter() {
-            let flags = indexed.cell.flags;
+        // pTerminal perf delta: iterates the synced viewport snapshot —
+        // see `RenderableContent::cells`. Points are original buffer
+        // coordinates, so the selection/hyperlink range checks are unchanged.
+        for (point, cell) in &content.cells {
+            let flags = cell.flags;
             let is_wide_char_spacer =
                 flags.contains(cell::Flags::WIDE_CHAR_SPACER);
             if is_wide_char_spacer {
@@ -325,20 +342,19 @@ impl<'a> TerminalView<'a> {
                 flags.intersects(cell::Flags::DIM | cell::Flags::DIM_BOLD);
             let is_selected = content
                 .selectable_range
-                .is_some_and(|r| r.contains(indexed.point));
+                .is_some_and(|r| r.contains(*point));
             let is_hovered_hyperling =
                 content.hovered_hyperlink.as_ref().is_some_and(|r| {
-                    r.contains(&indexed.point)
+                    r.contains(point)
                         && r.contains(&state.current_mouse_position_on_grid)
                 });
 
-            let x = layout_min.x + (cell_width * indexed.point.column.0 as f32);
-            let line_num =
-                indexed.point.line.0 + content.grid.display_offset() as i32;
+            let x = layout_min.x + (cell_width * point.column.0 as f32);
+            let line_num = point.line.0 + content.display_offset as i32;
             let y = layout_min.y + (cell_height * line_num as f32);
 
-            let mut fg = self.theme.get_color(indexed.fg);
-            let mut bg = self.theme.get_color(indexed.bg);
+            let mut fg = self.theme.get_color(cell.fg);
+            let mut bg = self.theme.get_color(cell.bg);
             let cell_width = if is_wide_char {
                 cell_width * 2.0
             } else {
@@ -378,7 +394,7 @@ impl<'a> TerminalView<'a> {
             }
 
             // Handle cursor rendering
-            if content.grid.cursor.point == indexed.point {
+            if content.cursor_point == *point {
                 let cursor_color = self.theme.get_color(content.cursor.fg);
                 shapes.push(Shape::Rect(RectShape::filled(
                     Rect::from_min_size(
@@ -391,10 +407,8 @@ impl<'a> TerminalView<'a> {
             }
 
             // Draw text content
-            if indexed.c != ' ' && indexed.c != '\t' {
-                if content.grid.cursor.point == indexed.point
-                    && is_app_cursor_mode
-                {
+            if cell.c != ' ' && cell.c != '\t' {
+                if content.cursor_point == *point && is_app_cursor_mode {
                     std::mem::swap(&mut fg, &mut bg);
                 }
 
@@ -402,12 +416,12 @@ impl<'a> TerminalView<'a> {
                 // marks) are zero-width chars alacritty stores next to the
                 // base char — append them so they overstrike it instead of
                 // being silently dropped.
-                let mut text = indexed.c.to_string();
-                if let Some(zerowidth) = indexed.cell.zerowidth() {
+                let mut text = cell.c.to_string();
+                if let Some(zerowidth) = cell.zerowidth() {
                     text.extend(zerowidth);
                 }
                 shapes.push(Shape::text(
-                    &painter.fonts(|c| c.clone()),
+                    &fonts,
                     Pos2 {
                         x: x + (cell_width / 2.0),
                         y,
@@ -830,7 +844,7 @@ fn process_mouse_move(
         cursor_x,
         cursor_y,
         &terminal_content.terminal_size,
-        terminal_content.grid.display_offset(),
+        terminal_content.display_offset,
     );
 
     // pTerminal delta 8: self-heal `is_dragged` from egui's raw

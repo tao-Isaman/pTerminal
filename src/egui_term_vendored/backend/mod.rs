@@ -20,7 +20,7 @@ use alacritty_terminal::term::{
 // parser as the child prints `\x1b[2J` etc.) so `BackendCommand::ClearScreen`
 // can call it directly. `ClearMode` is its argument type.
 use alacritty_terminal::vte::ansi::{ClearMode, Handler};
-use alacritty_terminal::{tty, Grid};
+use alacritty_terminal::tty;
 use egui::Modifiers;
 use settings::BackendSettings;
 use std::borrow::Cow;
@@ -157,6 +157,13 @@ pub struct TerminalBackend {
     size: TerminalSize,
     notifier: Notifier,
     last_content: RenderableContent,
+    /// pTerminal perf delta: `true` when the terminal may have changed since
+    /// the last [`Self::sync`] — set by every `process_command` and by
+    /// [`Self::mark_dirty`] (called from `TabTerm::poll` when PTY events
+    /// arrive). While clean, `sync` returns the cached snapshot instead of
+    /// re-walking the grid under the PTY lock, so frames driven by unrelated
+    /// UI (typing in a panel, hovering a tab) cost nothing here.
+    dirty: bool,
 }
 
 impl TerminalBackend {
@@ -201,12 +208,18 @@ impl TerminalBackend {
         let event_proxy = EventProxy(event_sender);
         let mut term = Term::new(config, &terminal_size, event_proxy.clone());
         let initial_content = RenderableContent {
-            grid: term.grid().clone(),
+            // pTerminal perf delta: a fresh grid is all blanks — an empty
+            // snapshot renders identically (just the background fill), and
+            // the first real `sync` (the backend starts `dirty`) fills it.
+            cells: Vec::new(),
+            display_offset: 0,
+            cursor_point: term.grid().cursor.point,
             selectable_range: None,
             terminal_mode: *term.mode(),
             terminal_size,
             cursor: term.grid_mut().cursor_cell().clone(),
             hovered_hyperlink: None,
+            hovered_url: None,
         };
         let term = Arc::new(FairMutex::new(term));
         let pty_event_loop =
@@ -249,10 +262,22 @@ impl TerminalBackend {
             size: terminal_size,
             notifier,
             last_content: initial_content,
+            dirty: true,
         })
     }
 
+    /// pTerminal perf delta: tells the backend its `Term` may have changed
+    /// (PTY output arrived), so the next [`Self::sync`] re-snapshots instead
+    /// of serving the cached content. Called from `TabTerm::poll`.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     pub fn process_command(&mut self, cmd: BackendCommand) {
+        // Every command can change what's on screen (write, scroll, resize,
+        // selection, hover) — over-invalidating on the read-only ones is
+        // harmless, it just costs one snapshot rebuild.
+        self.dirty = true;
         let term = self.term.clone();
         let mut term = term.lock();
         match cmd {
@@ -357,7 +382,19 @@ impl TerminalBackend {
         self.term.lock().selection_to_string().unwrap_or_default()
     }
 
+    /// pTerminal perf delta: upstream deep-cloned the ENTIRE grid here —
+    /// scrollback included — every frame (`terminal.grid().clone()`). With a
+    /// 10k-line scrollback that was ~10k `Vec<Cell>` allocations and
+    /// megabytes of memcpy per frame, all while holding the same
+    /// `FairMutex<Term>` the PTY reader thread needs to apply new output.
+    /// The renderer only ever walks the visible viewport
+    /// (`display_iter()`), so only that is snapshotted now, into a reused
+    /// buffer — and only when [`Self::dirty`] says something changed.
     pub fn sync(&mut self) -> &RenderableContent {
+        if !self.dirty {
+            return &self.last_content;
+        }
+        self.dirty = false;
         let term = self.term.clone();
         let mut terminal = term.lock();
         let selectable_range = match &terminal.selection {
@@ -365,10 +402,15 @@ impl TerminalBackend {
             None => None,
         };
 
-        let cursor = terminal.grid_mut().cursor_cell().clone();
-        self.last_content.grid = terminal.grid().clone();
+        self.last_content.cursor = terminal.grid_mut().cursor_cell().clone();
+        let grid = terminal.grid();
+        self.last_content.cells.clear();
+        self.last_content
+            .cells
+            .extend(grid.display_iter().map(|i| (i.point, i.cell.clone())));
+        self.last_content.display_offset = grid.display_offset();
+        self.last_content.cursor_point = grid.cursor.point;
         self.last_content.selectable_range = selectable_range;
-        self.last_content.cursor = cursor.clone();
         self.last_content.terminal_mode = *terminal.mode();
         self.last_content.terminal_size = self.size;
         self.last_content()
@@ -386,14 +428,32 @@ impl TerminalBackend {
     ) {
         match link_action {
             LinkAction::Hover => {
-                self.last_content.hovered_hyperlink = self.regex_match_at(
+                let range = self.regex_match_at(
                     terminal,
                     point,
                     &mut self.url_regex.clone(),
                 );
+                // pTerminal perf delta: the URL text is extracted here, at
+                // hover time, from the LIVE grid (upstream walked the cloned
+                // grid at click time — `last_content` no longer carries the
+                // full grid to walk).
+                self.last_content.hovered_url = range.as_ref().map(|range| {
+                    let start = *range.start();
+                    let end = *range.end();
+                    let mut url = String::from(terminal.grid().index(start).c);
+                    for indexed in terminal.grid().iter_from(start) {
+                        url.push(indexed.c);
+                        if indexed.point == end {
+                            break;
+                        }
+                    }
+                    url
+                });
+                self.last_content.hovered_hyperlink = range;
             },
             LinkAction::Clear => {
                 self.last_content.hovered_hyperlink = None;
+                self.last_content.hovered_url = None;
             },
             LinkAction::Open => {
                 self.open_link();
@@ -402,18 +462,7 @@ impl TerminalBackend {
     }
 
     fn open_link(&self) {
-        if let Some(range) = &self.last_content.hovered_hyperlink {
-            let start = range.start();
-            let end = range.end();
-
-            let mut url = String::from(self.last_content.grid.index(*start).c);
-            for indexed in self.last_content.grid.iter_from(*start) {
-                url.push(indexed.c);
-                if indexed.point == *end {
-                    break;
-                }
-            }
-
+        if let Some(url) = &self.last_content.hovered_url {
             // pTerminal delta: 6 — upstream did
             // `open::that(url).unwrap_or_else(|_| panic!("link opening is failed"))`.
             // This runs on the UI thread, so a Ctrl+click on any link the OS
@@ -587,6 +636,16 @@ impl TerminalBackend {
         }
     }
 
+    /// pTerminal perf delta: lets `TerminalView::resize` skip
+    /// `process_command(Resize)` — and with it a `FairMutex<Term>` lock —
+    /// on the ~every frame where nothing changed. Mirrors the early-return
+    /// condition inside [`Self::resize`] exactly.
+    pub fn needs_resize(&self, layout_size: Size, font_size: Size) -> bool {
+        layout_size != self.size.layout_size
+            || font_size.width as u16 != self.size.cell_width
+            || font_size.height as u16 != self.size.cell_height
+    }
+
     fn resize(
         &mut self,
         terminal: &mut Term<EventProxy>,
@@ -679,9 +738,20 @@ fn visible_regex_match_iter<'a>(
         .take_while(move |rm| rm.start().line <= viewport_end)
 }
 
+/// pTerminal perf delta: upstream held a full `Grid<Cell>` clone here
+/// (scrollback included). The renderer only reads the visible viewport, so
+/// this now carries exactly that: the visible cells (with their original
+/// buffer-space `Point`s, so selection/hyperlink range checks still work
+/// unchanged), plus the two grid scalars the renderer used to pull from the
+/// clone. The hovered link's URL text is captured at hover time
+/// (`hovered_url`) since there is no longer a full grid to walk at click
+/// time.
 pub struct RenderableContent {
-    pub grid: Grid<Cell>,
+    pub cells: Vec<(Point, Cell)>,
+    pub display_offset: usize,
+    pub cursor_point: Point,
     pub hovered_hyperlink: Option<RangeInclusive<Point>>,
+    pub hovered_url: Option<String>,
     pub selectable_range: Option<SelectionRange>,
     pub cursor: Cell,
     pub terminal_mode: TermMode,
@@ -691,8 +761,11 @@ pub struct RenderableContent {
 impl Default for RenderableContent {
     fn default() -> Self {
         Self {
-            grid: Grid::new(0, 0, 0),
+            cells: Vec::new(),
+            display_offset: 0,
+            cursor_point: Point::default(),
             hovered_hyperlink: None,
+            hovered_url: None,
             selectable_range: None,
             cursor: Cell::default(),
             terminal_mode: TermMode::empty(),
@@ -772,10 +845,14 @@ mod tests {
         wait_for(|| full_grid_text(backend).contains(needle))
     }
 
+    // pTerminal perf delta: reads the LIVE grid under the term lock —
+    // `RenderableContent` no longer carries the full grid (scrollback
+    // included), which is exactly what this helper needs to walk.
     fn full_grid_text(backend: &mut TerminalBackend) -> String {
-        let content = backend.sync();
-        let start = Point::new(content.grid.topmost_line(), Column(0));
-        content.grid.iter_from(start).map(|i| i.c).collect()
+        let term = backend.term.lock();
+        let grid = term.grid();
+        let start = Point::new(grid.topmost_line(), Column(0));
+        grid.iter_from(start).map(|i| i.c).collect()
     }
 
     /// Waits for the grid to stop changing across a few consecutive polls.
@@ -845,8 +922,9 @@ mod tests {
         // the assertions below actually exercise "reaches into
         // scrollback" rather than passing vacuously.
         let visible_only: String = {
+            backend.mark_dirty(); // PTY output arrived outside process_command
             let content = backend.sync();
-            content.grid.display_iter().map(|i| i.c).collect()
+            content.cells.iter().map(|(_, cell)| cell.c).collect()
         };
         assert!(
             !visible_only.contains("pterminal-oldest-line-marker"),
@@ -981,6 +1059,7 @@ mod tests {
                 term.input(ch);
             }
         }
+        backend.mark_dirty(); // the writes above bypassed process_command
         backend.sync();
 
         // Select exactly the two rows just written: (0,0) through "line2"'s
@@ -995,6 +1074,7 @@ mod tests {
             selection.update(end, Side::Right);
             term.selection = Some(selection);
         }
+        backend.mark_dirty(); // the selection above bypassed process_command
         backend.sync();
         assert!(backend.has_selection());
 

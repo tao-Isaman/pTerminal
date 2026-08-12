@@ -100,7 +100,9 @@ impl TabTerm {
     ///
     /// [`TabTerm::ui`] also polls, so a rendered terminal is never stale.
     pub fn poll(&mut self) {
+        let mut saw_event = false;
         while let Ok((_id, event)) = self.pty_rx.try_recv() {
+            saw_event = true;
             match event {
                 // `ChildExit` carries the real status code and is followed by `Exit`.
                 // `Exit` alone means the child is gone but the code was unreadable.
@@ -110,6 +112,12 @@ impl TabTerm {
                 },
                 _ => {},
             }
+        }
+        // Any PTY event means the terminal's content may have changed —
+        // tell the backend so its next `sync` re-snapshots the viewport
+        // (while clean, `sync` serves the cached copy; see `mark_dirty`).
+        if saw_event {
+            self.backend.mark_dirty();
         }
     }
 
@@ -429,7 +437,7 @@ pub fn agent_args(prompt: &str, resume: Option<&str>) -> Vec<String> {
 /// `taken`, so a normal agent slug that happens to BE `"orchestrator"` is
 /// bumped straight to `"orchestrator-2"` (or further, if that's taken too)
 /// rather than returned unchanged. The orchestrator's own tab is titled
-/// `"orchestrator"` directly (`app::new_orchestrator_workspace`), never
+/// `"orchestrator"` directly (`orchestrator::new_orchestrator_workspace`), never
 /// through this function, and `messages::resolve_target` treats that literal
 /// string as unconditionally special — a real agent tab titled it would be
 /// unreachable by its own name and would shadow the orchestrator.
@@ -1300,7 +1308,7 @@ mod tests {
 
     /// Task 4 (cross-workspace message routing): `"orchestrator"` is a
     /// reserved name — the orchestrator's own tab is titled it directly
-    /// (`app::new_orchestrator_workspace`, never through `unique_title`), and
+    /// (`orchestrator::new_orchestrator_workspace`, never through `unique_title`), and
     /// `resolve_target` treats it as unconditionally special. A normal
     /// agent slug that happens to BE `"orchestrator"` must never collide
     /// with (or be mistaken for) that reserved tab, even in a workspace

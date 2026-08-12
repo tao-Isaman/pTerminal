@@ -1,6 +1,5 @@
 use alacritty_terminal::vte::ansi::{self, NamedColor};
 use egui::Color32;
-use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct ColorPalette {
@@ -69,138 +68,93 @@ impl Default for ColorPalette {
     }
 }
 
+/// One slot per color a `Cell` can reference: ANSI indexed 0..=255, then
+/// `NamedColor`'s discriminants 256..=268 (`Foreground = 256` ..
+/// `DimForeground = 268` — verified against the vendored vte crate).
+const COLOR_SLOTS: usize = 269;
+
+/// pTerminal perf delta: upstream stored the palette as hex *strings* and
+/// re-parsed them (`u8::from_str_radix`) on every `get_color` call — which
+/// the render loop makes twice per visible cell per frame. All colors are
+/// now resolved to `Color32` once, here, at construction; `get_color` is a
+/// plain array index. Invalid hex still panics, just at construction instead
+/// of at first render (same failure surface, earlier and clearer).
 #[derive(Debug, Clone)]
 pub struct TerminalTheme {
-    palette: Box<ColorPalette>,
-    ansi256_colors: HashMap<u8, Color32>,
+    colors: Box<[Color32; COLOR_SLOTS]>,
 }
 
 impl Default for TerminalTheme {
     fn default() -> Self {
-        Self {
-            palette: Box::<ColorPalette>::default(),
-            ansi256_colors: TerminalTheme::get_ansi256_colors(),
-        }
+        Self::new(Box::default())
     }
 }
 
 impl TerminalTheme {
     pub fn new(palette: Box<ColorPalette>) -> Self {
-        Self {
-            palette,
-            ansi256_colors: TerminalTheme::get_ansi256_colors(),
+        let hex = |s: &str| {
+            hex_to_color(s).unwrap_or_else(|_| panic!("invalid color {s}"))
+        };
+        let background = hex(&palette.background);
+        let mut colors = Box::new([background; COLOR_SLOTS]);
+
+        // ANSI 0-15 come from the configurable palette.
+        let base16 = [
+            &palette.black, &palette.red, &palette.green, &palette.yellow,
+            &palette.blue, &palette.magenta, &palette.cyan, &palette.white,
+            &palette.bright_black, &palette.bright_red, &palette.bright_green,
+            &palette.bright_yellow, &palette.bright_blue, &palette.bright_magenta,
+            &palette.bright_cyan, &palette.bright_white,
+        ];
+        for (i, s) in base16.iter().enumerate() {
+            colors[i] = hex(s);
         }
-    }
 
-    fn get_ansi256_colors() -> HashMap<u8, Color32> {
-        let mut ansi256_colors = HashMap::new();
-
-        for r in 0..6 {
-            for g in 0..6 {
-                for b in 0..6 {
-                    // Reserve the first 16 colors for config.
-                    let index = 16 + r * 36 + g * 6 + b;
-                    let color = Color32::from_rgb(
+        // ANSI 16-231: the 6x6x6 color cube.
+        for r in 0..6u8 {
+            for g in 0..6u8 {
+                for b in 0..6u8 {
+                    let index = 16 + r as usize * 36 + g as usize * 6 + b as usize;
+                    colors[index] = Color32::from_rgb(
                         if r == 0 { 0 } else { r * 40 + 55 },
                         if g == 0 { 0 } else { g * 40 + 55 },
                         if b == 0 { 0 } else { b * 40 + 55 },
                     );
-                    ansi256_colors.insert(index, color);
                 }
             }
         }
 
-        let index: u8 = 232;
-        for i in 0..24 {
+        // ANSI 232-255: the grayscale ramp.
+        for i in 0..24u8 {
             let value = i * 10 + 8;
-            ansi256_colors
-                .insert(index + i, Color32::from_rgb(value, value, value));
+            colors[232 + i as usize] = Color32::from_rgb(value, value, value);
         }
 
-        ansi256_colors
+        // Named colors (discriminants 256..=268). Unlisted ones (Cursor)
+        // keep the background fill, matching upstream's `_ =>` arm.
+        colors[NamedColor::Foreground as usize] = hex(&palette.foreground);
+        colors[NamedColor::Background as usize] = background;
+        colors[NamedColor::BrightForeground as usize] = hex(
+            palette.bright_foreground.as_ref().unwrap_or(&palette.foreground),
+        );
+        colors[NamedColor::DimForeground as usize] = hex(&palette.dim_foreground);
+        colors[NamedColor::DimBlack as usize] = hex(&palette.dim_black);
+        colors[NamedColor::DimRed as usize] = hex(&palette.dim_red);
+        colors[NamedColor::DimGreen as usize] = hex(&palette.dim_green);
+        colors[NamedColor::DimYellow as usize] = hex(&palette.dim_yellow);
+        colors[NamedColor::DimBlue as usize] = hex(&palette.dim_blue);
+        colors[NamedColor::DimMagenta as usize] = hex(&palette.dim_magenta);
+        colors[NamedColor::DimCyan as usize] = hex(&palette.dim_cyan);
+        colors[NamedColor::DimWhite as usize] = hex(&palette.dim_white);
+
+        Self { colors }
     }
 
     pub fn get_color(&self, c: ansi::Color) -> Color32 {
         match c {
             ansi::Color::Spec(rgb) => Color32::from_rgb(rgb.r, rgb.g, rgb.b),
-            ansi::Color::Indexed(index) => {
-                if index <= 15 {
-                    let color = match index {
-                        // Normal terminal colors
-                        0 => &self.palette.black,
-                        1 => &self.palette.red,
-                        2 => &self.palette.green,
-                        3 => &self.palette.yellow,
-                        4 => &self.palette.blue,
-                        5 => &self.palette.magenta,
-                        6 => &self.palette.cyan,
-                        7 => &self.palette.white,
-                        // Bright terminal colors
-                        8 => &self.palette.bright_black,
-                        9 => &self.palette.bright_red,
-                        10 => &self.palette.bright_green,
-                        11 => &self.palette.bright_yellow,
-                        12 => &self.palette.bright_blue,
-                        13 => &self.palette.bright_magenta,
-                        14 => &self.palette.bright_cyan,
-                        15 => &self.palette.bright_white,
-                        _ => &self.palette.background,
-                    };
-
-                    return hex_to_color(color)
-                        .unwrap_or_else(|_| panic!("invalid color {}", color));
-                }
-
-                // Other colors
-                match self.ansi256_colors.get(&index) {
-                    Some(color) => *color,
-                    None => Color32::from_rgb(0, 0, 0),
-                }
-            },
-            ansi::Color::Named(c) => {
-                let color = match c {
-                    NamedColor::Foreground => &self.palette.foreground,
-                    NamedColor::Background => &self.palette.background,
-                    // Normal terminal colors
-                    NamedColor::Black => &self.palette.black,
-                    NamedColor::Red => &self.palette.red,
-                    NamedColor::Green => &self.palette.green,
-                    NamedColor::Yellow => &self.palette.yellow,
-                    NamedColor::Blue => &self.palette.blue,
-                    NamedColor::Magenta => &self.palette.magenta,
-                    NamedColor::Cyan => &self.palette.cyan,
-                    NamedColor::White => &self.palette.white,
-                    // Bright terminal colors
-                    NamedColor::BrightBlack => &self.palette.bright_black,
-                    NamedColor::BrightRed => &self.palette.bright_red,
-                    NamedColor::BrightGreen => &self.palette.bright_green,
-                    NamedColor::BrightYellow => &self.palette.bright_yellow,
-                    NamedColor::BrightBlue => &self.palette.bright_blue,
-                    NamedColor::BrightMagenta => &self.palette.bright_magenta,
-                    NamedColor::BrightCyan => &self.palette.bright_cyan,
-                    NamedColor::BrightWhite => &self.palette.bright_white,
-                    NamedColor::BrightForeground => {
-                        match &self.palette.bright_foreground {
-                            Some(color) => color,
-                            None => &self.palette.foreground,
-                        }
-                    },
-                    // Dim terminal colors
-                    NamedColor::DimForeground => &self.palette.dim_foreground,
-                    NamedColor::DimBlack => &self.palette.dim_black,
-                    NamedColor::DimRed => &self.palette.dim_red,
-                    NamedColor::DimGreen => &self.palette.dim_green,
-                    NamedColor::DimYellow => &self.palette.dim_yellow,
-                    NamedColor::DimBlue => &self.palette.dim_blue,
-                    NamedColor::DimMagenta => &self.palette.dim_magenta,
-                    NamedColor::DimCyan => &self.palette.dim_cyan,
-                    NamedColor::DimWhite => &self.palette.dim_white,
-                    _ => &self.palette.background,
-                };
-
-                hex_to_color(color)
-                    .unwrap_or_else(|_| panic!("invalid color {}", color))
-            },
+            ansi::Color::Indexed(index) => self.colors[index as usize],
+            ansi::Color::Named(c) => self.colors[c as usize],
         }
     }
 }
@@ -215,4 +169,58 @@ fn hex_to_color(hex: &str) -> anyhow::Result<Color32> {
     let b = u8::from_str_radix(&hex[5..7], 16)?;
 
     Ok(Color32::from_rgb(r, g, b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The resolved table must agree with what upstream's string-parsing
+    /// implementation produced for every representable color.
+    #[test]
+    fn resolved_colors_match_palette() {
+        let theme = TerminalTheme::default();
+        let p = ColorPalette::default();
+        assert_eq!(
+            theme.get_color(ansi::Color::Named(NamedColor::Foreground)),
+            hex_to_color(&p.foreground).unwrap()
+        );
+        assert_eq!(
+            theme.get_color(ansi::Color::Named(NamedColor::Background)),
+            hex_to_color(&p.background).unwrap()
+        );
+        assert_eq!(
+            theme.get_color(ansi::Color::Indexed(1)),
+            hex_to_color(&p.red).unwrap()
+        );
+        assert_eq!(
+            theme.get_color(ansi::Color::Indexed(15)),
+            hex_to_color(&p.bright_white).unwrap()
+        );
+        // color cube spot checks: 16 is (0,0,0), 231 is (255,255,255)
+        assert_eq!(theme.get_color(ansi::Color::Indexed(16)), Color32::from_rgb(0, 0, 0));
+        assert_eq!(theme.get_color(ansi::Color::Indexed(231)), Color32::from_rgb(255, 255, 255));
+        // grayscale ramp endpoints
+        assert_eq!(theme.get_color(ansi::Color::Indexed(232)), Color32::from_rgb(8, 8, 8));
+        assert_eq!(theme.get_color(ansi::Color::Indexed(255)), Color32::from_rgb(238, 238, 238));
+        // dim + bright-foreground fallback (None -> foreground)
+        assert_eq!(
+            theme.get_color(ansi::Color::Named(NamedColor::DimRed)),
+            hex_to_color(&p.dim_red).unwrap()
+        );
+        assert_eq!(
+            theme.get_color(ansi::Color::Named(NamedColor::BrightForeground)),
+            hex_to_color(&p.foreground).unwrap()
+        );
+        // unlisted named color (Cursor) falls back to background
+        assert_eq!(
+            theme.get_color(ansi::Color::Named(NamedColor::Cursor)),
+            hex_to_color(&p.background).unwrap()
+        );
+        // spec colors pass through
+        assert_eq!(
+            theme.get_color(ansi::Color::Spec(ansi::Rgb { r: 1, g: 2, b: 3 })),
+            Color32::from_rgb(1, 2, 3)
+        );
+    }
 }
