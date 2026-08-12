@@ -13,6 +13,7 @@ mod resume;
 mod shared_ctx;
 mod state;
 mod term;
+mod update;
 mod ui;
 mod watch;
 mod watcher;

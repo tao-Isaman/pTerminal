@@ -1,0 +1,50 @@
+# Builds and publishes a GitHub Release with the Windows installer whenever a
+# v* tag is pushed. Release procedure (from the design doc): bump `version` in
+# Cargo.toml, commit, `git tag vX.Y.Z`, `git push --tags` — the in-app update
+# check compares the release tag against CARGO_PKG_VERSION, so they must match
+# (the "versions agree" step enforces it).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release + upload the installer
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: versions agree (tag vs Cargo.toml)
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME.TrimStart('v')
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          if ($tag -ne $cargo) {
+            throw "tag v$tag does not match Cargo.toml version $cargo - the update check would never see this release as its own version"
+          }
+
+      - name: test
+        run: cargo test
+
+      - name: build
+        run: cargo build --release
+
+      - name: build installer
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\iscc.exe" /DAppVersion=$version installer\pterminal.iss
+
+      - name: publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            "installer\Output\pTerminal-setup.exe" `
+            --title "pTerminal $env:GITHUB_REF_NAME" `
+            --generate-notes

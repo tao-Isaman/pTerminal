@@ -432,6 +432,21 @@ impl PtApp {
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label("F2 context  Ctrl+T new tab");
+                    // Auto-update notice (see `crate::update`): present only
+                    // when the startup check found a newer release. One click
+                    // downloads the installer; `drain_events` runs it and
+                    // closes the app when the download lands.
+                    if let Some(info) = &self.update_available {
+                        if self.update_download.is_some() {
+                            ui.label("downloading update…");
+                        } else if ui
+                            .button(format!("update to v{}", info.version))
+                            .clicked()
+                        {
+                            self.update_download =
+                                Some(crate::update::spawn_download(info.installer_url.clone()));
+                        }
+                    }
                 });
             });
         });

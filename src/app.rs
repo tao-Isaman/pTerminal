@@ -359,6 +359,19 @@ pub struct PtApp {
     /// own event. Fixing it properly means deferring the message *text* too,
     /// i.e. a per-tab delivery FIFO; deliberately out of scope for this fix.
     pub pending_submit: Vec<(u64, std::time::Instant)>,
+    /// The once-per-launch update check ([`crate::update::spawn_update_check`],
+    /// started in [`PtApp::new`]); `drain_events` polls it and clears it after
+    /// the first answer (or a disconnect — the silent-failure case).
+    pub update_check: Option<std::sync::mpsc::Receiver<crate::update::UpdateInfo>>,
+    /// A newer published release, when the check found one. Drives the
+    /// status bar's "update to vX.Y.Z" button; stays set while a download
+    /// is in flight so a failed download brings the button back.
+    pub update_available: Option<crate::update::UpdateInfo>,
+    /// In-flight installer download ([`crate::update::spawn_download`],
+    /// started by the status-bar button). `drain_events` picks up the
+    /// result: on success the installer is spawned `/SILENT` and the app
+    /// closes; on failure the error dialog shows and the button returns.
+    pub update_download: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
 }
 
 /// How long after a delivered message's text is typed into a tab's PTY the
@@ -463,6 +476,10 @@ impl PtApp {
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
+            // once per launch; every failure mode is a silent no-op
+            update_check: Some(crate::update::spawn_update_check()),
+            update_available: None,
+            update_download: None,
         };
         // Don't let a watcher-skip notice clobber a state-corruption error
         // (set above via `corrupt_msg`) — that one is the more actionable /
@@ -1047,6 +1064,45 @@ impl PtApp {
                 Ok(None) => self.pending_file_pick = None, // user cancelled the dialog
                 Err(TryRecvError::Empty) => {} // still waiting on the worker thread
                 Err(TryRecvError::Disconnected) => self.pending_file_pick = None, // thread died
+            }
+        }
+        // once-per-launch update check result (see `crate::update`)
+        if let Some(rx) = &self.update_check {
+            match rx.try_recv() {
+                Ok(info) => {
+                    self.update_available = Some(info);
+                    self.update_check = None;
+                }
+                Err(TryRecvError::Empty) => {} // still checking
+                // Disconnect without an answer is the normal "no update /
+                // offline / no curl" outcome — silent by design.
+                Err(TryRecvError::Disconnected) => self.update_check = None,
+            }
+        }
+        // installer download result (started by the status-bar button)
+        if let Some(rx) = &self.update_download {
+            match rx.try_recv() {
+                Ok(Ok(installer)) => {
+                    self.update_download = None;
+                    // /SILENT: per-user install shows only a progress bar and
+                    // needs no elevation; the installer's [Run] entry
+                    // relaunches pTerminal when it finishes. Persist first —
+                    // the relaunched app resumes from state.json.
+                    self.persist();
+                    match std::process::Command::new(&installer).arg("/SILENT").spawn() {
+                        Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(e) => {
+                            // button returns: `update_available` is still set
+                            self.error = Some(format!("could not start installer: {e}"));
+                        }
+                    }
+                }
+                Ok(Err(msg)) => {
+                    self.update_download = None;
+                    self.error = Some(msg); // button returns
+                }
+                Err(TryRecvError::Empty) => {} // still downloading
+                Err(TryRecvError::Disconnected) => self.update_download = None,
             }
         }
         // hook event files -> tab statuses
@@ -2100,6 +2156,10 @@ mod tests {
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
+            // tests never talk to the network: no check, no notice, no download
+            update_check: None,
+            update_available: None,
+            update_download: None,
         }
     }
 
@@ -2185,6 +2245,10 @@ mod tests {
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
+            // tests never talk to the network: no check, no notice, no download
+            update_check: None,
+            update_available: None,
+            update_download: None,
         }
     }
 
@@ -2223,6 +2287,10 @@ mod tests {
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
+            // tests never talk to the network: no check, no notice, no download
+            update_check: None,
+            update_available: None,
+            update_download: None,
         }
     }
 
