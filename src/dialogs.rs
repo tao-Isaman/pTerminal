@@ -10,12 +10,10 @@
 //! went wrong; stacking a new decision on top of an unacknowledged error
 //! would only be confusing.
 
-use crate::app::{self, NewTabDraft, PendingClaim, PtApp};
-use crate::hooks::AgentStatus;
+use crate::app::{NewTabDraft, PendingClaim, PtApp, degrade_direct_mode_peers};
 use crate::term::{self, SpawnSpec, TabKind};
 use crate::{git, shared_ctx};
 use eframe::egui;
-use std::collections::HashSet;
 
 /// What to do with a closing tab's worktree, decided by the close dialog.
 /// `Plain` covers tabs with nothing to merge/keep/discard — a shell tab, or
@@ -260,7 +258,7 @@ impl PtApp {
                 });
             if discard {
                 if let Some(ws) = self.workspaces.get_mut(ws_index) {
-                    app::remove_editor(ws, editor_id);
+                    crate::editor::remove_editor(ws, editor_id);
                 }
                 self.closing_editor = None;
                 self.persist();
@@ -282,12 +280,7 @@ impl PtApp {
         // Snapshot our own children *before* spawning so `drain_events` in
         // app.rs can tell, from the sampler's next snapshot, which new PID
         // belongs to this tab (see `Tab::claim_pids`).
-        let before: HashSet<u32> = self
-            .last_snap
-            .iter()
-            .filter(|p| p.parent == Some(std::process::id()))
-            .map(|p| p.pid)
-            .collect();
+        let before = self.own_child_pids();
 
         // Same identity resolution as the dialog body: the draft's own
         // `ws_index`, never `self.active_ws`. A sidebar workspace switch
@@ -300,23 +293,10 @@ impl PtApp {
         let result = if draft.shell {
             term::spawn_shell(ctx, id, &repo)
         } else {
-            // CARRIED FINDING (documented on `term::spawn_agent`): a direct
-            // (isolate=false) agent spawn overwrites
-            // `.claude/settings.local.json` at `repo` unconditionally, so it
-            // silently steals hook routing from any other live direct-mode
-            // agent tab already running there. Degrade that older tab's
-            // status now, at the moment of takeover, rather than leaving it
-            // stuck showing a status that will never update again.
+            // Direct-mode hook takeover — see `degrade_direct_mode_peers`'s
+            // doc comment for the full rationale.
             if !draft.isolate {
-                for other in ws.tabs.iter_mut() {
-                    if other.kind == TabKind::Agent
-                        && other.worktree.is_none()
-                        && other.cwd == repo
-                        && other.status != AgentStatus::Exited
-                    {
-                        other.status = AgentStatus::Unknown;
-                    }
-                }
+                degrade_direct_mode_peers(ws, &repo);
             }
             // shared.md + gitignore entry + per-agent README, once per
             // workspace. Gitignore ruling (user-approved pre-flight

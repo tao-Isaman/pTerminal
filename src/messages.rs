@@ -156,7 +156,7 @@ pub struct WsStatus {
     pub agents: Vec<(String, String, PathBuf, usize, String)>,
     /// The last ~200 chars of this workspace's `shared.md`, newlines
     /// flattened to spaces and trimmed — already prepared by the caller
-    /// (`app::shared_excerpt_for`). Empty string (absent or empty file)
+    /// (`orchestrator::shared_excerpt_for`). Empty string (absent or empty file)
     /// renders as `(empty)`; the caller uses the literal `"(unavailable)"`
     /// for a read failure that isn't "file doesn't exist", which passes
     /// through unchanged since it's already non-empty.

@@ -14,6 +14,7 @@
 //! and with it every tab's poll — see that function's docs.
 
 use crate::commands;
+use crate::editor::{CloseEditorDraft, EditorTab, open_editor, remove_editor, save_editor};
 use crate::git;
 use crate::hooks::{self, AgentStatus};
 use crate::messages;
@@ -44,115 +45,11 @@ pub struct WsRt {
     pub active_editor: Option<usize>,
 }
 
-/// A single open plain-text file editor tab (Task 1). Lives in
-/// `WsRt::editors`; rendered by `PtApp::show_editor_ui` when it is the
-/// workspace's `active_editor`.
-pub struct EditorTab {
-    pub id: u64,
-    pub path: PathBuf,
-    pub buffer: String,
-    pub dirty: bool,
-    /// `true` when `read_to_string(path)` failed the last time it was read
-    /// (open, or an external delete since) — cleared by a successful
-    /// `save_editor` (a save can recreate/overwrite the file). Covers BOTH a
-    /// genuinely absent path AND a present-but-unreadable one (a directory,
-    /// a locked/permission-denied file, invalid UTF-8); `editor_note`
-    /// distinguishes the two at render time from `path.exists()` so the
-    /// CentralPanel's warning is truthful about whether a save would *create*
-    /// the file or *overwrite* an existing one (finding 2).
-    pub missing: bool,
-}
-
-/// Draft for the "discard unsaved changes" confirmation on closing a dirty
-/// editor tab (Task 1). Populated by the tab strip's middle-click/`x`
-/// handler, consumed by `dialogs::show_dialogs`.
-///
-/// **Identity-tracked by `(ws_index, editor_id)`**, same rationale as
-/// [`CloseDraft`]/[`CloseWsDraft`]: this confirmation window isn't modal
-/// either, so a workspace switch or another close while it's open must not
-/// silently retarget the eventual Discard at a different file. `show_dialogs`
-/// re-resolves the target every frame by this pair and drops the draft
-/// (`closing_editor = None`) if it no longer resolves.
-pub struct CloseEditorDraft {
-    pub ws_index: usize,
-    pub editor_id: u64,
-}
-
-/// Opens `path` as a new editor tab in `ws`: reads its contents
-/// (`std::fs::read_to_string`) into the buffer, flags `missing: true` with
-/// an empty buffer on any read error (most commonly "doesn't exist", but
-/// deliberately not narrowed to just that — a locked or unreadable file
-/// degrades the same way: an empty, editable buffer the user can still type
-/// into and save over, rather than a hard failure), appends the new
-/// `EditorTab`, and activates it. Never fails — matches `open_file_dialog`'s
-/// contract of "the picker succeeded, so something must open". The pane's
-/// warning note (`editor_note`) then tells the truth about whether that save
-/// would create or overwrite, computed from `path.exists()` — see finding 2.
-pub fn open_editor(ws: &mut WsRt, id: u64, path: PathBuf) {
-    let (buffer, missing) = match std::fs::read_to_string(&path) {
-        Ok(s) => (s, false),
-        Err(_) => (String::new(), true),
-    };
-    ws.editors.push(EditorTab { id, path, buffer, dirty: false, missing });
-    ws.active_editor = Some(ws.editors.len() - 1);
-}
-
-/// The editor pane's warning note for `ed`, or `None` when the file read
-/// cleanly (`missing == false`). When `missing` is set, distinguishes the two
-/// underlying causes so a reflexive Ctrl+S isn't a silent surprise (finding
-/// 2): a path that genuinely doesn't exist (a save will *create* it) versus
-/// one that exists on disk but couldn't be read — a directory, a
-/// locked/permission-denied file, invalid UTF-8 (a save will *overwrite* it
-/// with the current, possibly empty, buffer). Recomputed from `path.exists()`
-/// each call so it reflects the current disk state, not a stale open-time
-/// snapshot. Pure (only touches `ed` + a `path.exists()` probe) so it's
-/// unit-testable without an `egui` frame.
-fn editor_note(ed: &EditorTab) -> Option<String> {
-    if !ed.missing {
-        return None;
+impl WsRt {
+    /// A fresh runtime workspace wrapping `meta`: no live tabs or editors yet.
+    pub(crate) fn new(meta: state::Workspace) -> Self {
+        WsRt { meta, tabs: vec![], active_tab: 0, editors: vec![], active_editor: None }
     }
-    if ed.path.exists() {
-        Some(format!(
-            "\u{26A0} file exists but could not be read \u{2014} saving will OVERWRITE it with the current buffer: {}",
-            ed.path.display()
-        ))
-    } else {
-        Some(format!(
-            "\u{26A0} file not found \u{2014} saving will create it: {}",
-            ed.path.display()
-        ))
-    }
-}
-
-/// Writes `ed`'s buffer to `ed.path`, clearing `dirty` and `missing` on
-/// success (a save can recreate a file that was missing — see
-/// `EditorTab::missing`'s docs). Leaves both flags untouched on failure
-/// (caller surfaces the error via `self.error`, same convention as every
-/// other fallible action in this module) so a failed save doesn't lie about
-/// the buffer being safely on disk.
-pub fn save_editor(ed: &mut EditorTab) -> std::io::Result<()> {
-    std::fs::write(&ed.path, &ed.buffer)?;
-    ed.dirty = false;
-    ed.missing = false;
-    Ok(())
-}
-
-/// Removes the editor identified by `editor_id` from `ws.editors` (a no-op
-/// if it's already gone), fixing up `active_editor` so it keeps pointing at
-/// the SAME surviving editor rather than whatever now happens to sit at its
-/// old index — same index-repointing convention `close_workspace` already
-/// uses for `active_ws`. Removing the currently-active editor itself has
-/// nothing left to point at, so it clears to `None` (the CentralPanel's
-/// precedence rule then falls through to `selected_child`/the terminal)
-/// rather than guessing at a replacement.
-pub fn remove_editor(ws: &mut WsRt, editor_id: u64) {
-    let Some(idx) = ws.editors.iter().position(|e| e.id == editor_id) else { return };
-    ws.editors.remove(idx);
-    ws.active_editor = match ws.active_editor {
-        Some(cur) if cur == idx => None,
-        Some(cur) if cur > idx => Some(cur - 1),
-        other => other,
-    };
 }
 
 /// Identity of a resource-rollup PID claim in flight, for a tab that was just
@@ -231,7 +128,7 @@ pub struct CloseDraft {
 /// both construction sites (`shortcuts()`'s Ctrl+W and the tab strip's
 /// middle-click handler) so they can't drift out of sync on how `dirty`
 /// (or the identity fields) get filled in.
-fn close_draft_for(ws: &WsRt, ws_index: usize, tab_idx: usize) -> Option<CloseDraft> {
+pub(crate) fn close_draft_for(ws: &WsRt, ws_index: usize, tab_idx: usize) -> Option<CloseDraft> {
     let tab = ws.tabs.get(tab_idx)?;
     let dirty = tab
         .worktree
@@ -264,33 +161,6 @@ pub struct CloseWsDraft {
     pub name: String,
 }
 
-/// True if `a` and `b` name the same directory, for [`PtApp::handle_resume_command`]'s
-/// find-or-create workspace lookup. `pterminal resume --dir <path>` is
-/// arbitrary shell text — it need not be absolute, need not match the case
-/// Windows reports back, and need not resolve symlinks/`..` the same way a
-/// workspace's stored `repo_path` (originally chosen through the native
-/// folder picker) already does — so a bare `PathBuf` `==` would miss real
-/// matches (e.g. `D:\repo` from a shell vs. `D:\Repo\.` as stored) far too
-/// easily, silently spawning a duplicate workspace for what the user
-/// considers the same directory.
-///
-/// Canonicalizing both sides first (`std::fs::canonicalize`) fixes that, but
-/// canonicalize requires the path to exist — so it can legitimately fail on
-/// EITHER side (a workspace whose folder was deleted since it was added;
-/// `handle_resume_command` already rejects a nonexistent `cmd.dir` before
-/// this is ever called, but a stale workspace path is a real, independent
-/// failure mode). Falling back to plain equality in that case, rather than
-/// treating a canonicalize failure as "never matches", is the documented
-/// (task-brief) choice: it degrades to the pre-canonicalize behavior instead
-/// of guaranteeing a spurious new workspace every time one side can't be
-/// resolved.
-fn paths_match(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(ca), Ok(cb)) => ca == cb,
-        _ => a == b,
-    }
-}
-
 /// Chooses and writes the right per-agent README for a tab about to spawn
 /// (Task 3, editor-orchestrator — closes the seam `PtApp::ensure_orchestrator`'s
 /// doc comment calls out: the orchestrator's saved tab spawns through the
@@ -309,7 +179,7 @@ fn paths_match(a: &Path, b: &Path) -> bool {
 /// process — see `app::tests::app_with_one_saved_shell_tab`'s doc comment
 /// for why a real `Agent`-kind spawn can't be driven to a deterministic end
 /// in a test.
-fn agent_readme_for_spawn(is_orchestrator: bool, is_git: bool, repo_root: &Path) -> Option<PathBuf> {
+pub(crate) fn agent_readme_for_spawn(is_orchestrator: bool, is_git: bool, repo_root: &Path) -> Option<PathBuf> {
     if is_orchestrator {
         shared_ctx::write_orchestrator_readme(repo_root).ok()
     } else if is_git {
@@ -319,152 +189,31 @@ fn agent_readme_for_spawn(is_orchestrator: bool, is_git: bool, repo_root: &Path)
     }
 }
 
+/// Direct-mode hook takeover (CARRIED FINDING, documented on
+/// `term::spawn_agent`): a direct (isolate=false) agent spawn overwrites
+/// `.claude/settings.local.json` at `repo` unconditionally, so it silently
+/// steals hook routing from any other live direct-mode agent tab already
+/// running there. Degrade that older tab's status now, at the moment of
+/// takeover, rather than leaving it stuck showing a status that will never
+/// update again.
+pub(crate) fn degrade_direct_mode_peers(ws: &mut WsRt, repo: &Path) {
+    for other in ws.tabs.iter_mut() {
+        if other.kind == TabKind::Agent
+            && other.worktree.is_none()
+            && other.cwd == repo
+            && other.status != AgentStatus::Exited
+        {
+            other.status = AgentStatus::Unknown;
+        }
+    }
+}
+
 /// The `msg_offset` a workspace freshly added at `repo` should start at: the
 /// CURRENT byte length of `repo`'s `messages.jsonl`, or `0` when the file
 /// doesn't exist yet. Used by [`PtApp::finish_add_workspace`] — see the
 /// re-add rule documented there for why unconditional `0` is wrong.
 fn initial_msg_offset(repo: &Path) -> u64 {
     std::fs::metadata(shared_ctx::messages_path(repo)).map(|m| m.len()).unwrap_or(0)
-}
-
-/// The `shared.md` excerpt embedded in one workspace's `status.md` row group
-/// (Task 2: richer live status, `messages::WsStatus::shared_excerpt`): the
-/// last ~200 chars of `repo`'s `shared.md`, flattened to a single line via
-/// [`messages::flatten`] (same collapse `read_new`'s callers already use for
-/// message bodies) and re-trimmed after truncation in case the cut lands
-/// inside a run of flattened whitespace.
-///
-/// An absent `shared.md` (the common case — a fresh workspace, or one no
-/// agent has written to yet) is NOT treated as a failure: it returns `""`,
-/// which [`messages::orchestrator_status`] renders as the placeholder
-/// `(empty)`. Any OTHER read error (permissions, a directory sitting where
-/// the file should be, ...) is a genuine failure and returns the literal
-/// `"(unavailable)"` instead — already non-empty, so the formatter passes it
-/// through unchanged.
-///
-/// **Final-review finding (per-frame full-file re-read).** This used to
-/// unconditionally `read_to_string` the whole file and flatten it every call
-/// — and `refresh_orchestrator_status` calls this once per workspace, every
-/// single frame. `shared.md` only grows over a session, so that was
-/// allocator traffic (full-file read + flatten) scaling with session length
-/// times workspace count, for an excerpt that's almost always unchanged
-/// frame-to-frame. `cache` (per-app `PtApp::shared_excerpt_cache`, keyed by
-/// this exact path) makes the common case a single `std::fs::metadata` stat:
-/// on a `(len, mtime)` match against the cached entry, the cached excerpt is
-/// cloned (a ≤200-char `String`, not the file) and returned without ever
-/// opening the file for reading. Only a stat mismatch — or no entry yet —
-/// falls through to the real read+flatten+truncate, which then refreshes the
-/// cache entry. The three placeholder outcomes above are unchanged: they're
-/// decided the same way, just off `metadata`'s error kind where possible
-/// (`NotFound` also prunes any stale cache entry for the path) instead of
-/// `read_to_string`'s, with a fallback to the read's own error kind for the
-/// rare metadata-succeeds-but-read-fails race (e.g. deleted between the stat
-/// and the read).
-fn shared_excerpt_for(
-    repo_path: &Path,
-    cache: &mut HashMap<PathBuf, (u64, std::time::SystemTime, String)>,
-) -> String {
-    let path = shared_ctx::shared_md_path(repo_path);
-    let meta = match std::fs::metadata(&path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            cache.remove(&path);
-            return String::new();
-        }
-        Err(_) => return "(unavailable)".to_string(),
-    };
-    let len = meta.len();
-    if let Ok(mtime) = meta.modified() {
-        if let Some((cached_len, cached_mtime, cached_excerpt)) = cache.get(&path) {
-            if *cached_len == len && *cached_mtime == mtime {
-                return cached_excerpt.clone();
-            }
-        }
-    }
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let flat = messages::flatten(&content);
-            let n = flat.chars().count();
-            let start = n.saturating_sub(200);
-            let tail: String = flat.chars().skip(start).collect();
-            let excerpt = tail.trim().to_string();
-            if let Ok(mtime) = meta.modified() {
-                cache.insert(path, (len, mtime, excerpt.clone()));
-            }
-            excerpt
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(_) => "(unavailable)".to_string(),
-    }
-}
-
-/// Builds the reserved orchestrator's `Workspace` record (editor-
-/// orchestrator feature, Task 2): rooted at `shared_ctx::orchestrator_dir()`
-/// — not a git repo, since it's pTerminal's own scratch directory, not a
-/// checkout — with a single unresumed `Agent` saved tab titled
-/// "orchestrator" so it resumes through the exact same `resume_saved_tabs`
-/// path as any other saved agent tab (fresh `claude` the first time,
-/// `--resume <sid>` on every launch after that).
-///
-/// The saved tab's `tab_id` here is a placeholder (`0`) — this is a free
-/// function with no `next_tab_id` counter to draw a real one from (see
-/// [`pin_orchestrator_front`]'s doc comment for why). `PtApp::ensure_orchestrator`
-/// overwrites it with a real id immediately after, but only on the branch
-/// where a NEW orchestrator was actually created — an already-existing one
-/// keeps whatever id it was persisted with.
-fn new_orchestrator_workspace() -> state::Workspace {
-    let orch_dir = shared_ctx::orchestrator_dir();
-    state::Workspace {
-        name: "orchestrator".to_string(),
-        repo_path: orch_dir.clone(),
-        is_git: false,
-        default_isolate: false,
-        kept_worktrees: vec![],
-        saved_tabs: vec![state::SavedTab {
-            tab_id: 0,
-            kind: state::SavedTabKind::Agent,
-            title: "orchestrator".to_string(),
-            cwd: orch_dir,
-            worktree: None,
-            session_id: None,
-        }],
-        active_tab: 0,
-        msg_offset: 0,
-        saved_editors: vec![],
-        is_orchestrator: true,
-    }
-}
-
-/// Task 2 (editor-orchestrator): pure list manipulation behind
-/// [`PtApp::ensure_orchestrator`] — no filesystem I/O, no `PtApp`/`WsRt`/
-/// egui dependency, so the create-or-pin algorithm is unit-testable
-/// directly against a plain `Vec<state::Workspace>`.
-///
-/// Finds the (at most one, by construction) entry with `is_orchestrator ==
-/// true` and moves it to index 0 via remove+insert — a stable rotation
-/// that shifts every workspace between the old and new position by one
-/// slot but never reorders any two of THEM relative to each other. If none
-/// exists yet, inserts a freshly-built [`new_orchestrator_workspace`] at
-/// index 0 instead.
-///
-/// Returns `true` iff a NEW orchestrator was inserted (none existed before
-/// this call) — `false` covers both "already at 0, nothing to do" and
-/// "existed elsewhere, just moved". `PtApp::ensure_orchestrator` uses this
-/// to know whether the fresh saved tab still needs a real `tab_id` drawn
-/// from `next_tab_id` and the on-disk directories still need creating.
-fn pin_orchestrator_front(workspaces: &mut Vec<state::Workspace>) -> bool {
-    match workspaces.iter().position(|w| w.is_orchestrator) {
-        Some(0) => false,
-        Some(i) => {
-            let orch = workspaces.remove(i);
-            workspaces.insert(0, orch);
-            false
-        }
-        None => {
-            workspaces.insert(0, new_orchestrator_workspace());
-            true
-        }
-    }
 }
 
 pub struct PtApp {
@@ -532,18 +281,21 @@ pub struct PtApp {
     /// dirty editor tab (Task 1). See [`CloseEditorDraft`]'s doc comment for
     /// the identity-tracking rationale.
     pub closing_editor: Option<CloseEditorDraft>,
-    /// Last `agents.json` string written per workspace (by index), so the
-    /// per-frame roster maintenance in [`PtApp::maintain_roster`] only
-    /// touches disk when the built JSON actually changed. See that
-    /// function's docs.
-    pub roster_written: HashMap<usize, String>,
-    /// Last `status.md` string written for the orchestrator (Task 3), the
-    /// single-workspace analogue of `roster_written`'s per-index cache —
-    /// there is at most one orchestrator, so a plain `Option<String>`
-    /// suffices. See [`PtApp::refresh_orchestrator_status`]'s docs.
-    pub orchestrator_status_written: Option<String>,
+    /// Fingerprint (hash of the roster's inputs) of the last `agents.json`
+    /// written per workspace (by index), so the per-frame roster maintenance
+    /// in [`PtApp::maintain_roster`] neither touches disk NOR builds the
+    /// JSON string unless an input actually changed. (This used to store the
+    /// built JSON itself — which meant serializing every workspace's roster
+    /// every frame just to compare it.) See that function's docs.
+    pub roster_written: HashMap<usize, u64>,
+    /// Fingerprint of the last `status.md` written for the orchestrator
+    /// (Task 3), the single-workspace analogue of `roster_written`'s
+    /// per-index cache — there is at most one orchestrator, so a plain
+    /// `Option<u64>` suffices. See [`PtApp::refresh_orchestrator_status`]'s
+    /// docs.
+    pub orchestrator_status_written: Option<u64>,
     /// **Final-review finding (per-frame `shared.md` re-read).** Per-workspace
-    /// cache for [`shared_excerpt_for`], keyed by `shared.md`'s own path
+    /// cache for [`crate::orchestrator::shared_excerpt_for`], keyed by `shared.md`'s own path
     /// rather than workspace index: `(file length, mtime, computed excerpt)`.
     /// Without this, `refresh_orchestrator_status` re-read and re-flattened
     /// every workspace's ENTIRE `shared.md` every single frame — cost scaling
@@ -562,7 +314,7 @@ pub struct PtApp {
     /// stale bytes, not a correctness hazard, so `close_workspace` does not
     /// need to (and does not) clear this map the way it clears
     /// `roster_written`. A path whose file is deleted out from under it also
-    /// self-prunes: [`shared_excerpt_for`] removes the entry on a `NotFound`
+    /// self-prunes: [`crate::orchestrator::shared_excerpt_for`] removes the entry on a `NotFound`
     /// stat.
     pub shared_excerpt_cache: HashMap<PathBuf, (u64, std::time::SystemTime, String)>,
     /// Workspace indices whose last [`PtApp::deliver_messages`] call left a
@@ -653,7 +405,7 @@ impl PtApp {
         // so Thai text (terminal output, tab titles, shared.md) renders as
         // boxes without this. Loaded from the OS at runtime — pTerminal
         // still ships no font files. See `install_thai_fallback`.
-        install_thai_fallback(&cc.egui_ctx);
+        crate::ui::install_thai_fallback(&cc.egui_ctx);
 
         let base = state::default_base();
         let (st, corrupt_msg) = state::load(&base);
@@ -671,7 +423,7 @@ impl PtApp {
         let workspaces: Vec<WsRt> = st
             .workspaces
             .into_iter()
-            .map(|meta| WsRt { meta, tabs: vec![], active_tab: 0, editors: vec![], active_editor: None })
+            .map(WsRt::new)
             .collect();
         // Watch the hooks events dir (tab status) plus every workspace's
         // `.pterminal` dir (F2 panel live-reload of shared.md). Rebuilt
@@ -894,15 +646,7 @@ impl PtApp {
                         // any other live direct-mode agent tab already
                         // sitting at the same cwd.
                         if tab.kind == TabKind::Agent && tab.worktree.is_none() {
-                            for other in ws.tabs.iter_mut() {
-                                if other.kind == TabKind::Agent
-                                    && other.worktree.is_none()
-                                    && other.cwd == tab.cwd
-                                    && other.status != AgentStatus::Exited
-                                {
-                                    other.status = AgentStatus::Unknown;
-                                }
-                            }
+                            degrade_direct_mode_peers(ws, &tab.cwd);
                         }
                         ws.tabs.push(tab);
                     }
@@ -949,349 +693,6 @@ impl PtApp {
             let n = ws.tabs.len();
             ws.active_tab = if n == 0 { 0 } else { ws.meta.active_tab.min(n - 1) };
         }
-    }
-
-    /// Task 1 (resume-on-launch for editor tabs): reopens every path in each
-    /// workspace's `meta.saved_editors` via `open_editor` (a path that's
-    /// been deleted since just comes back flagged `missing`, same as it
-    /// would from a live Ctrl+O pick — see `open_editor`'s docs). Unlike
-    /// `resume_saved_tabs`, there is no process to spawn and therefore no
-    /// failure mode to fall back from: `open_editor` never fails.
-    ///
-    /// `active_editor` always ends this launch as `None` for every
-    /// workspace, even though `open_editor` itself activates each editor it
-    /// pushes (so the last-reopened editor briefly becomes "active" mid-loop
-    /// before the next one takes over) — the spec is that a fresh launch
-    /// always starts on the terminal/`selected_child` view, never with an
-    /// editor already covering it.
-    fn resume_saved_editors(&mut self) {
-        for ws_idx in 0..self.workspaces.len() {
-            let saved_paths = self.workspaces[ws_idx].meta.saved_editors.clone();
-            for path in saved_paths {
-                let id = self.next_tab_id;
-                self.next_tab_id += 1;
-                open_editor(&mut self.workspaces[ws_idx], id, path);
-            }
-            self.workspaces[ws_idx].active_editor = None;
-        }
-    }
-
-    /// Task 2: drains every pending `pterminal resume` command file
-    /// (`commands::read_and_delete_commands`) and hands each parsed command
-    /// to [`PtApp::handle_resume_command`]. Called from two places: once at
-    /// startup (`PtApp::new`, after `resume_saved_tabs`/before the startup
-    /// `deliver_messages` pass) to pick up commands written before this
-    /// launch existed to see them, and again from `drain_events` whenever
-    /// the filesystem watcher reports a change under `commands::commands_dir()`
-    /// (a `pterminal resume` invocation while this instance is already
-    /// running). One shared entry point so the malformed-file banner below
-    /// can't drift between the two call sites.
-    ///
-    /// A malformed command file (one that failed to parse as JSON — Task 1's
-    /// contract) is deleted along with the good ones (`read_and_delete_commands`
-    /// already did that) and reported **once, combined into a single count**
-    /// rather than per-file, appended to any error `handle_resume_command`
-    /// itself already raised this call so one drain never clobbers another's
-    /// banner (`self.error` only holds one message at a time — same
-    /// combine-with-`;` convention `deliver_messages` uses for its own two
-    /// independent failure modes).
-    fn drain_resume_commands(&mut self, ctx: &egui::Context) {
-        let (cmds, malformed) = commands::read_and_delete_commands();
-        for cmd in cmds {
-            self.handle_resume_command(ctx, cmd);
-        }
-        if malformed > 0 {
-            let noun = if malformed == 1 { "file" } else { "files" };
-            let msg = format!("resume: {malformed} malformed command {noun} skipped");
-            self.error = Some(match self.error.take() {
-                Some(existing) => format!("{existing}; {msg}"),
-                None => msg,
-            });
-        }
-    }
-
-    /// Handles one parsed `pterminal resume --id <sid> --dir <path>`
-    /// command (Task 2): finds the workspace whose `repo_path` matches
-    /// `cmd.dir` (see [`paths_match`]), creating one if none exists yet —
-    /// **exactly like a manual "+ workspace" pick**, via
-    /// [`PtApp::finish_add_workspace`] itself (name from the folder,
-    /// `is_git`/`default_isolate` autodetected, no saved tabs, no picker
-    /// dialog) — then opens a fresh agent tab in it mirroring
-    /// `dialogs::open_tab`'s agent path: the same direct-mode hook-takeover
-    /// degrade, the same `shared.md`/`.gitignore`/per-agent-README wiring
-    /// for a git repo, and the same unique-title/`PendingClaim`/persist
-    /// dance — with two deliberate differences from a brand-new tab:
-    /// `resume_session: Some(cmd.session_id)` instead of a fresh
-    /// prompt-driven launch (`prompt` is therefore empty — ignored by
-    /// `spawn_agent` in the resume branch anyway, see `SpawnSpec`'s docs),
-    /// and a `resumed-<first 8 chars of the session id>` title instead of a
-    /// slugged prompt, run through the same [`term::unique_title`] so it
-    /// can't collide with an already-open agent tab. `worktree: None` /
-    /// `isolate: false` unconditionally: a resume always lands directly in
-    /// the workspace's main checkout, never a fresh isolated worktree —
-    /// matching `resume_saved_tabs`'s own resume path, and matching the
-    /// fact that `spawn_agent` ignores `isolate` entirely once
-    /// `resume_session` is `Some`.
-    ///
-    /// **`cmd.dir` must already exist on disk, checked up front.** Unlike
-    /// `finish_add_workspace` (only ever reached via a native folder-picker
-    /// that structurally cannot return a path that doesn't exist), a resume
-    /// command's `--dir` is arbitrary text the CLI wrote into a JSON file —
-    /// it could name a typo'd path, a directory deleted since the CLI ran,
-    /// or (a bogus id, tested live) a path that simply never existed.
-    /// Silently `create_dir_all`-ing it (the way `finish_add_workspace`'s
-    /// downstream `spawn_agent`/`git` calls effectively would) would invent
-    /// a workspace the user never asked for out of a typo. Rejected here
-    /// instead, with a one-line, keep-going error banner — the same
-    /// non-fatal-degradation mechanism `deliver_messages`/`resume_saved_tabs`
-    /// already use for every other per-command failure in this module — and
-    /// the command is otherwise skipped entirely: no workspace lookup, no
-    /// creation, no spawn attempt.
-    fn handle_resume_command(&mut self, ctx: &egui::Context, cmd: commands::ResumeCmd) {
-        if !cmd.dir.is_dir() {
-            self.error = Some(format!("resume: directory does not exist: {}", cmd.dir.display()));
-            return;
-        }
-
-        let ws_index = match self.workspaces.iter().position(|ws| paths_match(&ws.meta.repo_path, &cmd.dir)) {
-            // Final-review finding 5: never resume INTO the reserved
-            // orchestrator workspace — its tabs are unclosable by construction,
-            // so a `pterminal resume --dir <orch dir>` would otherwise graft a
-            // permanent, undeletable duplicate agent tab onto it. Surface the
-            // reason and skip rather than spawn.
-            Some(i) if self.workspaces[i].meta.is_orchestrator => {
-                self.error = Some("resume: cannot resume into the orchestrator workspace".to_string());
-                return;
-            }
-            Some(i) => i,
-            None => {
-                self.finish_add_workspace(cmd.dir.clone());
-                self.workspaces.len() - 1
-            }
-        };
-
-        // Same PID-claim snapshot dance as `dialogs::open_tab` /
-        // `open_kept_worktree`: capture our own children before spawning so
-        // `drain_events` can tell which new PID belongs to this tab.
-        let before: HashSet<u32> = self
-            .last_snap
-            .iter()
-            .filter(|p| p.parent == Some(std::process::id()))
-            .map(|p| p.pid)
-            .collect();
-
-        // `next_tab_id`/`persist` ordering mirrors `dialogs::open_tab`: the
-        // counter is claimed and saved before the spawn even runs, so a
-        // crash mid-spawn can never hand out the same id twice.
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
-        self.persist();
-
-        let Some(ws) = self.workspaces.get_mut(ws_index) else { return };
-        let repo = ws.meta.repo_path.clone();
-        let is_git = ws.meta.is_git;
-        let is_orchestrator = ws.meta.is_orchestrator;
-
-        // Direct-mode hook takeover (see `dialogs::open_tab`'s doc comment
-        // for the full rationale): this resume is always a direct
-        // (isolate: false) spawn, so it just repointed
-        // `.claude/settings.local.json`'s hook routing away from any other
-        // live direct-mode agent tab already running at `repo`.
-        for other in ws.tabs.iter_mut() {
-            if other.kind == TabKind::Agent
-                && other.worktree.is_none()
-                && other.cwd == repo
-                && other.status != AgentStatus::Exited
-            {
-                other.status = AgentStatus::Unknown;
-            }
-        }
-
-        let shared = if is_git {
-            match shared_ctx::ensure_shared_md(&repo) {
-                Ok(p) => {
-                    if shared_ctx::gitignore_needs_entry(&repo) {
-                        if let Err(e) = shared_ctx::add_gitignore_entry(&repo) {
-                            self.error = Some(format!("could not update .gitignore: {e}"));
-                        }
-                    }
-                    Some(p)
-                }
-                Err(e) => {
-                    self.error = Some(e.to_string());
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        // Final-review finding 5: route the README choice through the shared
-        // helper so an orchestrator-dir tab gets its orchestrator README rather
-        // than none. (This resume path already refuses the orchestrator above,
-        // so `is_orchestrator` is `false` here in practice — kept for a single
-        // spawn-time source of truth across every spawn site.)
-        let agent_readme = agent_readme_for_spawn(is_orchestrator, is_git, &repo);
-
-        let existing_titles: Vec<String> =
-            ws.tabs.iter().filter(|t| t.kind == TabKind::Agent).map(|t| t.title.clone()).collect();
-        let sid_prefix: String = cmd.session_id.chars().take(8).collect();
-        let title = term::unique_title(&format!("resumed-{sid_prefix}"), &existing_titles);
-
-        let result = term::spawn_agent(
-            ctx,
-            id,
-            &term::SpawnSpec {
-                workspace_repo: repo,
-                main_repo_shared_md: shared,
-                prompt: String::new(),
-                isolate: false,
-                agent_readme,
-                resume_session: Some(cmd.session_id.clone()),
-                title: Some(title),
-                worktree: None,
-            },
-        );
-
-        match result {
-            Ok(tab) => self.finish_resume_spawn(ws_index, id, before, tab, &cmd.session_id),
-            Err(e) => self.error = Some(format!("resume: {e}")),
-        }
-    }
-
-    /// Finishes a successful resume spawn (Task 2, split out of
-    /// `handle_resume_command` for testability — see below): carries the
-    /// transferred `session_id` onto `tab`, pushes it, arms the
-    /// `PendingClaim`, switches the active workspace, and persists.
-    ///
-    /// **Critical fix (found in review):** `spawn_agent`/`spawn_shell`
-    /// always start a fresh `Tab` with `session_id: None`, regardless of
-    /// `SpawnSpec::resume_session` — correct for a brand-new spawn, wrong
-    /// here, since `claude --resume <sid>` continues the exact session
-    /// `session_id` names. The assignment below runs BEFORE `push`/`persist`
-    /// so an early `persist()` (this one, or any other firing before this
-    /// session's own `SessionStart` hook has a chance to report the id back)
-    /// writes the transferred id into `saved_tabs`, not `None`. Same bug
-    /// class `resume_saved_tabs`'s "REVIEW FINDING 1" already fixed for the
-    /// resume-on-launch path (see that function's docs) — this was the same
-    /// gap on the resume-via-CLI path, just not yet closed. Without it,
-    /// closing the app in the pre-`SessionStart` window and relaunching
-    /// would resume the saved tab with `resume_session: None` —
-    /// `agent_args("", None)` builds a bare `["/c", "claude"]`, silently
-    /// starting a brand-new session instead of continuing the transferred
-    /// one. This is almost certainly what actually produced the unexplained
-    /// bare-`claude` tab in this task's own live-verification incident (see
-    /// `task-2-report.md`'s fix-report addendum): the first, killed
-    /// resume attempt's tab had its session id nulled out by an early
-    /// `persist()` in exactly this window, and the second (contaminated)
-    /// startup drain resumed it — from `state.json`, not from a fresh
-    /// command file — with `resume_session: None`.
-    ///
-    /// **Why this is its own function.** `handle_resume_command`'s real
-    /// spawn goes through `spawn_agent`, which runs `claude --resume <sid>`
-    /// — confirmed live (see the report) to hang indefinitely for an
-    /// unresolvable session id rather than exit non-interactively, and
-    /// `TabTerm` exposes no way to force-kill a child from the outside. A
-    /// unit test driving `handle_resume_command` end-to-end would therefore
-    /// either hang the test suite or leak a real orphaned `claude.exe`
-    /// process (the exact failure this codebase's own
-    /// `resume_carries_saved_session_id_onto_the_tab_before_any_hook_fires`
-    /// test already had to route around, via `SavedTabKind::Shell`, for the
-    /// analogous `resume_saved_tabs` fix). Splitting the actual
-    /// bug-and-fix — the ordering of this assignment relative to
-    /// `push`/`persist` — into its own function lets a test drive it with a
-    /// safe, fast, `spawn_shell`-built `Tab` instead, with zero risk of
-    /// hanging or leaking a process, while still exercising the exact code
-    /// path that was broken.
-    fn finish_resume_spawn(
-        &mut self,
-        ws_index: usize,
-        id: u64,
-        before: HashSet<u32>,
-        mut tab: Tab,
-        session_id: &str,
-    ) {
-        tab.session_id = Some(session_id.to_string());
-        let ws = &mut self.workspaces[ws_index];
-        ws.tabs.push(tab);
-        ws.active_tab = ws.tabs.len() - 1;
-        self.pending_claim = Some(PendingClaim { ws_index, tab_id: id, before });
-        self.active_ws = ws_index;
-        self.persist();
-    }
-
-    /// Directories the filesystem watcher should cover: the hooks events
-    /// dir (tab status glyphs), every workspace's `.pterminal` dir (F2
-    /// shared-context panel live-reload), and (Task 2) `commands::commands_dir()`
-    /// — so a `pterminal resume` invocation's command file, written while
-    /// THIS instance is already running, is noticed without the user having
-    /// to relaunch. `spawn_watcher` creates each directory if it doesn't
-    /// exist yet, so adding a workspace eagerly creates its `.pterminal`
-    /// folder even before any agent has spawned there — a small side effect
-    /// of watching it up front (previously that directory only appeared on
-    /// first agent spawn, via `shared_ctx::ensure_shared_md`).
-    fn watcher_dirs(workspaces: &[WsRt]) -> Vec<PathBuf> {
-        let mut dirs = vec![hooks::events_dir(), commands::commands_dir()];
-        dirs.extend(workspaces.iter().map(|w| w.meta.repo_path.join(".pterminal")));
-        // Task 3 (editor-orchestrator): `status.md` lives directly under the
-        // orchestrator's own root (`shared_ctx::status_md_path`), a SIBLING
-        // of `.pterminal`, not inside it — so the `.pterminal`-only watch
-        // above never sees it change. Add the orchestrator's own root too,
-        // so the F2 panel's live-reload (see `drain_events`) fires for it
-        // the same way it already does for every workspace's `shared.md`.
-        if let Some(orch) = workspaces.iter().find(|w| w.meta.is_orchestrator) {
-            dirs.push(orch.meta.repo_path.clone());
-        }
-        dirs
-    }
-
-    /// Rebuilds the watcher so it covers the current workspace list.
-    /// Reassigning `self.watcher` drops the old `(RecommendedWatcher,
-    /// Receiver<PathBuf>)` tuple together — the old watcher and its channel
-    /// both go away in the same statement, which is what stops it from
-    /// forwarding events into a receiver nothing drains anymore. Called
-    /// from `finish_add_workspace`; a failure to rebuild degrades to no
-    /// live-reload/status-watching at all (`self.watcher = None`) rather
-    /// than panicking, same as the original construction in `new`. Any
-    /// per-directory skips (FINDING 2) are surfaced via `self.error`, same
-    /// as `new`, so a stale workspace path added later in the session is
-    /// reported instead of silently going dark.
-    fn rebuild_watcher(&mut self) {
-        match watcher::spawn_watcher(Self::watcher_dirs(&self.workspaces)) {
-            Ok((w, rx, skipped)) => {
-                self.watcher = Some((w, rx));
-                if let Some(msg) = Self::describe_watch_skips(&skipped) {
-                    self.error = Some(msg);
-                }
-            }
-            Err(e) => {
-                self.watcher = None;
-                self.error = Some(format!("filesystem watcher failed to restart: {e}"));
-            }
-        }
-    }
-
-    /// Formats a one-line summary of directories `spawn_watcher` couldn't
-    /// watch, for `self.error`, or `None` if nothing was skipped. Documented
-    /// choice (FINDING 2): surfaced through the existing `self.error` banner
-    /// rather than a new UI element — it's the same mechanism already used
-    /// for every other non-fatal, session-wide degradation in this module
-    /// (save failures, corrupt state, folder-pick errors), so it doesn't
-    /// need a second notification path, and it fires once per
-    /// spawn/rebuild rather than spamming every frame.
-    fn describe_watch_skips(skipped: &[(PathBuf, String)]) -> Option<String> {
-        if skipped.is_empty() {
-            return None;
-        }
-        let detail = skipped
-            .iter()
-            .map(|(p, e)| format!("{} ({e})", p.display()))
-            .collect::<Vec<_>>()
-            .join("; ");
-        let noun = if skipped.len() == 1 { "directory" } else { "directories" };
-        Some(format!(
-            "watcher: could not watch {} {noun}, status glyphs / shared.md live-reload will not update for them: {detail}",
-            skipped.len()
-        ))
     }
 
     /// Saves `state.json`. Step 2 extension: before building `AppState`,
@@ -1357,7 +758,7 @@ impl PtApp {
     ///
     /// Ignores the request if a pick is already outstanding, so clicking
     /// "+ workspace" twice can't open two native dialogs at once.
-    fn add_workspace(&mut self) {
+    pub(crate) fn add_workspace(&mut self) {
         if self.pending_folder_pick.is_some() {
             return;
         }
@@ -1369,33 +770,6 @@ impl PtApp {
         self.pending_folder_pick = Some(rx);
     }
 
-    /// Opens the native "pick a file" dialog on a worker thread and returns
-    /// immediately (Task 1: Ctrl+O / the `+file` button) — mirrors
-    /// [`PtApp::add_workspace`]'s off-thread pattern exactly, for the exact
-    /// same reason (`rfd::FileDialog::pick_file` is a blocking modal call;
-    /// running it on the UI thread would stall every tab's PTY poll for as
-    /// long as the dialog stayed open). The result is picked up in
-    /// [`PtApp::drain_events`] via `pending_file_pick`.
-    ///
-    /// Starts the dialog in the active workspace's `repo_path` — a no-op
-    /// (returns without opening anything) if there is no active workspace,
-    /// since an opened file has nowhere to attach its `EditorTab` to.
-    /// Ignores the request if a pick is already outstanding, so triggering
-    /// it twice can't open two native dialogs at once.
-    fn open_file_dialog(&mut self) {
-        if self.pending_file_pick.is_some() {
-            return;
-        }
-        let Some(ws) = self.workspaces.get(self.active_ws) else { return };
-        let start_dir = ws.meta.repo_path.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let file = rfd::FileDialog::new().set_directory(start_dir).pick_file();
-            let _ = tx.send(file); // app may have exited; a dropped receiver is fine
-        });
-        self.pending_file_pick = Some(rx);
-    }
-
     /// Finishes the flow started by [`PtApp::add_workspace`] once the picked
     /// folder is known: builds the `Workspace` record and persists it.
     /// `git::is_git_repo` shells out to `git`, but it's a one-shot check run
@@ -1403,7 +777,7 @@ impl PtApp {
     /// the UI thread rather than in the worker thread is cheap enough not to
     /// matter — kept here because `add_workspace` never has to touch
     /// `self.workspaces`/`persist` from the worker thread this way.
-    fn finish_add_workspace(&mut self, folder: PathBuf) {
+    pub(crate) fn finish_add_workspace(&mut self, folder: PathBuf) {
         let name = folder
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -1419,24 +793,18 @@ impl PtApp {
         // than unconditional `0` is what skips the backlog while still
         // delivering anything appended from this point on.
         let msg_offset = initial_msg_offset(&folder);
-        self.workspaces.push(WsRt {
-            meta: state::Workspace {
-                name,
-                repo_path: folder,
-                is_git,
-                default_isolate: is_git,
-                kept_worktrees: vec![],
-                saved_tabs: vec![],
-                active_tab: 0,
-                msg_offset,
-                saved_editors: vec![],
-                is_orchestrator: false,
-            },
-            tabs: vec![],
+        self.workspaces.push(WsRt::new(state::Workspace {
+            name,
+            repo_path: folder,
+            is_git,
+            default_isolate: is_git,
+            kept_worktrees: vec![],
+            saved_tabs: vec![],
             active_tab: 0,
-            editors: vec![],
-            active_editor: None,
-        });
+            msg_offset,
+            saved_editors: vec![],
+            is_orchestrator: false,
+        }));
         self.active_ws = self.workspaces.len() - 1;
         self.rebuild_watcher();
         self.persist();
@@ -1554,98 +922,6 @@ impl PtApp {
         self.workspaces.get(ws_index).map(|w| w.meta.name.as_str()) == Some(name)
     }
 
-    /// Task 2 (editor-orchestrator): ensures `self.workspaces` contains
-    /// exactly one reserved "orchestrator" workspace, pinned at index 0
-    /// (see [`pin_orchestrator_front`] for the list algorithm) — creating
-    /// it (on-disk `.pterminal` directory + a fresh saved-tab id) the first
-    /// time this ever runs for a given `%APPDATA%` install, and merely
-    /// re-pinning an already-present one on every call after that.
-    /// Idempotent: a second call with the orchestrator already at index 0
-    /// moves nothing and creates nothing.
-    ///
-    /// Called from `PtApp::new`, AFTER state load (so a previously-created
-    /// orchestrator round-trips through `state.json` like any other
-    /// workspace) and BEFORE `resume_saved_tabs` (so its saved tab resumes
-    /// through the exact same code path as any other saved agent tab).
-    ///
-    /// **Precondition (not re-checked): every `WsRt` in `self.workspaces` at
-    /// this point still has empty `tabs`/`editors`.** True for every call
-    /// site today — this only ever runs before `resume_saved_tabs`/
-    /// `resume_saved_editors` populate them. Rebuilding `self.workspaces`
-    /// from re-ordered `meta` clones below (rather than rotating the
-    /// `WsRt`s themselves in place) is only lossless under that
-    /// precondition; a future call site reached after tabs already exist
-    /// would silently drop them.
-    ///
-    /// **Index-0 invariant / `active_ws`:** this can shift every real
-    /// workspace's index by one (a fresh orchestrator inserted at the
-    /// front) or rotate a range of them (an existing orchestrator moved to
-    /// the front from elsewhere). `PtApp::new` accounts for that with
-    /// [`PtApp::resolve_active_ws`] rather than trusting the raw saved
-    /// index across this reorder — see that function's doc comment.
-    /// `close_workspace`'s own index math and `finish_add_workspace`
-    /// (append-only) are unaffected: both operate entirely AFTER this has
-    /// already run and settled, so every real workspace they see is already
-    /// living at its stable index in `1..n`.
-    ///
-    /// **Seam CLOSED (Task 3):** the fresh saved tab's spawn goes through
-    /// `resume_saved_tabs` completely unchanged from any other agent tab
-    /// EXCEPT for its `agent_readme` selection — `resume_saved_tabs` now
-    /// calls `agent_readme_for_spawn(is_orchestrator, is_git, &repo_root)`,
-    /// which writes [`shared_ctx::write_orchestrator_readme`]'s output for
-    /// this workspace regardless of `is_git` (always `false` here), rather
-    /// than falling through to `None` the way a plain `is_git`-only check
-    /// used to. See `agent_readme_for_spawn`'s doc comment for the full
-    /// history of the gap this closes.
-    pub fn ensure_orchestrator(&mut self) {
-        let mut metas: Vec<state::Workspace> = self.workspaces.iter().map(|w| w.meta.clone()).collect();
-        let created = pin_orchestrator_front(&mut metas);
-        if created {
-            let id = self.next_tab_id;
-            self.next_tab_id += 1;
-            metas[0].saved_tabs[0].tab_id = id;
-            let orch_dir = shared_ctx::orchestrator_dir();
-            if let Err(e) = std::fs::create_dir_all(orch_dir.join(".pterminal")) {
-                self.error = Some(format!("could not create orchestrator directory: {e}"));
-            }
-        }
-        self.workspaces = metas
-            .into_iter()
-            .map(|meta| WsRt { meta, tabs: vec![], active_tab: 0, editors: vec![], active_editor: None })
-            .collect();
-        // Only a brand-new orchestrator needs the watcher rebuilt: the
-        // initial `spawn_watcher` call in `PtApp::new` already ran over the
-        // FULL loaded workspace list (including any pre-existing
-        // orchestrator, order doesn't matter to `watcher_dirs`) before this
-        // method ever runs — see this method's doc comment for the exact
-        // ordering. A newly-created one wasn't in that list yet, so without
-        // this its `.pterminal` dir (F2 live-reload, once Task 3 uses it)
-        // would go unwatched until the next unrelated rebuild. Mirrors
-        // `finish_add_workspace`'s own rebuild-on-change convention.
-        if created {
-            self.rebuild_watcher();
-        }
-    }
-
-    /// Finds the reserved orchestrator workspace's current index, if any.
-    /// Extracted as its own helper (rather than inlining
-    /// `self.workspaces.iter().position(...)` at each call site) so
-    /// `is_orchestrator` is only ever compared against in one place. No
-    /// production call site yet — this task's own sidebar/tab-strip
-    /// rendering already has `ws.meta.is_orchestrator` in hand while
-    /// iterating, so it never needed a separate lookup; the interface is
-    /// part of Task 2's brief regardless (a future task querying "is there
-    /// an orchestrator, and where" without an in-hand `WsRt` needs exactly
-    /// this). `allow(dead_code)` is scoped to non-test builds so a real
-    /// production consumer showing up later doesn't need to remove
-    /// anything, and if the tests below ever stop exercising it, the
-    /// `cargo test` build starts warning instead of it rotting silently —
-    /// same convention as `hooks::status_from_events`.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn orchestrator_index(&self) -> Option<usize> {
-        self.workspaces.iter().position(|w| w.meta.is_orchestrator)
-    }
-
     /// Resolves the active-workspace index to restore at startup, once
     /// `ensure_orchestrator` may have reordered `workspaces` (Task 2:
     /// pinning an existing or freshly-inserted orchestrator to index 0
@@ -1682,6 +958,17 @@ impl PtApp {
             .min(workspaces.len() - 1)
     }
 
+    /// Snapshot of our direct child PIDs from the last sampler snapshot,
+    /// taken before a spawn so the new child can be identified (via
+    /// `PendingClaim` / `drain_events`).
+    pub(crate) fn own_child_pids(&self) -> HashSet<u32> {
+        self.last_snap
+            .iter()
+            .filter(|p| p.parent == Some(std::process::id()))
+            .map(|p| p.pid)
+            .collect()
+    }
+
     /// Opens a plain shell tab rooted at a worktree the user previously
     /// chose to "Keep" from the close dialog (Task 11), and drops it from
     /// `kept_worktrees` — the worktree stays on disk exactly as before,
@@ -1693,14 +980,9 @@ impl PtApp {
     /// children before spawning, hand the delta to `drain_events` via
     /// `pending_claim`) so this tab's CPU/mem rollup doesn't stay stuck at
     /// zero forever.
-    fn open_kept_worktree(&mut self, ctx: &egui::Context, ws_idx: usize, wt: state::WorktreeInfo) {
+    pub(crate) fn open_kept_worktree(&mut self, ctx: &egui::Context, ws_idx: usize, wt: state::WorktreeInfo) {
         let id = self.next_tab_id;
-        let before: HashSet<u32> = self
-            .last_snap
-            .iter()
-            .filter(|p| p.parent == Some(std::process::id()))
-            .map(|p| p.pid)
-            .collect();
+        let before = self.own_child_pids();
         match term::spawn_shell(ctx, id, &wt.path) {
             Ok(tab) => {
                 self.next_tab_id += 1;
@@ -1727,10 +1009,15 @@ impl PtApp {
     /// non-empty: without that, an Enter due 150 ms after a delivery would
     /// wait for `update`'s 500 ms heartbeat to come round.
     fn drain_events(&mut self, ctx: &egui::Context) {
-        // resource snapshots
+        // resource snapshots — `snap_updated` gates the per-tab CPU/mem
+        // rollup below: the sampler ticks every ~2s, so recomputing the
+        // rollup on the ~120 frames in between re-derived the identical
+        // answer from identical inputs (a full process-table walk per tab).
+        let mut snap_updated = false;
         while let Ok((snap, machine)) = self.sampler.try_recv() {
             self.last_snap = snap;
             self.machine = machine;
+            snap_updated = true;
         }
         // pick up a completed (or cancelled) "+ workspace" folder dialog
         if let Some(rx) = &self.pending_folder_pick {
@@ -1782,7 +1069,10 @@ impl PtApp {
         // Create+Modify pair for one file) collapse into a single drain
         // after the loop rather than one drain per event.
         let mut commands_ready = false;
-        let commands_dir = commands::commands_dir();
+        // `commands_dir()` resolves the OS config dir (a Win32 shell call) —
+        // only worth paying when a watcher event actually arrived.
+        let commands_dir =
+            if changed.is_empty() { PathBuf::new() } else { commands::commands_dir() };
         for path in changed {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
             if path.parent() == Some(commands_dir.as_path()) {
@@ -1886,8 +1176,8 @@ impl PtApp {
                             tab.status = new_status;
                             tab.last_activity = new_last_activity;
                             if let Some(sid) = hooks::latest_session_id(&records) {
-                                if tab.session_id.as_deref() != Some(sid.as_str()) {
-                                    tab.session_id = Some(sid);
+                                if tab.session_id.as_deref() != Some(sid) {
+                                    tab.session_id = Some(sid.to_string());
                                     session_changed = true;
                                 }
                             }
@@ -1967,25 +1257,25 @@ impl PtApp {
                         ws.tabs.iter().position(|t| t.id == claim.tab_id).map(|ti| (wi, ti))
                     })
                 });
-            match location {
-                Some((wi, ti)) => {
-                    let snap = self.last_snap.clone();
-                    let tab = &mut self.workspaces[wi].tabs[ti];
-                    tab.claim_pids(&claim.before, &snap);
-                    let done = !tab.root_pids.is_empty() || tab.spawned_at.elapsed().as_secs() > 5;
-                    if !done {
-                        // still pending: put it back, refreshing the index hint
-                        self.pending_claim = Some(PendingClaim {
-                            ws_index: wi,
-                            tab_id: claim.tab_id,
-                            before: claim.before,
-                        });
-                    }
+            // A `None` location means the tab (or its workspace) closed
+            // during the claim window — nothing left to claim for; drop it
+            // rather than spin on a target that no longer exists.
+            if let Some((wi, ti)) = location {
+                // `workspaces` and `last_snap` are distinct fields, so the
+                // mutable tab borrow and the snapshot read coexist — the
+                // full-snapshot `.clone()` this used to do (every frame for
+                // up to 5s after each spawn) was never needed.
+                let tab = &mut self.workspaces[wi].tabs[ti];
+                tab.claim_pids(&claim.before, &self.last_snap);
+                let done = !tab.root_pids.is_empty() || tab.spawned_at.elapsed().as_secs() > 5;
+                if !done {
+                    // still pending: put it back, refreshing the index hint
+                    self.pending_claim = Some(PendingClaim {
+                        ws_index: wi,
+                        tab_id: claim.tab_id,
+                        before: claim.before,
+                    });
                 }
-                // Tab closed (or its workspace closed) during the claim
-                // window — nothing left to claim for; drop it rather than
-                // spin on a target that no longer exists.
-                None => {}
             }
         }
         // Every tab of every workspace: drain its PTY channel (poll), notice
@@ -2001,9 +1291,14 @@ impl PtApp {
                     tab.children.clear();
                 }
                 tab.term.set_visible(ws_idx == self.active_ws && tab_idx == ws.active_tab);
-                let (cpu, mem) = crate::resources::rollup(&tab.root_pids, &self.last_snap);
-                tab.cpu = cpu;
-                tab.mem = mem;
+                // Only when a fresh snapshot arrived (~every 2s): the rollup
+                // walks the whole process table per tab, and between
+                // snapshots its inputs cannot have changed.
+                if snap_updated {
+                    let (cpu, mem) = crate::resources::rollup(&tab.root_pids, &self.last_snap);
+                    tab.cpu = cpu;
+                    tab.mem = mem;
+                }
                 // Step 4: prune finished subagent children a few seconds
                 // after completion, every frame, for every tab — so a
                 // finished child row (tab strip: "`- <desc>", see Step 8
@@ -2056,9 +1351,9 @@ impl PtApp {
             }
         }
         // Step 6: keep each workspace's live agent roster (agents.json) in
-        // sync. Cheap (string build + compare) and debounced internally —
-        // see the function's docs — so calling it unconditionally every
-        // frame is fine.
+        // sync. Cheap (an allocation-free fingerprint hash per workspace;
+        // the JSON is only built when the fingerprint changed) — so calling
+        // it unconditionally every frame is fine.
         self.maintain_roster();
         // Task 3 (editor-orchestrator): same idea, one level up — keep the
         // orchestrator's own `status.md` in sync with every OTHER
@@ -2089,7 +1384,22 @@ impl PtApp {
     /// spam the error dialog every frame until it clears, for a file no
     /// human is looking at directly. The next frame tries again.
     fn maintain_roster(&mut self) {
+        use std::hash::{Hash, Hasher};
         for (ws_idx, ws) in self.workspaces.iter().enumerate() {
+            // Fingerprint the roster's inputs WITHOUT allocating: the JSON
+            // (clones + serde pretty-print per workspace) is only built when
+            // this hash differs from the last successful write's.
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            ws.meta.repo_path.hash(&mut h);
+            for t in ws.tabs.iter().filter(|t| t.kind == TabKind::Agent) {
+                t.title.hash(&mut h);
+                messages::status_str(t.status).hash(&mut h);
+                t.cwd.hash(&mut h);
+            }
+            let fingerprint = h.finish();
+            if self.roster_written.get(&ws_idx) == Some(&fingerprint) {
+                continue;
+            }
             let entries: Vec<messages::RosterEntry> = ws
                 .tabs
                 .iter()
@@ -2101,84 +1411,14 @@ impl PtApp {
                 })
                 .collect();
             let json = messages::roster_json(&entries);
-            if self.roster_written.get(&ws_idx) == Some(&json) {
-                continue;
-            }
             let path = shared_ctx::agents_json_path(&ws.meta.repo_path);
             let Some(parent) = path.parent() else { continue };
             if std::fs::create_dir_all(parent).is_err() {
                 continue;
             }
             if std::fs::write(&path, &json).is_ok() {
-                self.roster_written.insert(ws_idx, json);
+                self.roster_written.insert(ws_idx, fingerprint);
             }
-        }
-    }
-
-    /// Task 3 (editor-orchestrator): keeps the orchestrator's `status.md`
-    /// up to date with every OTHER workspace's live agent-tab roster
-    /// (title, `status_str`-wire status, cwd) — a no-op when there's no
-    /// orchestrator workspace at all (nothing to write, nowhere to write
-    /// it). The orchestrator's OWN workspace is excluded by construction
-    /// (the loop below `continue`s past index `orch_idx` before a
-    /// `messages::WsStatus` is ever built for it) — SHELL/editor "tabs"
-    /// are excluded the same way `maintain_roster` excludes them from
-    /// `agents.json`, via the `TabKind::Agent` filter.
-    ///
-    /// `self.orchestrator_status_written` is the change-detect: the
-    /// formatted markdown is compared against the last string actually
-    /// written, and disk is only touched on a real difference — same
-    /// debounce shape as `maintain_roster`'s `roster_written`, just a plain
-    /// `Option<String>` instead of a per-index map since there is at most
-    /// one orchestrator. Errors (can't create the orchestrator's directory,
-    /// can't write the file) are skipped silently for this cycle, same
-    /// non-spammy-banner reasoning as `maintain_roster`'s docs.
-    fn refresh_orchestrator_status(&mut self) {
-        let Some(orch_idx) = self.orchestrator_index() else { return };
-        // A plain `for` loop rather than the `iter().map().collect()` chain
-        // this used to be: `shared_excerpt_for` now needs `&mut
-        // self.shared_excerpt_cache` per workspace, and a closure can't hold
-        // that mutable borrow of one `self` field while `self.workspaces`'s
-        // own iterator (a different field) is live across the same
-        // expression as cleanly as a loop body can.
-        let mut entries: Vec<messages::WsStatus> = Vec::with_capacity(self.workspaces.len());
-        for (i, ws) in self.workspaces.iter().enumerate() {
-            if i == orch_idx {
-                continue;
-            }
-            let agents = ws
-                .tabs
-                .iter()
-                .filter(|t| t.kind == TabKind::Agent)
-                .map(|t| {
-                    let subagent_count = t.children.iter().filter(|c| c.done_at.is_none()).count();
-                    (
-                        t.title.clone(),
-                        messages::status_str(t.status).to_string(),
-                        t.cwd.clone(),
-                        subagent_count,
-                        messages::fmt_hms(t.last_activity),
-                    )
-                })
-                .collect();
-            entries.push(messages::WsStatus {
-                name: ws.meta.name.clone(),
-                repo_path: ws.meta.repo_path.clone(),
-                shared_excerpt: shared_excerpt_for(&ws.meta.repo_path, &mut self.shared_excerpt_cache),
-                agents,
-            });
-        }
-        let text = messages::orchestrator_status(&entries);
-        if self.orchestrator_status_written.as_ref() == Some(&text) {
-            return;
-        }
-        let path = shared_ctx::status_md_path(&shared_ctx::orchestrator_dir());
-        let Some(parent) = path.parent() else { return };
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
-        if std::fs::write(&path, &text).is_ok() {
-            self.orchestrator_status_written = Some(text);
         }
     }
 
@@ -2290,75 +1530,40 @@ impl PtApp {
             .map(|(i, name, agents)| messages::WsAgents { ws_index: *i, name, agents: agents.as_slice() })
             .collect();
 
-        if is_orchestrator {
-            let resolutions: Vec<messages::TargetResolution> = batch
-                .messages
-                .iter()
-                .map(|m| messages::resolve_target(&m.to, &views, ws_idx, &messages::Sender::Orchestrator))
-                .collect();
+        let resolutions: Vec<messages::TargetResolution> = batch
+            .messages
+            .iter()
+            .map(|m| {
+                let sender = if is_orchestrator {
+                    messages::Sender::Orchestrator
+                } else {
+                    messages::Sender::Workspace { index: ws_idx, from: m.from.clone() }
+                };
+                messages::resolve_target(&m.to, &views, ws_idx, &sender)
+            })
+            .collect();
 
-            for (m, resolution) in batch.messages.iter().zip(resolutions.iter()) {
-                match resolution {
-                    messages::TargetResolution::Deliver { ws_index, tab_index } => {
-                        let tab = &mut self.workspaces[*ws_index].tabs[*tab_index];
-                        let tab_id = tab.id;
-                        tab.term.write_input(&format!(
-                            "[message from orchestrator] {}",
-                            messages::flatten(&m.text)
-                        ));
-                        self.pending_submit.push((tab_id, std::time::Instant::now() + SUBMIT_DELAY));
-                    }
-                    messages::TargetResolution::Orchestrator => {
+        for (m, resolution) in batch.messages.iter().zip(resolutions.iter()) {
+            // The delivery prefix names the sender: the orchestrator's
+            // reserved name when this is the orchestrator's own outbox, the
+            // message's `from` field otherwise.
+            let from_label: &str = if is_orchestrator { "orchestrator" } else { &m.from };
+            match resolution {
+                messages::TargetResolution::Deliver { ws_index, tab_index } => {
+                    let tab = &mut self.workspaces[*ws_index].tabs[*tab_index];
+                    let tab_id = tab.id;
+                    // finding 1: text now, Enter later (see `pending_submit`)
+                    tab.term
+                        .write_input(&format!("[message from {from_label}] {}", messages::flatten(&m.text)));
+                    self.pending_submit.push((tab_id, std::time::Instant::now() + SUBMIT_DELAY));
+                }
+                messages::TargetResolution::Orchestrator => {
+                    if is_orchestrator {
                         // Self-loop: the orchestrator addressing its own
                         // reserved name from its own outbox. Never delivered.
                         undeliverable
                             .get_or_insert_with(|| format!("'{}' (cannot message itself)", m.to));
-                    }
-                    messages::TargetResolution::Ambiguous => {
-                        undeliverable
-                            .get_or_insert_with(|| format!("'{}' (ambiguous — multiple agents match)", m.to));
-                    }
-                    messages::TargetResolution::Unknown => {
-                        undeliverable.get_or_insert_with(|| format!("'{}' (no such running agent)", m.to));
-                    }
-                    messages::TargetResolution::Broadcast(targets) => {
-                        if targets.is_empty() {
-                            undeliverable.get_or_insert_with(|| format!("'{}' (no matching agents)", m.to));
-                        } else {
-                            for &(ws_index, tab_index) in targets {
-                                let tab = &mut self.workspaces[ws_index].tabs[tab_index];
-                                let tab_id = tab.id;
-                                tab.term.write_input(&format!(
-                                    "[broadcast from orchestrator] {}",
-                                    messages::flatten(&m.text)
-                                ));
-                                self.pending_submit.push((tab_id, std::time::Instant::now() + SUBMIT_DELAY));
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            let resolutions: Vec<messages::TargetResolution> = batch
-                .messages
-                .iter()
-                .map(|m| {
-                    let sender = messages::Sender::Workspace { index: ws_idx, from: m.from.clone() };
-                    messages::resolve_target(&m.to, &views, ws_idx, &sender)
-                })
-                .collect();
-
-            for (m, resolution) in batch.messages.iter().zip(resolutions.iter()) {
-                match resolution {
-                    messages::TargetResolution::Deliver { ws_index, tab_index } => {
-                        let tab = &mut self.workspaces[*ws_index].tabs[*tab_index];
-                        let tab_id = tab.id;
-                        // finding 1: text now, Enter later (see `pending_submit`)
-                        tab.term
-                            .write_input(&format!("[message from {}] {}", m.from, messages::flatten(&m.text)));
-                        self.pending_submit.push((tab_id, std::time::Instant::now() + SUBMIT_DELAY));
-                    }
-                    messages::TargetResolution::Orchestrator => {
+                    } else {
                         let orch_idx = self.orchestrator_index();
                         let target = orch_idx.and_then(|oi| self.workspaces.get_mut(oi)).and_then(|orch_ws| {
                             orch_ws.tabs.iter_mut().find(|t| {
@@ -2372,8 +1577,7 @@ impl PtApp {
                             Some(tab) => {
                                 let tab_id = tab.id;
                                 tab.term.write_input(&format!(
-                                    "[message from {}] {}",
-                                    m.from,
+                                    "[message from {from_label}] {}",
                                     messages::flatten(&m.text)
                                 ));
                                 self.pending_submit.push((tab_id, std::time::Instant::now() + SUBMIT_DELAY));
@@ -2383,27 +1587,26 @@ impl PtApp {
                             }
                         }
                     }
-                    messages::TargetResolution::Ambiguous => {
-                        undeliverable
-                            .get_or_insert_with(|| format!("'{}' (ambiguous — multiple agents match)", m.to));
-                    }
-                    messages::TargetResolution::Unknown => {
-                        undeliverable.get_or_insert_with(|| format!("'{}' (no such running agent)", m.to));
-                    }
-                    messages::TargetResolution::Broadcast(targets) => {
-                        if targets.is_empty() {
-                            undeliverable.get_or_insert_with(|| format!("'{}' (no matching agents)", m.to));
-                        } else {
-                            for &(ws_index, tab_index) in targets {
-                                let tab = &mut self.workspaces[ws_index].tabs[tab_index];
-                                let tab_id = tab.id;
-                                tab.term.write_input(&format!(
-                                    "[broadcast from {}] {}",
-                                    m.from,
-                                    messages::flatten(&m.text)
-                                ));
-                                self.pending_submit.push((tab_id, std::time::Instant::now() + SUBMIT_DELAY));
-                            }
+                }
+                messages::TargetResolution::Ambiguous => {
+                    undeliverable
+                        .get_or_insert_with(|| format!("'{}' (ambiguous — multiple agents match)", m.to));
+                }
+                messages::TargetResolution::Unknown => {
+                    undeliverable.get_or_insert_with(|| format!("'{}' (no such running agent)", m.to));
+                }
+                messages::TargetResolution::Broadcast(targets) => {
+                    if targets.is_empty() {
+                        undeliverable.get_or_insert_with(|| format!("'{}' (no matching agents)", m.to));
+                    } else {
+                        for &(ws_index, tab_index) in targets {
+                            let tab = &mut self.workspaces[ws_index].tabs[tab_index];
+                            let tab_id = tab.id;
+                            tab.term.write_input(&format!(
+                                "[broadcast from {from_label}] {}",
+                                messages::flatten(&m.text)
+                            ));
+                            self.pending_submit.push((tab_id, std::time::Instant::now() + SUBMIT_DELAY));
                         }
                     }
                 }
@@ -2437,6 +1640,16 @@ impl PtApp {
         }
     }
 
+    /// True while any dialog (error / new-tab / close tab / close workspace /
+    /// close editor) is on screen and owns the pending decision.
+    pub(crate) fn dialog_open(&self) -> bool {
+        self.error.is_some()
+            || self.new_tab.is_some()
+            || self.closing.is_some()
+            || self.closing_ws.is_some()
+            || self.closing_editor.is_some()
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
         // A dialog (error / new-tab / close tab / close workspace) owns the
         // keyboard while it's open: without this guard, a repeated Ctrl+T
@@ -2450,12 +1663,7 @@ impl PtApp {
         // reason — e.g. Ctrl+1..9 switching the active tab out from under a
         // pending workspace-close confirmation. `closing_editor` (Task 1)
         // joins it too, for the same reason as `closing_ws`.
-        if self.error.is_some()
-            || self.new_tab.is_some()
-            || self.closing.is_some()
-            || self.closing_ws.is_some()
-            || self.closing_editor.is_some()
-        {
+        if self.dialog_open() {
             return;
         }
         let (t, w, cycle, open_file, save_file) = ctx.input_mut(|i| {
@@ -2531,262 +1739,6 @@ impl PtApp {
         }
     }
 
-    /// The tab strip's per-status marker: `(character, color)`.
-    ///
-    /// **Character choice is constrained by egui's bundled fonts.** pTerminal
-    /// deliberately ships no font files (see the design doc's "no bundled
-    /// assets" rule), so a tab label can only use code points covered by
-    /// egui's built-ins. The acceptance run (Task 13, screenshots
-    /// `t13-32`/`t13-33`) caught the original `●` (U+25CF) and `◉` (U+25C9)
-    /// rendering as empty tofu boxes on Windows — which made Working and
-    /// NeedsYou not just ugly but *indistinguishable*, defeating the point of
-    /// the whole app. Verified live (`fr-1-glyphs.png`): ASCII, `○` (U+25CB)
-    /// and `⚠` (U+26A0) render; `✕` (U+2715) does NOT — it was tofu too, and
-    /// is why Exited is a plain red `X`. Anything outside that set needs a
-    /// screenshot before it goes in.
-    ///
-    /// The statuses are separated on **two** axes on purpose — character AND
-    /// color — so neither a font gap nor a colorblind palette can collapse
-    /// two of them into the same thing. NeedsYou (the one status that wants
-    /// the user to actually do something) additionally tints the whole tab
-    /// title amber, see the caller: a colored glyph alone was too easy to
-    /// miss in a strip of tabs, which is the failure mode the review flagged.
-    fn glyph(status: AgentStatus) -> (&'static str, egui::Color32) {
-        match status {
-            AgentStatus::Working => ("*", egui::Color32::from_rgb(90, 200, 120)),
-            AgentStatus::NeedsYou => ("!", egui::Color32::from_rgb(255, 170, 40)),
-            AgentStatus::Idle => ("○", egui::Color32::from_rgb(150, 150, 150)),
-            AgentStatus::Exited => ("X", egui::Color32::from_rgb(235, 95, 95)),
-            AgentStatus::Unknown => ("?", egui::Color32::from_rgb(125, 155, 205)),
-        }
-    }
-
-    /// Renders the active workspace's `active_editor`, if any, into the
-    /// CentralPanel in place of the terminal/subagent-child view — Task 1's
-    /// highest-precedence branch (see the call site in `update`). Returns
-    /// `true` iff it actually rendered something, so the caller knows to
-    /// skip the terminal/`selected_child` fallback entirely for this frame.
-    ///
-    /// **Stale-index and no-editor handling both reset `editor_has_focus`
-    /// to `false`**, mirroring `show_ctx_panel_ui`'s own reset (see that
-    /// function's doc comment for the exact stuck-focus failure mode this
-    /// avoids: without it, a `true` left over from the last frame an editor
-    /// had focus would permanently block the terminal from ever reclaiming
-    /// keyboard focus again). A stale `active_editor` (its index no longer
-    /// resolves — the editor was closed from under it, though nothing in
-    /// this codebase currently does that without also fixing up
-    /// `active_editor` itself; kept as a defensive fallback, same spirit as
-    /// `selected_child`'s own stale-index handling just below this call
-    /// site) clears `active_editor` to `None` so the very next frame falls
-    /// straight through without re-checking.
-    ///
-    /// **Save is read out before any `self` field is written.** `ed`
-    /// borrows `self.workspaces` for as long as it's used; `save_editor`'s
-    /// `Result` is captured into a local first, and every `self.*` write
-    /// (`editor_has_focus`, `error`) happens only after that borrow's last
-    /// use — avoids any doubt about ordering mutable borrows of different
-    /// fields of `self` across a function call boundary.
-    fn show_editor_ui(&mut self, ui: &mut egui::Ui) -> bool {
-        let ws_idx = self.active_ws;
-        let Some(ws) = self.workspaces.get_mut(ws_idx) else {
-            self.editor_has_focus = false;
-            return false;
-        };
-        let Some(idx) = ws.active_editor else {
-            self.editor_has_focus = false;
-            return false;
-        };
-        let Some(ed) = ws.editors.get_mut(idx) else {
-            ws.active_editor = None;
-            self.editor_has_focus = false;
-            return false;
-        };
-
-        // Finding 2: the note must be truthful about what a save does — a
-        // genuinely absent path is "will create", but an existing-but-
-        // unreadable one (directory, locked/permission-denied, bad UTF-8) is a
-        // "will OVERWRITE" warning, since save writes unconditionally.
-        if let Some(note) = editor_note(ed) {
-            ui.colored_label(
-                egui::Color32::from_rgb(255, 170, 40), // amber — same as NeedsYou/the missing-dir banner
-                note,
-            );
-        }
-        let mut save_clicked = false;
-        ui.horizontal(|ui| {
-            ui.label(ed.path.display().to_string());
-            if ui.button("Save").clicked() {
-                save_clicked = true;
-            }
-        });
-        // Finding 4: wrap the editor in a vertical ScrollArea (mirrors the F2
-        // panel's TextEdit) — an egui multiline `TextEdit` doesn't scroll
-        // itself, so without this a file taller than the window has its lower
-        // rows permanently off-screen and unreachable.
-        let mut changed = false;
-        let mut has_focus = false;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let resp = ui
-                .add_sized(ui.available_size(), egui::TextEdit::multiline(&mut ed.buffer).code_editor());
-            changed = resp.changed();
-            has_focus = resp.has_focus();
-        });
-        if changed {
-            ed.dirty = true;
-        }
-        let save_result = if save_clicked { Some(save_editor(ed)) } else { None };
-
-        self.editor_has_focus = has_focus;
-        if let Some(Err(e)) = save_result {
-            self.error = Some(format!("could not save file: {e}"));
-        }
-        true
-    }
-
-    /// The path [`PtApp::show_ctx_panel_ui`] should show/reload for `ws`
-    /// (Task 3, editor-orchestrator): the orchestrator's own generated
-    /// `status.md` when `ws.is_orchestrator`, else that workspace's
-    /// ordinary `shared.md`. Both live under the same `ws.repo_path` — the
-    /// orchestrator's `repo_path` IS `shared_ctx::orchestrator_dir()` (see
-    /// `new_orchestrator_workspace`) — so this is pure path arithmetic, no
-    /// I/O. Extracted from `show_ctx_panel_ui` so the branch is testable
-    /// without an `egui::Context`/`SidePanel` frame.
-    fn ctx_panel_path_for(ws: &state::Workspace) -> PathBuf {
-        if ws.is_orchestrator {
-            shared_ctx::status_md_path(&ws.repo_path)
-        } else {
-            shared_ctx::shared_md_path(&ws.repo_path)
-        }
-    }
-
-    /// The F2 shared-context panel: shows/edits the active workspace's
-    /// `shared.md` — or, for the reserved orchestrator workspace (Task 3),
-    /// shows its generated `status.md` instead (read-only-ish: no "save"
-    /// button, since the file is regenerated by
-    /// [`PtApp::refresh_orchestrator_status`] the moment any agent's status
-    /// changes anyway). Adapted from the brief's reference snippet in three
-    /// ways:
-    ///
-    /// 1. **Focus tracking (the FOCUS fix `term::TabTerm::ui`'s docs call
-    ///    for).** The `TextEdit`'s response is captured into
-    ///    `self.ctx_panel_has_focus` every frame the panel is open, and
-    ///    `update` ANDs `!ctx_panel_has_focus` into the terminal's
-    ///    `focused` bool — otherwise the active terminal would fight this
-    ///    `TextEdit` for keyboard focus exactly the way the dialog-vs-
-    ///    terminal bug worked before Task 11's fix.
-    /// 2. **Save creates the file/dir if missing.** The brief's snippet
-    ///    saves with a bare `std::fs::write`, which fails if
-    ///    `<repo>/.pterminal/` doesn't exist yet (e.g. a workspace where no
-    ///    agent has ever been spawned, so `shared_ctx::ensure_shared_md`
-    ///    was never called). Save now creates the parent directory first.
-    /// 3. **Per-workspace buffer tracking (FINDING 1 fix).** `path` below is
-    ///    recomputed from `self.active_ws` every frame, but
-    ///    `ctx_panel_text` used to only be refilled on an explicit reload
-    ///    click, an empty buffer, or a watcher event — NOT on an active-
-    ///    workspace switch. With the panel open, clicking a different
-    ///    workspace row in the sidebar (still clickable — the panel doesn't
-    ///    grab exclusive input) left the buffer showing the OLD workspace's
-    ///    text while `path` already pointed at the NEW one; clicking "save"
-    ///    then silently overwrote the wrong workspace's `shared.md` with
-    ///    the wrong content (data loss, no error). `ctx_panel_loaded_for`
-    ///    now tracks which workspace's path the buffer was last loaded
-    ///    from/saved to; every frame, a mismatch against the current
-    ///    `path` forces a reload from disk before anything else (a save,
-    ///    in particular) can act on stale content.
-    fn show_ctx_panel_ui(&mut self, ctx: &egui::Context) {
-        if !self.show_ctx_panel {
-            // BUG FOUND IN MANUAL VERIFICATION: without this reset,
-            // closing the panel (F2) while its TextEdit still holds
-            // keyboard focus leaves `ctx_panel_has_focus` stuck at `true`
-            // forever — this function returns before ever reaching the
-            // line that would refresh it, since that line only runs while
-            // the panel is shown. The active terminal's `focused` bool
-            // ANDs in `!ctx_panel_has_focus` (see `update`), so the stale
-            // `true` permanently blocks the terminal from ever requesting
-            // keyboard focus again, silently swallowing all further
-            // keystrokes with no visible error. Reproduced live: opened
-            // the panel, focused the TextEdit, closed with F2, then typed
-            // into the active shell tab — nothing reached it. Resetting
-            // here, on the very first frame the panel is no longer shown,
-            // fixes it.
-            self.ctx_panel_has_focus = false;
-            return;
-        }
-        let Some(ws) = self.workspaces.get(self.active_ws) else { return };
-        let is_orchestrator = ws.meta.is_orchestrator;
-        let path = Self::ctx_panel_path_for(&ws.meta);
-
-        // FINDING 1 fix: reload whenever the active workspace's path no
-        // longer matches what the buffer was last loaded from — including
-        // the very first frame the panel is ever shown, when
-        // `ctx_panel_loaded_for` is still `None`. This replaces the brief's
-        // `self.ctx_panel_text.is_empty()` heuristic (which also had the
-        // latent problem of re-reading from disk on every frame the user
-        // had legitimately deleted all the text, clobbering an intentional
-        // empty buffer) with a check that's precise about *why* a reload is
-        // needed.
-        let switched = self.ctx_panel_loaded_for.as_deref() != Some(path.as_path());
-        if switched {
-            self.ctx_panel_text = std::fs::read_to_string(&path).unwrap_or_default();
-            self.ctx_panel_loaded_for = Some(path.clone());
-        }
-
-        let mut has_focus = false;
-        egui::SidePanel::right("shared_ctx").default_width(360.0).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(if is_orchestrator { "status.md" } else { "shared.md" });
-                if ui.button("reload").clicked() {
-                    self.ctx_panel_text = std::fs::read_to_string(&path).unwrap_or_default();
-                    self.ctx_panel_loaded_for = Some(path.clone());
-                }
-                // Task 3: no "save" for the orchestrator's status.md — it's
-                // generated (`refresh_orchestrator_status`) and would just
-                // get overwritten the next time any agent's status changes;
-                // offering a save button here would be misleading.
-                if !is_orchestrator && ui.button("save").clicked() {
-                    // Adaptation 2 (see doc comment above): ensure the
-                    // parent dir exists before writing, since the brief's
-                    // bare `std::fs::write` would fail on a workspace whose
-                    // `.pterminal` dir was never created.
-                    let mut dir_ok = true;
-                    if let Some(parent) = path.parent() {
-                        if let Err(e) = std::fs::create_dir_all(parent) {
-                            self.error = Some(format!("could not save shared.md: {e}"));
-                            dir_ok = false;
-                        }
-                    }
-                    if dir_ok {
-                        if let Err(e) = std::fs::write(&path, &self.ctx_panel_text) {
-                            self.error = Some(format!("could not save shared.md: {e}"));
-                        } else {
-                            self.ctx_panel_loaded_for = Some(path.clone());
-                        }
-                    }
-                }
-            });
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let resp = ui.add_sized(ui.available_size(),
-                    egui::TextEdit::multiline(&mut self.ctx_panel_text).code_editor().interactive(!is_orchestrator));
-                has_focus = resp.has_focus();
-            });
-        });
-        // The TextEdit above is the same widget (same call site / auto id)
-        // every frame, so egui persists its focus by id across frames
-        // regardless of content — if it held focus in the OLD workspace's
-        // buffer, `resp.has_focus()` can still read `true` this frame even
-        // though the content just got swapped out from under the cursor
-        // for a workspace switch. Force our own tracking bool false in
-        // that case (same fix in spirit as the panel-close case above):
-        // `update`'s `focused` bool ANDs in `!ctx_panel_has_focus`, so an
-        // incorrectly-true value here would keep the active terminal
-        // permanently starved of focus after a workspace switch made while
-        // the panel was open.
-        if switched {
-            has_focus = false;
-        }
-        self.ctx_panel_has_focus = has_focus;
-    }
-
     /// Restarts the active tab's process after it exited (Task 12's
     /// "Restart" button). Captures a before-snapshot of our own child PIDs
     /// *before* calling `Tab::respawn` — the old child's PID must already
@@ -2828,7 +1780,7 @@ impl PtApp {
     /// rather than let it fall through to `respawn`. Cheap, and it keeps the
     /// invariant with the function that must hold it instead of relying on
     /// one `if` in the UI layer staying correct forever.
-    fn restart_active_tab(&mut self, ctx: &egui::Context) {
+    pub(crate) fn restart_active_tab(&mut self, ctx: &egui::Context) {
         if self
             .workspaces
             .get(self.active_ws)
@@ -2838,12 +1790,7 @@ impl PtApp {
             self.respawn_missing_dir_tab(ctx);
             return;
         }
-        let before: HashSet<u32> = self
-            .last_snap
-            .iter()
-            .filter(|p| p.parent == Some(std::process::id()))
-            .map(|p| p.pid)
-            .collect();
+        let before = self.own_child_pids();
         let ws_index = self.active_ws;
         let Some(ws) = self.workspaces.get_mut(ws_index) else { return };
         let Some(tab) = ws.tabs.get_mut(ws.active_tab) else { return };
@@ -2871,14 +1818,9 @@ impl PtApp {
     /// it — so this goes through `spawn_agent`/`spawn_shell` proper (same
     /// as a brand-new tab from the dialog) and replaces the `Tab` in place,
     /// keeping its id (and so its tab-strip position) stable.
-    fn respawn_missing_dir_tab(&mut self, ctx: &egui::Context) {
+    pub(crate) fn respawn_missing_dir_tab(&mut self, ctx: &egui::Context) {
         let ws_index = self.active_ws;
-        let before: HashSet<u32> = self
-            .last_snap
-            .iter()
-            .filter(|p| p.parent == Some(std::process::id()))
-            .map(|p| p.pid)
-            .collect();
+        let before = self.own_child_pids();
         let Some(ws) = self.workspaces.get_mut(ws_index) else { return };
         let tab_idx = ws.active_tab;
         let Some(old) = ws.tabs.get(tab_idx) else { return };
@@ -2933,7 +1875,7 @@ impl PtApp {
     /// close dialog's, for a real tab) — there is nothing of the user's to
     /// lose here, just a diagnostic placeholder that already told them what
     /// was wrong.
-    fn close_missing_dir_tab(&mut self) {
+    pub(crate) fn close_missing_dir_tab(&mut self) {
         let ws_index = self.active_ws;
         let Some(ws) = self.workspaces.get_mut(ws_index) else { return };
         let idx = ws.active_tab;
@@ -2981,405 +1923,11 @@ impl eframe::App for PtApp {
         // `tab_id`), `NewTabDraft` by `ws_index`, `CloseWsDraft` by
         // (`ws_index`, `name`). Switching workspaces mid-dialog can no
         // longer misdirect any of them.
-        let dialog_open = self.error.is_some()
-            || self.new_tab.is_some()
-            || self.closing.is_some()
-            || self.closing_ws.is_some()
-            || self.closing_editor.is_some();
+        let dialog_open = self.dialog_open();
 
-        egui::SidePanel::left("workspaces").default_width(180.0).show(ctx, |ui| {
-            ui.heading("WORKSPACES");
-            ui.separator();
-            let mut clicked = None;
-            // Collected outside the loop, same borrow pattern as `clicked`
-            // above: `ws.meta.kept_worktrees` is borrowed immutably by the
-            // `for` loop over `self.workspaces`, so acting on a click (which
-            // needs a mutable borrow to spawn a tab and remove the entry)
-            // has to wait until the loop is done.
-            let mut kept_clicked: Option<(usize, state::WorktreeInfo)> = None;
-            // Task 2: same collect-outside-the-loop pattern as `clicked` /
-            // `kept_clicked` above — the context menu closure below only
-            // needs a mutable borrow of this local, not of `self`.
-            let mut close_ws_clicked: Option<CloseWsDraft> = None;
-            for (i, ws) in self.workspaces.iter().enumerate() {
-                if ws.meta.is_orchestrator {
-                    // Task 2 (editor-orchestrator): distinct rendering, and
-                    // deliberately no `.context_menu` attached below — this
-                    // is the reserved singleton workspace
-                    // `ensure_orchestrator` pins at index 0, never a
-                    // candidate for the numbered agents/mem/cpu row format
-                    // or for "Close workspace" (enforced for real by
-                    // `close_workspace`'s own guard; this omission is what
-                    // makes that guarantee visible in the UI). It also never
-                    // has `kept_worktrees` (never populated for a non-git
-                    // workspace), so there's nothing else this row needs to
-                    // render.
-                    //
-                    // BUG FOUND IN MANUAL VERIFICATION (screenshot evidence,
-                    // `orch-1-fresh-launch-initial.png`): the brief's own
-                    // literal "\u{25C8}" (WHITE DIAMOND CONTAINING BLACK
-                    // SMALL DIAMOND) rendered as an empty tofu box on this
-                    // machine/font — the exact failure mode this file's own
-                    // `glyph()`/"[wt]"/"[e]" doc comments already warn about
-                    // for other bundled-font gaps; missed during
-                    // implementation, caught here. Dropped in favor of no
-                    // extra glyph at all: the row is already visually
-                    // distinct from a numbered workspace row by omitting the
-                    // agents/mem/cpu stats line entirely and always sitting
-                    // first, so unlike ">"/"[wt]"/"[e]" there's no ASCII
-                    // substitute needed — confirmed rendering correctly live
-                    // afterward (`orch-1-fresh-launch-orchestrator-active.png`).
-                    let label = format!("{} Orchestrator", if i == self.active_ws { ">" } else { " " });
-                    let row_resp = ui.selectable_label(i == self.active_ws, label);
-                    if row_resp.clicked() {
-                        clicked = Some(i);
-                    }
-                    continue;
-                }
-                let agent_count = ws.tabs.iter().filter(|t| t.kind == TabKind::Agent).count();
-                let (cpu, mem): (f32, u64) = ws
-                    .tabs
-                    .iter()
-                    .fold((0.0, 0), |(c, m), t| (c + t.cpu, m + t.mem));
-                let label = format!(
-                    "{} {}\n   {} agents  {:.1}G {:>3.0}%",
-                    // ">" not "▸": same font-coverage rule as `glyph` — the
-                    // triangle rendered as a tofu box on Windows (seen live
-                    // in the sidebar, screenshot `fr-1-glyphs.png`).
-                    if i == self.active_ws { ">" } else { " " },
-                    ws.meta.name,
-                    agent_count,
-                    mem as f64 / 1e9,
-                    cpu,
-                );
-                let row_resp = ui.selectable_label(i == self.active_ws, label);
-                if row_resp.clicked() {
-                    clicked = Some(i);
-                }
-                // Task 2: right-click → "Close workspace". Single item, per
-                // the brief. Guarded by `dialog_open` the same way the `+`
-                // new-tab button is (`add_enabled`, not a post-hoc bool
-                // check) — a dialog already in flight visibly disables the
-                // menu item instead of silently swallowing the click.
-                row_resp.context_menu(|ui| {
-                    if ui.add_enabled(!dialog_open, egui::Button::new("Close workspace")).clicked() {
-                        close_ws_clicked = Some(CloseWsDraft { ws_index: i, name: ws.meta.name.clone() });
-                        ui.close_menu();
-                    }
-                });
-                for wt in &ws.meta.kept_worktrees {
-                    // `ui.small(text)` alone doesn't reliably sense clicks
-                    // (a plain `Label`'s default sense is hover-only unless
-                    // egui's text-selection interaction happens to union in
-                    // a click sense) — adaptation from the brief's
-                    // display-only snippet: sense the click explicitly.
-                    let resp = ui.add(
-                        // "[wt]" not "⌂" (U+2302): same font-coverage rule as
-                        // `glyph` — no bundled fonts, so stay inside what
-                        // egui's built-ins cover.
-                        egui::Label::new(egui::RichText::new(format!("  [wt] {}", wt.branch)).small())
-                            .sense(egui::Sense::click()),
-                    );
-                    if resp.clicked() {
-                        kept_clicked = Some((i, wt.clone()));
-                    }
-                }
-            }
-            if let Some(i) = clicked {
-                self.active_ws = i;
-                // REVIEW FINDING 2 fix (selected_child not cleared on
-                // workspace switch — distinct from this file's other
-                // "FINDING 2", the unrelated watcher best-effort skip):
-                // every other path that changes which tab is
-                // showing (real-tab click `app.rs:1438`, keyboard tab
-                // switch `app.rs:978`/`989`, close/restart paths) already
-                // clears `selected_child` — this sidebar workspace click was
-                // the one gap. Without it, a child pane selected in
-                // workspace A stayed selected after switching to workspace
-                // B; the CentralPanel resolver used to scan every
-                // workspace's tabs for a matching id (not just the active
-                // one), so it would keep resolving and render A's info pane
-                // OVER B's terminal until the user clicked a real tab in B.
-                self.selected_child = None;
-            }
-            if let Some((ws_idx, wt)) = kept_clicked {
-                self.open_kept_worktree(ctx, ws_idx, wt);
-            }
-            if let Some(draft) = close_ws_clicked {
-                self.closing_ws = Some(draft);
-            }
-            ui.separator();
-            if ui.button("+ workspace").clicked() {
-                self.add_workspace();
-            }
-        });
-
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
-            // Task 1: collected outside `ui.horizontal` below, same pattern
-            // as the sidebar's `clicked`/`kept_clicked` — `open_file_dialog`
-            // needs `&mut self` as a whole (it's a method call, not a plain
-            // field write), which can't happen while `ws` still holds a
-            // mutable borrow of `self.workspaces` inside that closure.
-            let mut open_file_clicked = false;
-            let mut needs_persist = false;
-            ui.horizontal(|ui| {
-                let active_ws = self.active_ws;
-                let Some(ws) = self.workspaces.get_mut(active_ws) else {
-                    ui.label("add a workspace to begin");
-                    return;
-                };
-                // Task 2 (editor-orchestrator): the reserved orchestrator
-                // workspace is a single always-resumed agent tab — no
-                // `+`/`+file`, and its one tab can't be closed by
-                // middle-click or the `x` button (mirrored by a Ctrl+W
-                // guard in `shortcuts()`). Computed once, read at every
-                // suppression point below.
-                let is_orchestrator = ws.meta.is_orchestrator;
-                let mut close_req = None;
-                for (i, tab) in ws.tabs.iter().enumerate() {
-                    // Shared-dir warning marker (Step 3). Only Agent tabs
-                    // with no worktree (i.e. working directly in a shared
-                    // checkout, not an isolated one) can collide with each
-                    // other's hook routing (see `spawn_agent`'s doc comment
-                    // on direct-mode hook takeover) — so the marker only
-                    // ever appears on those. "Another tab working directly
-                    // in this directory" is scoped to OTHER AGENT tabs at
-                    // the same `cwd`, not shells: a shell is passive (no
-                    // hooks, no `.claude/settings.local.json` writes), so it
-                    // can't take over another tab's status routing the way
-                    // a second direct-mode agent spawn does.
-                    let shared_dir_warning = tab.kind == TabKind::Agent
-                        && tab.worktree.is_none()
-                        && ws.tabs.iter().enumerate().any(|(j, other)| {
-                            j != i && other.kind == TabKind::Agent && other.cwd == tab.cwd
-                        });
-                    // Two-section label: the status marker keeps its own
-                    // color while the title stays in the theme's text color,
-                    // which a plain `RichText` (one color for the whole
-                    // string) can't express — hence the `LayoutJob`. The
-                    // exception is NeedsYou, which tints the title too: that
-                    // is the "needs you" highlight, and it is the difference
-                    // between a monitoring app you can scan and one you have
-                    // to squint at. Shell tabs get `>` in the plain text
-                    // color — a marker, not a status.
-                    let (marker, marker_color, title_color) = if tab.kind == TabKind::Agent {
-                        let (g, c) = Self::glyph(tab.status);
-                        let title_c = if tab.status == AgentStatus::NeedsYou {
-                            Some(c)
-                        } else {
-                            None
-                        };
-                        (g, Some(c), title_c)
-                    } else {
-                        (">", None, None)
-                    };
-                    let font = egui::TextStyle::Button.resolve(ui.style());
-                    let base = ui.visuals().text_color();
-                    let mut text = egui::text::LayoutJob::default();
-                    let mut fmt = |s: &str, color: egui::Color32| {
-                        text.append(
-                            s,
-                            0.0,
-                            egui::TextFormat { font_id: font.clone(), color, ..Default::default() },
-                        );
-                    };
-                    fmt(marker, marker_color.unwrap_or(base));
-                    let title = if shared_dir_warning {
-                        format!(" {} ⚠", tab.title)
-                    } else {
-                        format!(" {}", tab.title)
-                    };
-                    fmt(&title, title_color.unwrap_or(base));
-                    let mut hover = format!(
-                        "{}\ncpu {:.0}%  ram {:.0} MB",
-                        tab.cwd.display(),
-                        tab.cpu,
-                        tab.mem as f64 / 1e6
-                    );
-                    if shared_dir_warning {
-                        hover.push_str("\nanother tab is working directly in this directory");
-                    }
-                    let resp = ui
-                        .selectable_label(i == ws.active_tab, text)
-                        .on_hover_text(hover);
-                    if resp.clicked() {
-                        ws.active_tab = i;
-                        self.selected_child = None; // Step 8: clicking any real tab clears it
-                        ws.active_editor = None; // Task 1: a terminal tab click leaves the editor view
-                    }
-                    if resp.middle_clicked() && !dialog_open && !is_orchestrator {
-                        close_req = Some(i);
-                    }
-                    // Visible close button — same confirmed-close path as
-                    // middle-click/Ctrl+W (close dialog, then the drop of the
-                    // tab's ConPTY takes the agent process down with it).
-                    // Task 2: hidden entirely for the orchestrator's tab,
-                    // not just disabled — "no-close" per the brief.
-                    if !is_orchestrator
-                        && ui.small_button("x").on_hover_text("close tab").clicked()
-                        && !dialog_open
-                    {
-                        close_req = Some(i);
-                    }
-                    // Step 8: subagent child rows, one small selectable
-                    // label per live `SubTab`, right after the parent's own
-                    // label — amber while running, green once done (same
-                    // color pair `glyph` uses for Working/NeedsYou, chosen
-                    // for the same reason: readable at a glance). "..." not
-                    // a unicode ellipsis — same font-coverage rule as
-                    // `glyph`/the sidebar's `[wt]` marker: no bundled fonts,
-                    // stay inside egui's verified built-in glyphs.
-                    //
-                    // BUG FOUND IN MANUAL VERIFICATION (screenshot
-                    // evidence, a live subagent run): the brief's own
-                    // `└` (U+2514, BOX DRAWINGS LIGHT UP AND RIGHT) renders
-                    // as an empty tofu box on this build/font — exactly the
-                    // failure mode `glyph`'s doc comment already warns
-                    // about for `●`/`◉`/`✕`. Swapped for the ASCII
-                    // "`-" tree-branch marker (same convention as ">" for
-                    // "▸" and "[wt]" for "⌂" elsewhere in this file);
-                    // confirmed rendering correctly live afterward.
-                    for (child_idx, child) in tab.children.iter().enumerate() {
-                        let running = child.done_at.is_none();
-                        let color = if running {
-                            egui::Color32::from_rgb(255, 170, 40) // amber, running
-                        } else {
-                            egui::Color32::from_rgb(90, 200, 120) // green, done
-                        };
-                        let chars: Vec<char> = child.desc.chars().collect();
-                        let truncated = if chars.len() > 24 {
-                            format!("{}...", chars[..24].iter().collect::<String>())
-                        } else {
-                            child.desc.clone()
-                        };
-                        let child_resp = ui.selectable_label(
-                            self.selected_child == Some((tab.id, child_idx)),
-                            egui::RichText::new(format!("  `- {truncated}")).color(color).small(),
-                        );
-                        if child_resp.clicked() {
-                            self.selected_child = Some((tab.id, child_idx));
-                        }
-                    }
-                }
-                if let Some(i) = close_req {
-                    self.closing = close_draft_for(ws, active_ws, i);
-                }
-
-                // Task 1: editor tabs, rendered after every terminal tab —
-                // "[e]" marks a file tab the same way ">" marks a shell tab
-                // and "[wt]" marks a kept-worktree row (sidebar); a trailing
-                // "*" when unsaved changes are pending, same glyph
-                // `AgentStatus::Working` already uses for "something changed
-                // here". LIVE-VERIFICATION FINDING: the brief's own literal
-                // "\u{270E}" (PENCIL) and "\u{25CF}" (the dirty marker,
-                // already flagged as tofu on this exact build/font by
-                // `glyph`'s own doc comment — missed during implementation,
-                // caught here) both rendered as empty tofu boxes on this
-                // machine (screenshot `ed-2-editor-opened.png` before this
-                // fix). Swapped for the ASCII markers this module already
-                // uses everywhere else for the same font-coverage reason;
-                // confirmed rendering correctly afterward
-                // (`ed-3-editor-typed.png`).
-                let mut editor_close_req: Option<usize> = None;
-                for (ei, ed) in ws.editors.iter().enumerate() {
-                    let file_name = ed
-                        .path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| ed.path.display().to_string());
-                    let label = if ed.dirty {
-                        format!("[e] {file_name} *")
-                    } else {
-                        format!("[e] {file_name}")
-                    };
-                    let resp = ui
-                        .selectable_label(ws.active_editor == Some(ei), label)
-                        .on_hover_text(ed.path.display().to_string());
-                    if resp.clicked() {
-                        ws.active_editor = Some(ei);
-                        self.selected_child = None;
-                    }
-                    if resp.middle_clicked() && !dialog_open {
-                        editor_close_req = Some(ei);
-                    }
-                    if ui.small_button("x").on_hover_text("close file").clicked() && !dialog_open {
-                        editor_close_req = Some(ei);
-                    }
-                }
-                if let Some(ei) = editor_close_req {
-                    if let Some(ed) = ws.editors.get(ei) {
-                        if ed.dirty {
-                            self.closing_editor =
-                                Some(CloseEditorDraft { ws_index: active_ws, editor_id: ed.id });
-                        } else {
-                            let editor_id = ed.id;
-                            remove_editor(ws, editor_id);
-                            // `self.persist()` needs `&mut self` as a whole
-                            // and `ws` (borrowing `self.workspaces`) is still
-                            // used further down in this closure (the `+`
-                            // button reads `ws.meta`) — deferred to after
-                            // `ui.horizontal` returns, same as
-                            // `open_file_clicked` just below.
-                            needs_persist = true;
-                        }
-                    }
-                }
-
-                // Task 2: both hidden outright (not just disabled) for the
-                // orchestrator workspace — single agent tab, no editors, no
-                // shells, per the brief.
-                if !is_orchestrator {
-                    if ui.add_enabled(!dialog_open, egui::Button::new("+")).clicked() {
-                        let isolate = ws.meta.default_isolate && ws.meta.is_git;
-                        self.new_tab = Some(NewTabDraft {
-                            ws_index: active_ws,
-                            prompt: String::new(),
-                            isolate,
-                            shell: false,
-                        });
-                    }
-                    // Task 1: `+file` beside `+` — opens the native file
-                    // picker (Ctrl+O does the same thing; this is the mouse
-                    // path).
-                    if ui.add_enabled(!dialog_open, egui::Button::new("+file")).clicked() {
-                        open_file_clicked = true;
-                    }
-                }
-            });
-            if open_file_clicked {
-                self.open_file_dialog();
-            }
-            if needs_persist {
-                self.persist();
-            }
-        });
-
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let (cpu, mem): (f32, u64) = self
-                    .workspaces
-                    .iter()
-                    .flat_map(|w| &w.tabs)
-                    .fold((0.0, 0), |(c, m), t| (c + t.cpu, m + t.mem));
-                ui.label(format!("agents: {:.1}GB / {:.0}%", mem as f64 / 1e9, cpu));
-                let own = self
-                    .last_snap
-                    .iter()
-                    .find(|p| p.pid == std::process::id())
-                    .map(|p| p.mem)
-                    .unwrap_or(0);
-                ui.label(format!("pterm: {:.0}MB", own as f64 / 1e6));
-                ui.label(format!(
-                    "machine: {:.1}/{:.1}GB  cpu {:.0}%",
-                    self.machine.mem_used as f64 / 1e9,
-                    self.machine.mem_total as f64 / 1e9,
-                    self.machine.cpu_pct,
-                ));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label("F2 context  Ctrl+T new tab");
-                });
-            });
-        });
+        self.sidebar_ui(ctx, dialog_open);
+        self.tab_strip_ui(ctx, dialog_open);
+        self.status_bar_ui(ctx);
 
         // dialogs (Task 11) and F2 panel (Task 12) hook in here
         self.show_dialogs(ctx);
@@ -3423,184 +1971,16 @@ impl eframe::App for PtApp {
             && self.error.is_none()
             && !self.ctx_panel_has_focus
             && !self.editor_has_focus;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Task 1: the active editor tab, if any, takes over the whole
-            // central panel — highest precedence, ahead of even the
-            // subagent child pane below (`active_editor` first, else
-            // `selected_child`, else the terminal). See `show_editor_ui`'s
-            // docs for the stale-index/focus-reset handling.
-            if self.show_editor_ui(ui) {
-                return;
-            }
-            // Step 8: a selected subagent child takes over the whole
-            // central panel instead of the terminal. Resolved fresh every
-            // frame by (parent tab id, child index) rather than trusted
-            // from click time — pruning (drain_events, a few seconds after
-            // completion) or the parent tab closing can make it stale
-            // between clicks. A stale selection just clears itself here and
-            // falls through to the normal terminal/placeholder rendering
-            // below; no user action needed, per the brief.
-            if let Some((parent_id, child_idx)) = self.selected_child {
-                // Collected into owned values (not `&SubTab`) up front so
-                // nothing here holds a live borrow of `self.workspaces` —
-                // simpler than reasoning about NLL across the match below.
-                //
-                // REVIEW FINDING 2 fix: restricted to `self.active_ws`'s own tabs
-                // ONLY, not `self.workspaces.iter().flat_map(...)` over
-                // every workspace. Tab ids are unique per `next_tab_id`
-                // counter but NOT namespaced per workspace, so scanning all
-                // workspaces could resolve a `parent_id` that belongs to a
-                // tab sitting in a workspace that isn't even showing right
-                // now — a pane selected in workspace A would keep rendering
-                // on top of workspace B's terminal after switching via the
-                // sidebar (the click site's own `selected_child = None` is
-                // the first half of this fix; this scan restriction is the
-                // second half, needed even where some other path failed to
-                // clear the selection).
-                let resolved: Option<(String, String, std::time::Instant, Option<std::time::Instant>)> = self
-                    .workspaces
-                    .get(self.active_ws)
-                    .into_iter()
-                    .flat_map(|w| w.tabs.iter())
-                    .find(|t| t.id == parent_id)
-                    .and_then(|t| {
-                        t.children
-                            .get(child_idx)
-                            .map(|c| (t.title.clone(), c.desc.clone(), c.started, c.done_at))
-                    });
-                match resolved {
-                    Some((parent_title, desc, started, done_at)) => {
-                        ui.heading("subagent");
-                        ui.label(format!("parent tab: {parent_title}"));
-                        ui.separator();
-                        ui.label(desc);
-                        ui.separator();
-                        let (state, elapsed) = match done_at {
-                            Some(done) => ("Done", done.duration_since(started)),
-                            None => ("Running", started.elapsed()),
-                        };
-                        ui.label(format!("state: {state}"));
-                        ui.label(format!("elapsed: {:.1}s", elapsed.as_secs_f32()));
-                        return;
-                    }
-                    None => {
-                        self.selected_child = None; // stale; fall through below
-                    }
-                }
-            }
-
-            let mut restart = false;
-            let mut respawn_missing = false;
-            let mut close_missing = false;
-            if let Some(ws) = self.workspaces.get_mut(self.active_ws) {
-                if let Some(tab) = ws.tabs.get_mut(ws.active_tab) {
-                    // Step 5: missing-dir banner, drawn above the exit
-                    // banner. A placeholder's diagnostic `cmd.exe` exits
-                    // almost immediately, so both banners typically show
-                    // together — intended, not a bug (see
-                    // `spawn_missing_dir_placeholder`'s docs).
-                    let placeholder = tab.missing_dir.is_some();
-                    if placeholder {
-                        // Finding 3: the reason is now carried on the tab
-                        // (missing directory, or a failed resume spawn) rather
-                        // than being reconstructed from `missing_dir` here.
-                        // `dead_reason` is always `Some` when `missing_dir`
-                        // is — both are set by the one constructor that builds
-                        // placeholders — so the fallback never renders.
-                        let reason = tab
-                            .dead_reason
-                            .clone()
-                            .unwrap_or_else(|| "this tab could not be restored".to_string());
-                        ui.horizontal(|ui| {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(255, 170, 40), // amber — same as NeedsYou
-                                format!("\u{26A0} {reason}"),
-                            );
-                            if ui.button("Respawn in main checkout").clicked() {
-                                respawn_missing = true;
-                            }
-                            if ui.button("Close").clicked() {
-                                close_missing = true;
-                            }
-                        });
-                    }
-                    // Exit banner + Restart (Step 2). Drawn above the
-                    // terminal so it's visible even though the dead
-                    // terminal view still renders below it (its last
-                    // on-screen frame, frozen).
-                    if let Some(code) = tab.term.exited() {
-                        ui.horizontal(|ui| {
-                            ui.colored_label(
-                                egui::Color32::LIGHT_RED,
-                                format!("process exited with code {code}"),
-                            );
-                            // FINAL-REVIEW FINDING 4: no Restart button for a
-                            // dead placeholder — `Tab::respawn` would poison
-                            // hook routing (see `restart_active_tab`'s docs).
-                            // The missing-dir banner drawn just above already
-                            // offers the two actions that make sense for one.
-                            if !placeholder && ui.button("Restart").clicked() {
-                                restart = true;
-                            }
-                        });
-                    }
-                    tab.term.ui(ui, focused); // only the ACTIVE tab renders — spec perf requirement
-                    if restart {
-                        self.restart_active_tab(ctx);
-                    }
-                    if respawn_missing {
-                        self.respawn_missing_dir_tab(ctx);
-                    }
-                    if close_missing {
-                        self.close_missing_dir_tab();
-                    }
-                    return;
-                }
-            }
-            ui.centered_and_justified(|ui| {
-                ui.label("Ctrl+T — new tab    Ctrl+Tab — cycle    F2 — shared context");
-            });
-        });
+        self.central_ui(ctx, focused);
     }
-}
-
-/// Append a Thai-capable Windows system font as the *lowest-priority*
-/// fallback in both egui font families. Bundled fonts keep first priority,
-/// so Latin/UI text and the status-marker glyphs are untouched; only code
-/// points the bundled fonts lack (Thai) fall through to it. No candidate
-/// font on disk → no-op, exactly today's behavior.
-///
-/// ponytail: no complex text shaping — Thai combining marks render by
-/// zero-width overstrike, fine for normal text; revisit only if stacked-mark
-/// positioning misrenders badly enough to matter.
-fn install_thai_fallback(ctx: &egui::Context) {
-    let Some(bytes) = thai_font_bytes() else { return };
-    let mut fonts = egui::FontDefinitions::default();
-    fonts
-        .font_data
-        .insert("thai-fallback".into(), egui::FontData::from_owned(bytes).into());
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push("thai-fallback".into());
-    }
-    ctx.set_fonts(fonts);
-}
-
-/// Leelawadee UI is Windows' standard Thai UI font (shipped since 8.1);
-/// Tahoma also covers Thai and exists on effectively every install.
-fn thai_font_bytes() -> Option<Vec<u8>> {
-    let dir = PathBuf::from(std::env::var_os("WINDIR")?).join("Fonts");
-    ["LeelawUI.ttf", "tahoma.ttf"]
-        .into_iter()
-        .find_map(|f| std::fs::read(dir.join(f)).ok())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::editor_note;
+    use crate::orchestrator::{pin_orchestrator_front, shared_excerpt_for};
+    use crate::resume::paths_match;
 
     /// Guards every test that does real filesystem I/O (create/remove) on
     /// the singleton, non-tempdir `shared_ctx::orchestrator_dir()` — unlike
@@ -3632,7 +2012,7 @@ mod tests {
     /// regresses to boxes — nothing else in the suite would notice.
     #[test]
     fn thai_font_resolves_on_windows() {
-        let bytes = thai_font_bytes().expect("no Thai-capable system font found");
+        let bytes = crate::ui::thai_font_bytes().expect("no Thai-capable system font found");
         // sfnt magics (ttf/ttc/otf) — proves we read a real font file.
         let magic = &bytes[..4];
         assert!(
@@ -4528,7 +2908,7 @@ mod tests {
         app.new_tab = Some(NewTabDraft { ws_index: 2, prompt: String::new(), isolate: false, shell: false });
         app.closing = Some(CloseDraft { ws_index: 2, tab_id: 1, dirty: false, confirm_discard: false });
         app.closing_ws = Some(CloseWsDraft { ws_index: 2, name: "ws2".to_string() });
-        app.roster_written.insert(2, "stale-roster-json".to_string());
+        app.roster_written.insert(2, 0xDEAD_BEEF); // stale fingerprint
         app.partial_pending.insert(2);
 
         app.close_workspace(2);

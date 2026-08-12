@@ -94,9 +94,11 @@ pub fn parse_events(contents: &str) -> Vec<EventRecord> {
     out
 }
 
-/// The session id from the last record that carries one, if any.
-pub fn latest_session_id(records: &[EventRecord]) -> Option<String> {
-    records.iter().rev().find_map(|r| r.session_id.clone())
+/// The session id from the last record that carries one, if any. Borrowed —
+/// the caller compares before deciding to store, so allocating here would
+/// clone on every hook event just to (usually) throw the copy away.
+pub fn latest_session_id(records: &[EventRecord]) -> Option<&str> {
+    records.iter().rev().find_map(|r| r.session_id.as_deref())
 }
 
 /// Status from the last record whose event maps to one (`UserPromptSubmit`→
@@ -520,7 +522,7 @@ mod tests {
             EventRecord { event: "PreToolUse".into(), session_id: None, tool_desc: Some("desc".into()) },
             EventRecord { event: "Stop".into(), session_id: Some("last".into()), tool_desc: None },
         ];
-        assert_eq!(latest_session_id(&records), Some("last".to_string()));
+        assert_eq!(latest_session_id(&records), Some("last"));
     }
 
     #[test]

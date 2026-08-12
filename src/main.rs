@@ -1,15 +1,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app;
+mod editor;
 mod commands;
 mod dialogs;
 mod egui_term_vendored;
 mod git;
 mod hooks;
 mod messages;
+mod orchestrator;
 mod resources;
+mod resume;
 mod shared_ctx;
 mod state;
 mod term;
+mod ui;
+mod watch;
 mod watcher;
 
 fn main() -> eframe::Result<()> {
