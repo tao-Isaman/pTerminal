@@ -2165,8 +2165,15 @@ mod tests {
 
     /// Polls `term` to completion (bounded) so a test never leaves an
     /// orphaned child process behind.
+    ///
+    /// 60s, not 10s: the bound only exists to catch a genuinely hung child.
+    /// A healthy child exits in milliseconds locally, but on a loaded CI
+    /// runner (4 vCPUs, many tests cold-starting powershell.exe through
+    /// ConPTY in parallel) 10s produced real false-positive panics — four
+    /// tests died here on the v0.1.0 release run, and the same panic showed
+    /// up locally under full-suite parallel load.
     fn drain_to_exit(term: &mut term::TabTerm) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while term.exited().is_none() && std::time::Instant::now() < deadline {
             term.poll();
             std::thread::sleep(std::time::Duration::from_millis(20));
