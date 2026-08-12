@@ -15,7 +15,7 @@ use std::sync::mpsc::{channel, Receiver};
 
 /// GitHub coordinates of the repo whose Releases are the update channel.
 /// Fixed when the public repo was created (spec: setup step 1).
-const OWNER: &str = "REPLACE_OWNER";
+const OWNER: &str = "tao-Isaman";
 const REPO: &str = "pTerminal";
 
 /// The release asset the installer workflow uploads, and therefore the only
