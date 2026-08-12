@@ -187,6 +187,13 @@ mod tests {
         let repo = dir.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         g(&repo, &["init"]);
+        // Repo-LOCAL identity: `g()` injects `-c` identity for the commands
+        // it runs, but production functions under test (`merge_branch`) run
+        // bare `git` — on a machine with no global identity (CI runners), a
+        // merge then dies with "tell me who you are" on stderr instead of
+        // reaching the CONFLICT-on-stdout path this suite asserts on.
+        g(&repo, &["config", "user.email", "t@t"]);
+        g(&repo, &["config", "user.name", "t"]);
         std::fs::write(repo.join("a.txt"), "hello").unwrap();
         g(&repo, &["add", "."]);
         g(&repo, &["commit", "-m", "init"]);
