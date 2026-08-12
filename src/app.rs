@@ -14,7 +14,7 @@
 //! and with it every tab's poll — see that function's docs.
 
 use crate::commands;
-use crate::editor::{CloseEditorDraft, EditorTab, open_editor, remove_editor, save_editor};
+use crate::editor::{CloseEditorDraft, EditorTab, open_editor, save_editor};
 use crate::git;
 use crate::hooks::{self, AgentStatus};
 use crate::messages;
@@ -411,7 +411,9 @@ impl PtApp {
         // dark style itself still comes from a real `Visuals::dark()`
         // value, not just whatever `Theme::Dark.default_style()` happens to
         // default to.
-        cc.egui_ctx.set_visuals(eframe::egui::Visuals::dark());
+        // `brand_visuals` = `Visuals::dark()` + the Prompt Lab AI palette
+        // (#00FFAB on #212529) — see its docs in `ui.rs`.
+        cc.egui_ctx.set_visuals(crate::ui::brand_visuals());
         cc.egui_ctx.set_theme(eframe::egui::ThemePreference::Dark);
 
         // Step 1b: Thai glyph fallback. egui's bundled fonts cover no Thai,
@@ -2034,7 +2036,7 @@ impl eframe::App for PtApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor::editor_note;
+    use crate::editor::{editor_note, remove_editor};
     use crate::orchestrator::{pin_orchestrator_front, shared_excerpt_for};
     use crate::resume::paths_match;
 

@@ -41,10 +41,18 @@ fn main() -> eframe::Result<()> {
         None => {} // no subcommand: normal GUI launch
     }
 
+    // Window/taskbar icon at runtime. Raw 32x32 RGBA generated alongside
+    // assets/icon.ico (see assets/) and embedded — no image decoder needed.
+    let icon = eframe::egui::IconData {
+        rgba: include_bytes!("../assets/icon_32.rgba").to_vec(),
+        width: 32,
+        height: 32,
+    };
     let opts = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_title("pTerminal"),
+            .with_title("pTerminal")
+            .with_icon(icon),
         ..Default::default()
     };
     eframe::run_native(

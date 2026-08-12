@@ -773,6 +773,32 @@ impl PtApp {
     }
 }
 
+/// pTerminal's brand palette: Prompt Lab AI's CI (promptlabai.com) — near-
+/// black surfaces with the #00FFAB spring-green accent. Everything blue in
+/// stock `Visuals::dark()` (selected rows via `selectable_label`, links,
+/// focus rings) moves to green; surfaces move to the site's #212529 family.
+/// Status glyph colors (working green / needs-you amber / exited red) are
+/// semantic, not brand, and stay as they are.
+pub(crate) fn brand_visuals() -> egui::Visuals {
+    use egui::{Color32, Stroke};
+    const GREEN: Color32 = Color32::from_rgb(0, 255, 171); // #00FFAB
+    const GREEN_DIM: Color32 = Color32::from_rgb(0, 96, 64); // selected-row fill
+    const PANEL: Color32 = Color32::from_rgb(33, 37, 41); // #212529
+    const INPUT: Color32 = Color32::from_rgb(18, 21, 24); // text-edit wells
+
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = PANEL;
+    v.window_fill = PANEL;
+    v.extreme_bg_color = INPUT;
+    v.faint_bg_color = Color32::from_rgb(41, 46, 51);
+    v.selection.bg_fill = GREEN_DIM;
+    v.selection.stroke = Stroke::new(1.0, GREEN);
+    v.hyperlink_color = GREEN;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, GREEN_DIM);
+    v.widgets.active.bg_stroke = Stroke::new(1.0, GREEN);
+    v
+}
+
 /// Append a Thai-capable Windows system font as the *lowest-priority*
 /// fallback in both egui font families. Bundled fonts keep first priority,
 /// so Latin/UI text and the status-marker glyphs are untouched; only code

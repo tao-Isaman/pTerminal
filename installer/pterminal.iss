@@ -23,6 +23,7 @@ OutputBaseFilename=pTerminal-setup
 Compression=lzma2
 SolidCompression=yes
 UninstallDisplayIcon={app}\pterminal.exe
+SetupIconFile=..\assets\icon.ico
 
 [Files]
 Source: "..\target\release\pterminal.exe"; DestDir: "{app}"; Flags: ignoreversion

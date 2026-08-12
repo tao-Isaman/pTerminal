@@ -37,7 +37,10 @@ impl Default for ColorPalette {
     fn default() -> Self {
         Self {
             foreground: String::from("#d8d8d8"),
-            background: String::from("#181818"),
+            // pTerminal brand delta: matches the app's #212529-family
+            // surfaces (see `ui::brand_visuals`), one step darker so the
+            // terminal well reads as inset.
+            background: String::from("#1a1d21"),
             black: String::from("#181818"),
             red: String::from("#ac4242"),
             green: String::from("#90a959"),
