@@ -154,7 +154,7 @@ impl TabTerm {
         // What Shift+Enter writes instead of `\r` — the tab-appropriate
         // line-continuation (caller decides by `TabKind`). Empty = off.
         shift_enter: &[u8],
-    ) {
+    ) -> Option<std::path::PathBuf> {
         self.poll();
         // `TerminalView::new` borrows `ui` only to derive the widget id, so the view
         // has to be bound to a local before `ui` is borrowed again by `add`.
@@ -227,6 +227,11 @@ impl TabTerm {
                 }
             });
         }
+
+        // Ctrl+click on an existing file path in the terminal content stashes
+        // an open request on the backend (see its path-hover logic); surface
+        // it to the caller, which opens the editor tab.
+        self.backend.take_file_open_request()
     }
 
     /// `Some(code)` once the child process has exited.

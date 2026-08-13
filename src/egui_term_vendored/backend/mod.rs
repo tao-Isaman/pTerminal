@@ -26,6 +26,7 @@ use settings::BackendSettings;
 use std::borrow::Cow;
 use std::cmp::min;
 use std::io::Result;
+use std::path::{Path, PathBuf};
 use std::ops::{Index, RangeInclusive};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -153,6 +154,18 @@ impl From<TerminalSize> for WindowSize {
 pub struct TerminalBackend {
     pub id: u64,
     pub url_regex: RegexSearch,
+    /// pTerminal delta (Ctrl+click file paths): candidate file-path matcher.
+    /// A match only becomes a hover target if the file EXISTS on disk —
+    /// see the `LinkAction::Hover` arm.
+    pub path_regex: RegexSearch,
+    /// The directory this terminal's child was spawned in — relative path
+    /// matches resolve against it. The child's LIVE cwd isn't tracked
+    /// (ponytail: spawn cwd covers repo-rooted compiler/agent output).
+    spawn_cwd: Option<PathBuf>,
+    /// Set by a Ctrl+click on an existing file path; drained by
+    /// [`Self::take_file_open_request`] via `TabTerm::ui`, which turns it
+    /// into an editor tab.
+    file_open_request: Option<PathBuf>,
     term: Arc<FairMutex<Term<EventProxy>>>,
     size: TerminalSize,
     notifier: Notifier,
@@ -183,6 +196,9 @@ impl TerminalBackend {
         // reproduced live in Task 13's acceptance run (`cmd /c claude Reply with ...`
         // reached Claude Code as just `Reply`). Escaping is a no-op for single-word args,
         // so this is safe to always set.
+        // (Ctrl+click file paths): kept for resolving relative path matches;
+        // cloned before `working_directory` moves into `pty_config`.
+        let spawn_cwd = settings.working_directory.clone();
         #[cfg(target_os = "windows")]
         let pty_config = tty::Options {
             shell: Some(tty::Shell::new(settings.shell, settings.args)),
@@ -221,6 +237,7 @@ impl TerminalBackend {
             cursor: term.grid_mut().cursor_cell().clone(),
             hovered_hyperlink: None,
             hovered_url: None,
+            hovered_file: None,
         };
         let term = Arc::new(FairMutex::new(term));
         let pty_event_loop =
@@ -256,15 +273,35 @@ impl TerminalBackend {
                 }
             })?;
 
+        // Candidate file paths: optional drive letter, at least one dir
+        // separator, a dot-extension, optional `:line` suffix. No spaces
+        // (ponytail: unquoted spaced paths are rare in terminal output).
+        // Deliberately loose — the existence check at hover time is the
+        // real filter.
+        let path_regex = RegexSearch::new(
+            r#"([A-Za-z]:)?[\w.~-]*[\\/][\w\\/.-]+\.[A-Za-z0-9]+(:\d+)?"#,
+        )
+        .unwrap();
+
         Ok(Self {
             id,
             url_regex,
+            path_regex,
+            spawn_cwd,
+            file_open_request: None,
             term: term.clone(),
             size: terminal_size,
             notifier,
             last_content: initial_content,
             dirty: true,
         })
+    }
+
+    /// pTerminal delta (Ctrl+click file paths): the pending "open this file
+    /// in an editor tab" request from a Ctrl+click, if any. Drained once
+    /// per frame by `TabTerm::ui`.
+    pub fn take_file_open_request(&mut self) -> Option<PathBuf> {
+        self.file_open_request.take()
     }
 
     /// pTerminal perf delta: tells the backend its `Term` may have changed
@@ -453,32 +490,54 @@ impl TerminalBackend {
     ) {
         match link_action {
             LinkAction::Hover => {
-                let range = self.regex_match_at(
+                // pTerminal perf delta: the matched text is extracted here,
+                // at hover time, from the LIVE grid (upstream walked the
+                // cloned grid at click time — `last_content` no longer
+                // carries the full grid to walk).
+                let url_range = self.regex_match_at(
                     terminal,
                     point,
                     &mut self.url_regex.clone(),
                 );
-                // pTerminal perf delta: the URL text is extracted here, at
-                // hover time, from the LIVE grid (upstream walked the cloned
-                // grid at click time — `last_content` no longer carries the
-                // full grid to walk).
-                self.last_content.hovered_url = range.as_ref().map(|range| {
-                    let start = *range.start();
-                    let end = *range.end();
-                    let mut url = String::from(terminal.grid().index(start).c);
-                    for indexed in terminal.grid().iter_from(start) {
-                        url.push(indexed.c);
-                        if indexed.point == end {
-                            break;
-                        }
-                    }
-                    url
+                if let Some(range) = url_range {
+                    self.last_content.hovered_url =
+                        Some(Self::match_text(terminal, &range));
+                    self.last_content.hovered_file = None;
+                    self.last_content.hovered_hyperlink = Some(range);
+                    return;
+                }
+                // pTerminal delta (Ctrl+click file paths): no URL under the
+                // pointer — try a file-path candidate. It only becomes a
+                // hover target (underline + clickable) if the file EXISTS,
+                // which is what keeps the loose regex honest.
+                let path_range = self.regex_match_at(
+                    terminal,
+                    point,
+                    &mut self.path_regex.clone(),
+                );
+                let resolved = path_range.as_ref().and_then(|r| {
+                    resolve_existing_file(
+                        &Self::match_text(terminal, r),
+                        self.spawn_cwd.as_deref(),
+                    )
                 });
-                self.last_content.hovered_hyperlink = range;
+                match resolved {
+                    Some(p) => {
+                        self.last_content.hovered_file = Some(p);
+                        self.last_content.hovered_url = None;
+                        self.last_content.hovered_hyperlink = path_range;
+                    },
+                    None => {
+                        self.last_content.hovered_hyperlink = None;
+                        self.last_content.hovered_url = None;
+                        self.last_content.hovered_file = None;
+                    },
+                }
             },
             LinkAction::Clear => {
                 self.last_content.hovered_hyperlink = None;
                 self.last_content.hovered_url = None;
+                self.last_content.hovered_file = None;
             },
             LinkAction::Open => {
                 self.open_link();
@@ -486,7 +545,22 @@ impl TerminalBackend {
         };
     }
 
-    fn open_link(&self) {
+    /// The grid text covered by `range` — shared by the URL and file-path
+    /// hover extraction.
+    fn match_text(terminal: &Term<EventProxy>, range: &Match) -> String {
+        let start = *range.start();
+        let end = *range.end();
+        let mut text = String::from(terminal.grid().index(start).c);
+        for indexed in terminal.grid().iter_from(start) {
+            text.push(indexed.c);
+            if indexed.point == end {
+                break;
+            }
+        }
+        text
+    }
+
+    fn open_link(&mut self) {
         if let Some(url) = &self.last_content.hovered_url {
             // pTerminal delta: 6 — upstream did
             // `open::that(url).unwrap_or_else(|_| panic!("link opening is failed"))`.
@@ -496,6 +570,11 @@ impl TerminalBackend {
             // whole app down with it. A link that won't open is not worth a
             // crash: ignore the failure and leave the terminal alone.
             let _ = open::that(url);
+        } else if let Some(path) = self.last_content.hovered_file.clone() {
+            // pTerminal delta (Ctrl+click file paths): opened by pTerminal
+            // itself, not the OS — `TabTerm::ui` drains this into an editor
+            // tab in the active workspace.
+            self.file_open_request = Some(path);
         }
     }
 
@@ -781,10 +860,42 @@ pub struct RenderableContent {
     pub cursor_point: Point,
     pub hovered_hyperlink: Option<RangeInclusive<Point>>,
     pub hovered_url: Option<String>,
+    /// pTerminal delta (Ctrl+click file paths): the EXISTING file under the
+    /// Ctrl+hover, resolved to an absolute path. Mutually exclusive with
+    /// `hovered_url`; both share `hovered_hyperlink` for the underline.
+    pub hovered_file: Option<PathBuf>,
     pub selectable_range: Option<SelectionRange>,
     pub cursor: Cell,
     pub terminal_mode: TermMode,
     pub terminal_size: TerminalSize,
+}
+
+/// pTerminal delta (Ctrl+click file paths): turns a regex match's text into
+/// an absolute path of an EXISTING file, or `None`. Strips a trailing
+/// `:line` suffix (compiler/`file:line` convention — the editor has no
+/// goto-line yet, so the number is dropped; ponytail ceiling). Relative
+/// candidates resolve against `cwd` (the terminal's spawn directory).
+fn resolve_existing_file(text: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let candidate = PathBuf::from(strip_line_suffix(text));
+    let full = if candidate.is_absolute() {
+        candidate
+    } else {
+        cwd?.join(candidate)
+    };
+    full.is_file().then_some(full)
+}
+
+/// `"src\app.rs:123"` → `"src\app.rs"`; leaves drive colons (`D:\x.rs`)
+/// and non-numeric suffixes alone.
+fn strip_line_suffix(s: &str) -> &str {
+    match s.rsplit_once(':') {
+        Some((head, tail))
+            if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            head
+        }
+        _ => s,
+    }
 }
 
 impl Default for RenderableContent {
@@ -796,6 +907,7 @@ impl Default for RenderableContent {
             cursor_point: Point::default(),
             hovered_hyperlink: None,
             hovered_url: None,
+            hovered_file: None,
             selectable_range: None,
             cursor: Cell::default(),
             terminal_mode: TermMode::empty(),
@@ -1004,6 +1116,109 @@ mod tests {
             "ClearScreen must empty the whole buffer, including \
              scrollback; got: {after_clear:?}"
         );
+    }
+
+    #[test]
+    fn strip_line_suffix_rules() {
+        assert_eq!(strip_line_suffix(r"src\app.rs:123"), r"src\app.rs");
+        assert_eq!(strip_line_suffix("src/app.rs"), "src/app.rs");
+        assert_eq!(strip_line_suffix(r"D:\x\y.rs"), r"D:\x\y.rs"); // drive colon
+        assert_eq!(strip_line_suffix("a.rs:"), "a.rs:"); // empty suffix
+        assert_eq!(strip_line_suffix("a.rs:12b"), "a.rs:12b"); // non-numeric
+    }
+
+    #[test]
+    fn resolve_existing_file_checks_disk_and_resolves_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("real.rs");
+        std::fs::write(&f, "x").unwrap();
+
+        // absolute, exists
+        assert_eq!(
+            resolve_existing_file(&f.display().to_string(), None),
+            Some(f.clone())
+        );
+        // absolute with :line
+        assert_eq!(
+            resolve_existing_file(&format!("{}:42", f.display()), None),
+            Some(f.clone())
+        );
+        // relative against cwd
+        assert_eq!(
+            resolve_existing_file("real.rs", Some(dir.path())),
+            Some(f.clone())
+        );
+        // relative without a cwd -> None
+        assert_eq!(resolve_existing_file("real.rs", None), None);
+        // nonexistent -> None
+        assert_eq!(
+            resolve_existing_file("not-there.rs", Some(dir.path())),
+            None
+        );
+        // a DIRECTORY is not an openable file
+        assert_eq!(
+            resolve_existing_file(&dir.path().display().to_string(), None),
+            None
+        );
+    }
+
+    /// End-to-end (Ctrl+click file paths): echo a real file's absolute path
+    /// into a live cmd.exe, Hover a point inside it (existence-checked
+    /// underline target), then Open — the request must surface via
+    /// `take_file_open_request`, and open::that must NOT be involved.
+    #[test]
+    fn hovering_and_clicking_an_echoed_file_path_requests_an_editor_open() {
+        let mut backend = spawn_backend(914);
+        let dir = std::env::temp_dir().join("pt-path-click-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("clickme.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+
+        backend.process_command(BackendCommand::Write(
+            format!("echo {}\r", file.display()).into_bytes(),
+        ));
+        // the echoed OUTPUT line (not the typed command) is what we hover;
+        // wait for the path to appear twice (command echo + output)
+        assert!(
+            wait_for(|| full_grid_text(&mut backend).matches("clickme.rs").count() >= 2),
+            "echoed path never appeared"
+        );
+
+        // locate a point INSIDE the path on the OUTPUT line (the last
+        // occurrence of the filename in the grid)
+        let (line, col) = {
+            let term = backend.term.lock();
+            let grid = term.grid();
+            let mut found = None;
+            for l in 0..grid.screen_lines() as i32 {
+                for c in 0..grid.columns() {
+                    if grid[Line(l)][Column(c)].c == 'k' {
+                        // 'k' of clickme — cheap unique-ish anchor; keep last
+                        let prev = if c > 0 { grid[Line(l)][Column(c - 1)].c } else { ' ' };
+                        if prev == 'c' {
+                            found = Some((l, c));
+                        }
+                    }
+                }
+            }
+            found.expect("anchor char not found in grid")
+        };
+        let point = Point::new(Line(line), Column(col));
+
+        backend.process_command(BackendCommand::ProcessLink(LinkAction::Hover, point));
+        backend.mark_dirty();
+        backend.sync();
+        assert_eq!(
+            backend.last_content().hovered_file.as_deref(),
+            Some(file.as_path()),
+            "hover did not resolve the echoed path to the real file"
+        );
+        assert!(backend.last_content().hovered_hyperlink.is_some(), "no underline range");
+        assert!(backend.last_content().hovered_url.is_none());
+
+        backend.process_command(BackendCommand::ProcessLink(LinkAction::Open, point));
+        assert_eq!(backend.take_file_open_request(), Some(file));
+        assert_eq!(backend.take_file_open_request(), None); // drained once
     }
 
     /// Regression test for the `Grid::iter_from` off-by-one caught during

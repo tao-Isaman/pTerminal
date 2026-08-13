@@ -591,7 +591,20 @@ impl PtApp {
                     // and CSI-u all insert; LF is the cleanest — one byte,
                     // no continuation character involved).
                     let shift_enter: &[u8] = if is_shell { b"`\r" } else { b"\n" };
-                    tab.term.ui(ui, focused, history, shift_enter); // only the ACTIVE tab renders — spec perf requirement
+                    let open_req = tab.term.ui(ui, focused, history, shift_enter); // only the ACTIVE tab renders — spec perf requirement
+                    // Ctrl+click on a file path in the terminal (see the
+                    // backend's path-hover logic): open it in an editor tab
+                    // in this workspace. The workspace is re-borrowed fresh —
+                    // `tab`'s borrow ended at the ui call above.
+                    if let Some(path) = open_req {
+                        let id = self.next_tab_id;
+                        self.next_tab_id += 1;
+                        if let Some(ws) = self.workspaces.get_mut(self.active_ws) {
+                            crate::editor::open_editor(ws, id, path);
+                        }
+                        self.selected_child = None;
+                        self.persist();
+                    }
                     if restart {
                         self.restart_active_tab(ctx);
                     }
