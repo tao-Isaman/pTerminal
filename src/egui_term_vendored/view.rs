@@ -1062,6 +1062,46 @@ fn process_button_click(
     }
 }
 
+/// USER-REPORTED BUG FIX (Ctrl+click file paths in Claude conversations):
+/// an app in mouse mode (Claude enables SGR reporting for its whole TUI)
+/// used to receive EVERY primary click as a mouse report — Ctrl+click
+/// included — making the LinkOpen path below unreachable exactly where
+/// file paths matter most. Standard terminal behavior is that a held
+/// modifier bypasses app mouse reporting (xterm's modifier-override
+/// convention); ours is Ctrl (`command_only`), matching the LinkOpen
+/// binding, so Ctrl+click opens links/files and Ctrl+drag selects text
+/// even inside mouse-mode apps. Pure, for unit tests.
+fn primary_click_reports_to_app(mode: TermMode, modifiers: &Modifiers) -> bool {
+    mode.intersects(TermMode::MOUSE_MODE) && !modifiers.command_only()
+}
+
+#[cfg(test)]
+mod click_routing_tests {
+    use super::*;
+
+    #[test]
+    fn plain_clicks_report_to_a_mouse_mode_app_but_ctrl_bypasses() {
+        let claude_mode = TermMode::SGR_MOUSE
+            | TermMode::MOUSE_MOTION
+            | TermMode::ALT_SCREEN
+            | TermMode::ALTERNATE_SCROLL;
+        let none = Modifiers::NONE;
+        let ctrl = Modifiers::COMMAND;
+        // Claude tab: plain click -> report; Ctrl+click -> OUR routing
+        // (selection / LinkOpen), the user-reported fix.
+        assert!(primary_click_reports_to_app(claude_mode, &none));
+        assert!(!primary_click_reports_to_app(claude_mode, &ctrl));
+        // Shell tab (no mouse mode): never reported, with or without Ctrl.
+        assert!(!primary_click_reports_to_app(TermMode::ALTERNATE_SCROLL, &none));
+        assert!(!primary_click_reports_to_app(TermMode::ALTERNATE_SCROLL, &ctrl));
+        // Ctrl+Shift is not the bare-Ctrl override.
+        assert!(primary_click_reports_to_app(
+            claude_mode,
+            &(Modifiers::COMMAND | Modifiers::SHIFT)
+        ));
+    }
+}
+
 fn process_left_button(
     state: &mut TerminalViewState,
     layout: &Response,
@@ -1072,7 +1112,7 @@ fn process_left_button(
     pressed: bool,
 ) -> InputAction {
     let terminal_mode = backend.last_content().terminal_mode;
-    if terminal_mode.intersects(TermMode::MOUSE_MODE) {
+    if primary_click_reports_to_app(terminal_mode, modifiers) {
         InputAction::BackendCall(BackendCommand::MouseReport(
             MouseButton::LeftButton,
             *modifiers,
