@@ -586,9 +586,11 @@ impl PtApp {
                     let is_shell = tab.kind == crate::term::TabKind::Shell;
                     let history = if is_shell { Some(&mut self.history) } else { None };
                     // Shift+Enter newline: PowerShell continues a line with a
-                    // trailing backtick; Claude Code with a trailing backslash
-                    // (its documented \-then-Enter input continuation).
-                    let shift_enter: &[u8] = if is_shell { b"`\r" } else { b"\\\r" };
+                    // trailing backtick; Claude Code inserts a newline on a
+                    // bare LF (probe-verified live: LF, \-then-CR, alt-Enter
+                    // and CSI-u all insert; LF is the cleanest — one byte,
+                    // no continuation character involved).
+                    let shift_enter: &[u8] = if is_shell { b"`\r" } else { b"\n" };
                     tab.term.ui(ui, focused, history, shift_enter); // only the ACTIVE tab renders — spec perf requirement
                     if restart {
                         self.restart_active_tab(ctx);
