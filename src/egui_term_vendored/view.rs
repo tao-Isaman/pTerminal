@@ -95,6 +95,11 @@ pub struct TerminalView<'a> {
     /// pTerminal delta (ghost suggestions): present only for shell tabs
     /// (`TabTerm::ui` decides); `None` = the feature doesn't exist here.
     history: Option<&'a mut crate::history::History>,
+    /// pTerminal delta (Shift+Enter newline): what Shift+Enter writes to the
+    /// PTY instead of `\r` — the tab-appropriate line-continuation sequence
+    /// (`TabTerm::ui` decides: `\`+CR for Claude tabs, backtick+CR for
+    /// PowerShell). Empty = feature off, Shift+Enter routes normally.
+    shift_enter: &'a [u8],
 }
 
 impl Widget for TerminalView<'_> {
@@ -135,7 +140,16 @@ impl<'a> TerminalView<'a> {
             theme: &DEFAULT_THEME,
             bindings_layout: &DEFAULT_BINDINGS,
             history: None,
+            shift_enter: &[],
         }
+    }
+
+    /// pTerminal delta (Shift+Enter newline): arms the Shift+Enter →
+    /// line-continuation interception with the given PTY byte sequence.
+    #[inline]
+    pub fn with_shift_enter(mut self, seq: &'a [u8]) -> Self {
+        self.shift_enter = seq;
+        self
     }
 
     #[inline]
@@ -309,6 +323,25 @@ impl<'a> TerminalView<'a> {
                         continue;
                     }
                     _ => {}
+                }
+            }
+
+            // pTerminal delta (Shift+Enter newline): terminals normally send
+            // plain `\r` for Enter with or without Shift — the two are
+            // indistinguishable to the child, which is why Claude Code needs
+            // `/terminal-setup` in other terminals. We own the keyboard, so
+            // Shift+Enter writes the tab's continuation sequence instead and
+            // never reaches the normal Enter routing (including the ghost
+            // feature's history commit below — a continuation isn't a
+            // finished command).
+            if !self.shift_enter.is_empty() {
+                if let egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. } = &event {
+                    if modifiers.shift_only() {
+                        self.backend.process_command(BackendCommand::Write(
+                            self.shift_enter.to_vec(),
+                        ));
+                        continue;
+                    }
                 }
             }
 

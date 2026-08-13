@@ -151,11 +151,16 @@ impl TabTerm {
         // Ghost-suggestion history — `Some` only for shell tabs (the caller
         // decides; agent tabs run Claude Code's own input UI, no ghosts).
         history: Option<&mut crate::history::History>,
+        // What Shift+Enter writes instead of `\r` — the tab-appropriate
+        // line-continuation (caller decides by `TabKind`). Empty = off.
+        shift_enter: &[u8],
     ) {
         self.poll();
         // `TerminalView::new` borrows `ui` only to derive the widget id, so the view
         // has to be bound to a local before `ui` is borrowed again by `add`.
-        let mut view = TerminalView::new(ui, &mut self.backend).set_focus(focused);
+        let mut view = TerminalView::new(ui, &mut self.backend)
+            .set_focus(focused)
+            .with_shift_enter(shift_enter);
         if let Some(h) = history {
             view = view.with_history(h);
         }
