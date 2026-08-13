@@ -355,9 +355,27 @@ impl<'a> TerminalView<'a> {
             if !self.shift_enter.is_empty() {
                 if let egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. } = &event {
                     if modifiers.shift_only() {
-                        self.backend.process_command(BackendCommand::Write(
-                            self.shift_enter.to_vec(),
-                        ));
+                        // USER-REPORTED BUG FIX: the sequence must follow the
+                        // terminal's LIVE mode, not the tab kind. Running
+                        // `claude` INSIDE a shell tab enters the alternate
+                        // screen — the shell arming (backtick+CR) would type
+                        // a stray backtick and SUBMIT there. Any fullscreen
+                        // TUI gets a bare LF (probe-verified to insert a
+                        // newline in Claude Code, filled or empty input);
+                        // the armed per-tab sequence applies only on the
+                        // main screen (the actual shell prompt).
+                        let seq: &[u8] = if self
+                            .backend
+                            .last_content()
+                            .terminal_mode
+                            .contains(TermMode::ALT_SCREEN)
+                        {
+                            b"\n"
+                        } else {
+                            self.shift_enter
+                        };
+                        self.backend
+                            .process_command(BackendCommand::Write(seq.to_vec()));
                         continue;
                     }
                 }
@@ -1214,6 +1232,121 @@ fn dropped_paths_payload(paths: &[std::path::PathBuf]) -> String {
         out.push(' ');
     }
     out
+}
+
+#[cfg(test)]
+mod shift_enter_event_path_tests {
+    use super::*;
+    use crate::egui_term_vendored::backend::settings::BackendSettings;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Repro harness for the user-reported "Shift+Enter does nothing in a
+    /// Claude tab": drives the REAL TerminalView through headless egui
+    /// frames over a REAL ConPTY (cmd.exe), injecting a synthetic
+    /// Shift+Enter `Event::Key`. The armed marker sequence must be typed
+    /// into the child (visible via its echo on the cursor row), and the
+    /// line must NOT execute (no plain `\r` may slip through).
+    fn drive_frame(
+        ctx: &egui::Context,
+        backend: &mut crate::egui_term_vendored::backend::TerminalBackend,
+        events: Vec<egui::Event>,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(800.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let view = TerminalView::new(ui, backend)
+                    .set_focus(true)
+                    .with_shift_enter(b"XYZMARK");
+                ui.add(view);
+            });
+        });
+    }
+
+    fn wait_for_echo(
+        backend: &mut crate::egui_term_vendored::backend::TerminalBackend,
+        needle: &str,
+        secs: u64,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            backend.mark_dirty();
+            backend.sync();
+            let (left, _) = backend.cursor_line_context();
+            if left.contains(needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    #[test]
+    fn shift_enter_reaches_the_pty_through_the_egui_event_path() {
+        let ctx = egui::Context::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let dir = std::env::temp_dir().join("pt-shift-enter-repro");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut backend = crate::egui_term_vendored::backend::TerminalBackend::new(
+            955,
+            ctx.clone(),
+            tx,
+            BackendSettings {
+                shell: "cmd.exe".to_string(),
+                args: vec![],
+                working_directory: Some(dir),
+                scrolling_history: 200,
+            },
+            Arc::new(AtomicBool::new(true)),
+        )
+        .expect("spawn cmd.exe");
+
+        // frame 1: no events — establishes widget focus
+        drive_frame(&ctx, &mut backend, vec![]);
+        // give cmd.exe a moment to print its banner + prompt
+        std::thread::sleep(Duration::from_secs(2));
+        drive_frame(&ctx, &mut backend, vec![]);
+
+        // frame 3: the synthetic Shift+Enter
+        drive_frame(
+            &ctx,
+            &mut backend,
+            vec![egui::Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            }],
+        );
+
+        assert!(
+            wait_for_echo(&mut backend, "XYZMARK", 10),
+            "Shift+Enter never wrote the armed sequence to the PTY — \
+             the egui event path is broken (the user-reported bug)"
+        );
+        // The marker must still be sitting UNEXECUTED on the prompt line —
+        // a stray \r alongside it would have run the line and produced
+        // cmd's "not recognized" error.
+        backend.mark_dirty();
+        backend.sync();
+        let (left, _) = backend.cursor_line_context();
+        assert!(
+            left.contains("XYZMARK"),
+            "marker executed or vanished; row was {left:?}"
+        );
+    }
 }
 
 #[cfg(test)]
