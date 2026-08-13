@@ -258,6 +258,24 @@ impl<'a> TerminalView<'a> {
         if !layout.has_focus() {
             return self;
         }
+
+        // pTerminal delta (file drop): files dropped from the OS this frame
+        // are typed into the PTY as quoted paths. Only the focused (active,
+        // visible) terminal ever reaches this line, so a drop lands exactly
+        // once. `dropped_files` is one-frame raw input — no dedup needed.
+        let dropped: Vec<std::path::PathBuf> = layout.ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.backend.process_command(BackendCommand::Write(
+                dropped_paths_payload(&dropped).into_bytes(),
+            ));
+        }
+
         let pointer_inside = layout.contains_pointer();
 
         let modifiers = layout.ctx.input(|i| i.modifiers);
@@ -1182,6 +1200,45 @@ mod ctrl_c_action_tests {
 // edge and is capped to `1..=5` lines per frame so a pointer parked far off
 // the bottom of a huge monitor doesn't blow through the whole scrollback in
 // one frame.
+/// pTerminal delta (file drop): the text typed into the PTY for dropped
+/// files — each path double-quoted (spaces-safe in PowerShell/cmd, and
+/// plain text to Claude's input box), space-separated, one trailing space
+/// so the user keeps typing naturally. `"` cannot occur in a Windows path,
+/// so no escaping is needed inside the quotes.
+fn dropped_paths_payload(paths: &[std::path::PathBuf]) -> String {
+    let mut out = String::new();
+    for p in paths {
+        out.push('"');
+        out.push_str(&p.display().to_string());
+        out.push('"');
+        out.push(' ');
+    }
+    out
+}
+
+#[cfg(test)]
+mod dropped_paths_tests {
+    use super::dropped_paths_payload;
+    use std::path::PathBuf;
+
+    #[test]
+    fn quotes_joins_and_trails_a_space() {
+        let paths = vec![
+            PathBuf::from(r"C:\repo\a file.txt"),
+            PathBuf::from(r"D:\x\b.rs"),
+        ];
+        assert_eq!(
+            dropped_paths_payload(&paths),
+            r#""C:\repo\a file.txt" "D:\x\b.rs" "#
+        );
+    }
+
+    #[test]
+    fn empty_drop_is_empty_payload() {
+        assert_eq!(dropped_paths_payload(&[]), "");
+    }
+}
+
 fn autoscroll_lines(pointer_y: f32, rect_top: f32, rect_bottom: f32) -> i32 {
     let overshoot = if pointer_y < rect_top {
         pointer_y - rect_top
