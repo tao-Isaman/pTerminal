@@ -213,6 +213,7 @@ impl TerminalBackend {
             // the first real `sync` (the backend starts `dirty`) fills it.
             cells: Vec::new(),
             display_offset: 0,
+            history_size: 0,
             cursor_point: term.grid().cursor.point,
             selectable_range: None,
             terminal_mode: *term.mode(),
@@ -409,6 +410,7 @@ impl TerminalBackend {
             .cells
             .extend(grid.display_iter().map(|i| (i.point, i.cell.clone())));
         self.last_content.display_offset = grid.display_offset();
+        self.last_content.history_size = grid.history_size();
         self.last_content.cursor_point = grid.cursor.point;
         self.last_content.selectable_range = selectable_range;
         self.last_content.terminal_mode = *terminal.mode();
@@ -772,6 +774,10 @@ fn visible_regex_match_iter<'a>(
 pub struct RenderableContent {
     pub cells: Vec<(Point, Cell)>,
     pub display_offset: usize,
+    /// pTerminal delta (scrollbar): lines of scrollback above the viewport.
+    /// 0 in the alternate screen (it has no history) — which is exactly when
+    /// the scrollbar must not draw.
+    pub history_size: usize,
     pub cursor_point: Point,
     pub hovered_hyperlink: Option<RangeInclusive<Point>>,
     pub hovered_url: Option<String>,
@@ -786,6 +792,7 @@ impl Default for RenderableContent {
         Self {
             cells: Vec::new(),
             display_offset: 0,
+            history_size: 0,
             cursor_point: Point::default(),
             hovered_hyperlink: None,
             hovered_url: None,

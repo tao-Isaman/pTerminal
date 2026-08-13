@@ -22,6 +22,29 @@ use crate::egui_term_vendored::types::Size;
 
 const EGUI_TERM_WIDGET_ID_PREFIX: &str = "egui_term::instance::";
 
+/// pTerminal delta (scrollbar): width of the right-edge scrollback bar, in
+/// points. Drawn (and clickable) only while real scrollback exists —
+/// `history_size == 0` (e.g. Claude Code's alternate screen) hides it.
+const SCROLLBAR_WIDTH: f32 = 8.0;
+
+/// The scrollbar thumb's `(top, bottom)` as fractions of the terminal rect
+/// height. Line space runs oldest→newest top-to-bottom: `history + screen`
+/// total lines, the viewport's top sitting `history - display_offset` lines
+/// down. Pure for unit tests.
+fn scrollbar_thumb_fracs(history: usize, screen: usize, offset: usize) -> (f32, f32) {
+    let total = (history + screen).max(1) as f32;
+    let top = (history - offset.min(history)) as f32 / total;
+    (top, top + screen as f32 / total)
+}
+
+/// The `display_offset` a scrollbar drag at `y_frac` (0 = rect top) asks
+/// for — the thumb's CENTER follows the pointer. Pure for unit tests.
+fn drag_target_offset(y_frac: f32, history: usize, screen: usize) -> usize {
+    let total = (history + screen) as f32;
+    let top_line = y_frac.clamp(0.0, 1.0) * total - screen as f32 / 2.0;
+    (history as f32 - top_line).round().clamp(0.0, history as f32) as usize
+}
+
 #[derive(Debug, Clone)]
 enum InputAction {
     BackendCall(BackendCommand),
@@ -36,6 +59,9 @@ pub struct TerminalViewState {
     // the moment the prefix changes — see `TerminalView::ghost`.
     ghost_last_prefix: String,
     ghost_suppressed: bool,
+    // pTerminal delta (scrollbar): a drag that started on the scrollbar —
+    // pointer moves retarget the viewport instead of extending a selection.
+    scrollbar_dragging: bool,
     is_dragged: bool,
     // pTerminal delta 8: tracks whether a primary-button drag-select is in
     // progress, independent of `is_dragged`'s MOUSE_MODE branch (see
@@ -170,6 +196,28 @@ impl<'a> TerminalView<'a> {
         self
     }
 
+    /// pTerminal delta (scrollbar): jump the viewport so the thumb's center
+    /// lands under the pointer at `y` — used for both the initial click and
+    /// every drag move. `Scroll` takes a DELTA (positive = toward history),
+    /// so the target offset is diffed against the last-synced one.
+    fn scrollbar_jump(&mut self, layout: &Response, y: f32) {
+        let c = self.backend.last_content();
+        let (history, screen, current) = (
+            c.history_size,
+            c.terminal_size.screen_lines(),
+            c.display_offset,
+        );
+        if history == 0 {
+            return;
+        }
+        let y_frac = (y - layout.rect.top()) / layout.rect.height().max(1.0);
+        let target = drag_target_offset(y_frac, history, screen);
+        let delta = target as i64 - current as i64;
+        if delta != 0 {
+            self.backend.process_command(BackendCommand::Scroll(delta as i32));
+        }
+    }
+
     fn resize(self, layout: &Response) -> Self {
         // pTerminal perf delta: skip the command (and its terminal-mutex
         // lock) entirely on the ~every frame where nothing changed —
@@ -220,7 +268,50 @@ impl<'a> TerminalView<'a> {
                 .cloned()
                 .collect()
         });
+        // pTerminal delta (scrollbar): self-heal a drag whose release
+        // happened outside the rect — same root cause and pattern as the
+        // `is_selecting`/`is_dragged` self-heals below.
+        if state.scrollbar_dragging
+            && !layout.ctx.input(|i| i.pointer.primary_down())
+        {
+            state.scrollbar_dragging = false;
+        }
+
         for event in events {
+            // pTerminal delta (scrollbar): clicks/drags on the right-edge
+            // bar retarget the viewport and must NOT start a selection or
+            // reach the app as mouse reports. Active only while real
+            // scrollback exists (never in Claude's alternate screen).
+            if self.backend.last_content().history_size > 0 {
+                match &event {
+                    egui::Event::PointerButton {
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        pos,
+                        ..
+                    } if pointer_inside
+                        && pos.x >= layout.rect.max.x - SCROLLBAR_WIDTH =>
+                    {
+                        state.scrollbar_dragging = true;
+                        self.scrollbar_jump(layout, pos.y);
+                        continue;
+                    }
+                    egui::Event::PointerButton {
+                        button: PointerButton::Primary,
+                        pressed: false,
+                        ..
+                    } if state.scrollbar_dragging => {
+                        state.scrollbar_dragging = false;
+                        continue;
+                    }
+                    egui::Event::PointerMoved(pos) if state.scrollbar_dragging => {
+                        self.scrollbar_jump(layout, pos.y);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
             // pTerminal delta (ghost suggestions): intercept BEFORE normal
             // routing. Runs only when a shell tab armed `with_history`.
             if self.history.is_some() {
@@ -277,12 +368,17 @@ impl<'a> TerminalView<'a> {
                     ))
                 },
                 egui::Event::MouseWheel { unit, delta, .. } if pointer_inside => {
-                    input_actions.push(process_mouse_wheel(
+                    // pTerminal delta (conversation scrolling): the terminal
+                    // mode decides whether ticks scroll OUR display or are
+                    // reported TO the app — see `process_mouse_wheel`.
+                    input_actions = process_mouse_wheel(
                         state,
+                        self.backend.last_content().terminal_mode,
+                        modifiers,
                         self.font.font_type().size,
                         unit,
                         delta,
-                    ))
+                    )
                 },
                 egui::Event::PointerButton {
                     button,
@@ -560,7 +656,138 @@ impl<'a> TerminalView<'a> {
             }
         }
 
+        // pTerminal delta (scrollbar): slim right-edge scrollback indicator,
+        // drawn only while history exists (never in the alternate screen —
+        // `history_size` is 0 there by construction). Track faint, thumb
+        // proportional; clicking/dragging it is handled in `process_input`.
+        if content.history_size > 0 {
+            let (t, b) = scrollbar_thumb_fracs(
+                content.history_size,
+                content.terminal_size.screen_lines(),
+                content.display_offset,
+            );
+            let x1 = layout_max.x;
+            let x0 = x1 - SCROLLBAR_WIDTH;
+            let h = layout_max.y - layout_min.y;
+            shapes.push(Shape::Rect(RectShape::filled(
+                Rect::from_min_max(Pos2::new(x0, layout_min.y), Pos2::new(x1, layout_max.y)),
+                CornerRadius::ZERO,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 8),
+            )));
+            shapes.push(Shape::Rect(RectShape::filled(
+                Rect::from_min_max(
+                    Pos2::new(x0 + 1.0, layout_min.y + t * h),
+                    Pos2::new(x1 - 1.0, layout_min.y + b * h),
+                ),
+                CornerRadius::same(3),
+                egui::Color32::from_rgba_unmultiplied(160, 170, 165, 150),
+            )));
+        }
+
         painter.extend(shapes);
+    }
+}
+
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::{drag_target_offset, scrollbar_thumb_fracs};
+
+    #[test]
+    fn thumb_at_bottom_when_offset_zero() {
+        // 100 history + 50 screen: viewport is the bottom third
+        let (t, b) = scrollbar_thumb_fracs(100, 50, 0);
+        assert!((b - 1.0).abs() < 1e-6, "bottom edge at 1.0, got {b}");
+        assert!((t - 100.0 / 150.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn thumb_at_top_when_fully_scrolled() {
+        let (t, b) = scrollbar_thumb_fracs(100, 50, 100);
+        assert!(t.abs() < 1e-6, "top edge at 0.0, got {t}");
+        assert!((b - 50.0 / 150.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn thumb_fills_everything_without_history() {
+        // not drawn in practice (history 0 hides the bar), but must not NaN
+        let (t, b) = scrollbar_thumb_fracs(0, 50, 0);
+        assert!(t.abs() < 1e-6 && (b - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn drag_maps_edges_and_center() {
+        // dragging to the very top = fully scrolled back
+        assert_eq!(drag_target_offset(0.0, 100, 50), 100);
+        // the very bottom = live view
+        assert_eq!(drag_target_offset(1.0, 100, 50), 0);
+        // out-of-rect drags clamp instead of exploding
+        assert_eq!(drag_target_offset(-0.3, 100, 50), 100);
+        assert_eq!(drag_target_offset(1.4, 100, 50), 0);
+        // center of the track: thumb center at line 75, top at 50 -> offset 50
+        assert_eq!(drag_target_offset(0.5, 100, 50), 50);
+    }
+}
+
+#[cfg(test)]
+mod wheel_action_tests {
+    use super::*;
+
+    fn wheel(mode: TermMode, dy: f32) -> Vec<InputAction> {
+        let mut state = TerminalViewState::default();
+        process_mouse_wheel(
+            &mut state,
+            mode,
+            Modifiers::NONE,
+            14.0,
+            MouseWheelUnit::Line,
+            Vec2::new(0.0, dy),
+        )
+    }
+
+    /// Shell tabs (no mouse mode): display scroll, exactly as before.
+    #[test]
+    fn no_mouse_mode_scrolls_display() {
+        let acts = wheel(TermMode::ALTERNATE_SCROLL, 3.0);
+        assert_eq!(acts.len(), 1);
+        assert!(matches!(
+            acts[0],
+            InputAction::BackendCall(BackendCommand::Scroll(3))
+        ));
+    }
+
+    /// Claude Code's live mode (SGR mouse + alt screen): wheel becomes
+    /// per-tick mouse reports for the app, never a display scroll.
+    #[test]
+    fn mouse_mode_forwards_reports_per_tick() {
+        let mode = TermMode::SGR_MOUSE
+            | TermMode::MOUSE_MOTION
+            | TermMode::ALT_SCREEN
+            | TermMode::ALTERNATE_SCROLL;
+        let up = wheel(mode, 2.0);
+        assert_eq!(up.len(), 2);
+        for a in &up {
+            assert!(matches!(
+                a,
+                InputAction::BackendCall(BackendCommand::MouseReport(
+                    MouseButton::ScrollUp,
+                    ..
+                ))
+            ));
+        }
+        let down = wheel(mode, -1.0);
+        assert_eq!(down.len(), 1);
+        assert!(matches!(
+            down[0],
+            InputAction::BackendCall(BackendCommand::MouseReport(
+                MouseButton::ScrollDown,
+                ..
+            ))
+        ));
+    }
+
+    #[test]
+    fn zero_delta_does_nothing() {
+        assert!(wheel(TermMode::empty(), 0.0).is_empty());
     }
 }
 
@@ -690,28 +917,55 @@ fn process_keyboard_key(
     }
 }
 
+/// pTerminal delta (conversation scrolling): upstream ALWAYS emitted a
+/// display `Scroll`, so an app that had requested mouse reporting (Claude
+/// Code sets SGR_MOUSE) never received the wheel — and in its alternate
+/// screen the backend converted the scroll to arrow keys, which cycled the
+/// input box's command history instead of moving the transcript. Real
+/// terminals forward wheel ticks as mouse button 64/65 reports when the app
+/// asked for the mouse; the app then scrolls its own view. Shell tabs
+/// (no mouse mode) keep the old display-scroll behavior untouched.
 fn process_mouse_wheel(
     state: &mut TerminalViewState,
+    terminal_mode: TermMode,
+    modifiers: Modifiers,
     font_size: f32,
     unit: MouseWheelUnit,
     delta: Vec2,
-) -> InputAction {
-    match unit {
-        MouseWheelUnit::Line => {
-            let lines = delta.y.signum() * delta.y.abs().ceil();
-            InputAction::BackendCall(BackendCommand::Scroll(lines as i32))
-        },
+) -> Vec<InputAction> {
+    // Positive = toward history (scroll up), matching `BackendCommand::Scroll`.
+    let lines: i32 = match unit {
+        MouseWheelUnit::Line => (delta.y.signum() * delta.y.abs().ceil()) as i32,
         MouseWheelUnit::Point => {
             state.scroll_pixels -= delta.y;
-            let lines = (state.scroll_pixels / font_size).trunc();
+            let l = (state.scroll_pixels / font_size).trunc();
             state.scroll_pixels %= font_size;
-            if lines != 0.0 {
-                InputAction::BackendCall(BackendCommand::Scroll(-lines as i32))
-            } else {
-                InputAction::Ignore
-            }
+            -l as i32
         },
-        MouseWheelUnit::Page => InputAction::Ignore,
+        MouseWheelUnit::Page => 0,
+    };
+    if lines == 0 {
+        return vec![];
+    }
+    if terminal_mode.intersects(TermMode::MOUSE_MODE) {
+        let button = if lines > 0 {
+            MouseButton::ScrollUp
+        } else {
+            MouseButton::ScrollDown
+        };
+        // One report per tick, press-only — the wire convention for wheel.
+        (0..lines.unsigned_abs())
+            .map(|_| {
+                InputAction::BackendCall(BackendCommand::MouseReport(
+                    button.clone(),
+                    modifiers,
+                    state.current_mouse_position_on_grid,
+                    true,
+                ))
+            })
+            .collect()
+    } else {
+        vec![InputAction::BackendCall(BackendCommand::Scroll(lines))]
     }
 }
 
