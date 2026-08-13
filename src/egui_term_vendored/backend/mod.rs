@@ -1326,7 +1326,11 @@ mod tests {
         let mut backend = spawn_backend(912);
 
         // Start from a known-empty, known-cursor-position buffer regardless
-        // of whatever the shell has already printed asynchronously.
+        // of whatever the shell has already printed asynchronously. The
+        // quiescence wait matters: on a slow CI runner cmd.exe's startup
+        // banner arrived AFTER an immediate ClearScreen and interleaved
+        // with the rows this test writes (caught live on the v0.1.8 run).
+        wait_for_quiescence(&mut backend);
         backend.process_command(BackendCommand::ClearScreen);
         {
             let term = backend.term.clone();
