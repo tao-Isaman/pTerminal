@@ -278,8 +278,10 @@ impl TerminalBackend {
         // (ponytail: unquoted spaced paths are rare in terminal output).
         // Deliberately loose — the existence check at hover time is the
         // real filter.
+        // `~` in the tail too: Windows 8.3 short names (`C:\Users\RUNNER~1\...`)
+        // are real paths — caught live by the CI runner's temp dir.
         let path_regex = RegexSearch::new(
-            r#"([A-Za-z]:)?[\w.~-]*[\\/][\w\\/.-]+\.[A-Za-z0-9]+(:\d+)?"#,
+            r#"([A-Za-z]:)?[\w.~-]*[\\/][\w\\/.~-]+\.[A-Za-z0-9]+(:\d+)?"#,
         )
         .unwrap();
 
@@ -1276,6 +1278,13 @@ mod tests {
     #[test]
     fn select_all_on_a_fresh_backend_does_not_drop_the_first_character() {
         let mut backend = spawn_backend(911);
+
+        // The old form read the grid "synchronously, before the banner can
+        // arrive" — a RACE the CI runner lost (its cmd.exe printed the
+        // Windows banner first). Deterministic instead: wait for the child
+        // to go quiet, then force-blank the buffer with ClearScreen.
+        wait_for_quiescence(&mut backend);
+        backend.process_command(BackendCommand::ClearScreen);
 
         backend.process_command(BackendCommand::SelectAll);
         backend.sync();
