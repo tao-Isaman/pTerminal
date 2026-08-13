@@ -420,6 +420,29 @@ impl TerminalBackend {
         &self.last_content
     }
 
+    /// pTerminal delta (history ghost suggestions): the cursor row as the
+    /// shell rendered it, split at the cursor — `(text left of the cursor,
+    /// is there any non-blank cell at or right of the cursor)`. Read from
+    /// the synced snapshot, so it reflects the last `sync()`. The right-side
+    /// flag gates the ghost: suggestions only make sense with the cursor at
+    /// the end of the line.
+    pub fn cursor_line_context(&self) -> (String, bool) {
+        let c = &self.last_content;
+        let mut left = String::new();
+        let mut has_right = false;
+        for (point, cell) in &c.cells {
+            if point.line != c.cursor_point.line {
+                continue;
+            }
+            if point.column < c.cursor_point.column {
+                left.push(cell.c);
+            } else if cell.c != ' ' && cell.c != '\t' {
+                has_right = true;
+            }
+        }
+        (left, has_right)
+    }
+
     fn process_link_action(
         &mut self,
         terminal: &Term<EventProxy>,
@@ -1000,6 +1023,34 @@ mod tests {
     /// actual content. (Under the OLD hand-rolled loop this asserted
     /// `4000 == 50 * 80` — every cell's literal space, one run-on string,
     /// nothing between rows; a dropped first cell read 3999.)
+    /// Ghost-suggestion support: typed-but-unsubmitted text must come back
+    /// as the cursor row's left-of-cursor context, with nothing right of
+    /// the cursor.
+    #[test]
+    fn cursor_line_context_returns_typed_unsubmitted_text() {
+        let mut backend = spawn_backend(913);
+        // NO trailing \r — the text sits on the prompt line, cursor after it.
+        backend.process_command(BackendCommand::Write(
+            b"echo pterminal-ctx-check".to_vec(),
+        ));
+        assert!(
+            grid_contains(&mut backend, "pterminal-ctx-check"),
+            "typed text never reached the grid"
+        );
+        wait_for_quiescence(&mut backend);
+        backend.mark_dirty(); // PTY echo arrived outside process_command
+        backend.sync();
+        let (left, has_right) = backend.cursor_line_context();
+        assert!(
+            left.ends_with("echo pterminal-ctx-check"),
+            "left-of-cursor was {left:?}"
+        );
+        assert!(!has_right, "nothing should sit right of the cursor");
+        // the prompt (`C:\...>`) must still be part of the row text, so
+        // history::typed_prefix can find its "> " marker
+        assert!(left.contains('>'), "prompt marker missing from {left:?}");
+    }
+
     #[test]
     fn select_all_on_a_fresh_backend_does_not_drop_the_first_character() {
         let mut backend = spawn_backend(911);

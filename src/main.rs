@@ -5,6 +5,7 @@ mod commands;
 mod dialogs;
 mod egui_term_vendored;
 mod git;
+mod history;
 mod hooks;
 mod messages;
 mod orchestrator;

@@ -1,3 +1,4 @@
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Point as TerminalGridPoint;
 use alacritty_terminal::term::cell;
 use alacritty_terminal::term::TermMode;
@@ -30,6 +31,11 @@ enum InputAction {
 
 #[derive(Clone, Default)]
 pub struct TerminalViewState {
+    // pTerminal delta (ghost suggestions): the prompt prefix the ghost was
+    // last computed for, and whether Esc suppressed it. Suppression clears
+    // the moment the prefix changes — see `TerminalView::ghost`.
+    ghost_last_prefix: String,
+    ghost_suppressed: bool,
     is_dragged: bool,
     // pTerminal delta 8: tracks whether a primary-button drag-select is in
     // progress, independent of `is_dragged`'s MOUSE_MODE branch (see
@@ -60,6 +66,9 @@ pub struct TerminalView<'a> {
     font: TerminalFont,
     theme: &'static TerminalTheme,
     bindings_layout: &'static BindingsLayout,
+    /// pTerminal delta (ghost suggestions): present only for shell tabs
+    /// (`TabTerm::ui` decides); `None` = the feature doesn't exist here.
+    history: Option<&'a mut crate::history::History>,
 }
 
 impl Widget for TerminalView<'_> {
@@ -99,6 +108,7 @@ impl<'a> TerminalView<'a> {
             font: TerminalFont::default(),
             theme: &DEFAULT_THEME,
             bindings_layout: &DEFAULT_BINDINGS,
+            history: None,
         }
     }
 
@@ -106,6 +116,48 @@ impl<'a> TerminalView<'a> {
     pub fn set_focus(mut self, has_focus: bool) -> Self {
         self.has_focus = has_focus;
         self
+    }
+
+    /// pTerminal delta (ghost suggestions): arms history capture + the
+    /// inline ghost for this view. Only shell tabs pass this.
+    #[inline]
+    pub fn with_history(
+        mut self,
+        history: &'a mut crate::history::History,
+    ) -> Self {
+        self.history = Some(history);
+        self
+    }
+
+    /// The ghost's visible remainder, if one applies right now: focused,
+    /// history armed, cursor at end of line, a ≥2-char typed prefix (see
+    /// `history::typed_prefix`), a matching history entry, and not
+    /// Esc-suppressed for this prefix. Reads the backend's LAST-SYNCED
+    /// snapshot — callers that need this-frame freshness sync first.
+    fn ghost(&self, state: &mut TerminalViewState) -> Option<String> {
+        let history = self.history.as_deref()?;
+        if !self.has_focus {
+            return None;
+        }
+        let (left, has_right) = self.backend.cursor_line_context();
+        if has_right {
+            return None;
+        }
+        let prefix = crate::history::typed_prefix(&left)?;
+        if prefix != state.ghost_last_prefix {
+            state.ghost_last_prefix = prefix.to_string();
+            state.ghost_suppressed = false;
+        }
+        if state.ghost_suppressed {
+            return None;
+        }
+        let suggestion = history.suggest(prefix)?;
+        let suffix = crate::history::ghost_suffix(suggestion, prefix);
+        if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.to_string())
+        }
     }
 
     fn focus(self, layout: &Response) -> Self {
@@ -134,7 +186,7 @@ impl<'a> TerminalView<'a> {
     }
 
     fn process_input(
-        self,
+        mut self,
         layout: &Response,
         state: &mut TerminalViewState,
     ) -> Self {
@@ -169,6 +221,47 @@ impl<'a> TerminalView<'a> {
                 .collect()
         });
         for event in events {
+            // pTerminal delta (ghost suggestions): intercept BEFORE normal
+            // routing. Runs only when a shell tab armed `with_history`.
+            if self.history.is_some() {
+                if let egui::Event::Key { key, pressed: true, modifiers, .. } = &event {
+                    match key {
+                        // → accepts the ghost: type its remainder into the
+                        // PTY and swallow the arrow (→ at end-of-line is a
+                        // shell no-op, so nothing of value is lost).
+                        Key::ArrowRight if modifiers.is_none() => {
+                            if let Some(suffix) = self.ghost(state) {
+                                self.backend.process_command(
+                                    BackendCommand::Write(suffix.into_bytes()),
+                                );
+                                continue;
+                            }
+                        }
+                        // Esc dismisses the ghost for this prefix but STILL
+                        // reaches the shell (PSReadLine's clear-line etc.).
+                        Key::Escape => {
+                            if self.ghost(state).is_some() {
+                                state.ghost_suppressed = true;
+                            }
+                        }
+                        // Enter: the line is about to execute — commit it to
+                        // history exactly as the shell rendered it. Chars
+                        // typed in this same frame may lag the snapshot and
+                        // be missed; accepted (rare at human typing speed).
+                        Key::Enter if modifiers.is_none() => {
+                            let (left, _) = self.backend.cursor_line_context();
+                            if let Some(line) = crate::history::typed_prefix(&left) {
+                                let line = line.to_string();
+                                if let Some(h) = self.history.as_deref_mut() {
+                                    h.commit(&line);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             let mut input_actions = vec![];
 
             match event {
@@ -304,7 +397,12 @@ impl<'a> TerminalView<'a> {
         layout: &Response,
         painter: &Painter,
     ) {
-        let content = self.backend.sync();
+        // pTerminal delta (ghost suggestions): sync FIRST so the ghost is
+        // computed against this frame's snapshot, then re-borrow the
+        // content immutably for the render loop.
+        self.backend.sync();
+        let ghost = self.ghost(state);
+        let content = self.backend.last_content();
         let layout_min = layout.rect.min;
         let layout_max = layout.rect.max;
         let cell_height = content.terminal_size.cell_height as f32;
@@ -430,6 +528,34 @@ impl<'a> TerminalView<'a> {
                     text,
                     self.font.font_type(),
                     fg,
+                ));
+            }
+        }
+
+        // pTerminal delta (ghost suggestions): the dim remainder of the
+        // matched history entry, drawn after the cursor and clamped to the
+        // row's remaining columns. Left-aligned as ONE text shape — the
+        // monospace font advances ~one cell per glyph, and a ghost is
+        // decoration, not grid content.
+        if let Some(suffix) = ghost {
+            let cursor_col = content.cursor_point.column.0;
+            let remaining =
+                content.terminal_size.columns().saturating_sub(cursor_col);
+            let clipped: String = suffix.chars().take(remaining).collect();
+            if !clipped.is_empty() {
+                let line_num =
+                    content.cursor_point.line.0 + content.display_offset as i32;
+                let pos = Pos2::new(
+                    layout_min.x + cell_width * cursor_col as f32,
+                    layout_min.y + cell_height * line_num as f32,
+                );
+                shapes.push(Shape::text(
+                    &fonts,
+                    pos,
+                    Align2::LEFT_TOP,
+                    clipped,
+                    self.font.font_type(),
+                    egui::Color32::from_gray(115),
                 ));
             }
         }

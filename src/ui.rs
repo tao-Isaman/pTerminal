@@ -579,7 +579,16 @@ impl PtApp {
                             }
                         });
                     }
-                    tab.term.ui(ui, focused); // only the ACTIVE tab renders — spec perf requirement
+                    // Ghost-suggestion history is armed for SHELL tabs only —
+                    // agent tabs run Claude Code's own input UI. Disjoint
+                    // `self` fields: `tab` borrows `self.workspaces`,
+                    // history is its own field.
+                    let history = if tab.kind == crate::term::TabKind::Shell {
+                        Some(&mut self.history)
+                    } else {
+                        None
+                    };
+                    tab.term.ui(ui, focused, history); // only the ACTIVE tab renders — spec perf requirement
                     if restart {
                         self.restart_active_tab(ctx);
                     }

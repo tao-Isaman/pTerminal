@@ -372,6 +372,10 @@ pub struct PtApp {
     /// result: on success the installer is spawned `/SILENT` and the app
     /// closes; on failure the error dialog shows and the button returns.
     pub update_download: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
+    /// Shell command history backing the inline ghost suggestions — one
+    /// global history per user (`history.txt` in the state dir), armed per
+    /// frame for shell tabs only in `central_ui`. See `crate::history`.
+    pub history: crate::history::History,
 }
 
 /// How long after a delivered message's text is typed into a tab's PTY the
@@ -450,6 +454,8 @@ impl PtApp {
             Ok((w, rx, skipped)) => (Some((w, rx)), Self::describe_watch_skips(&skipped)),
             Err(e) => (None, Some(format!("filesystem watcher failed to start: {e}"))),
         };
+        // Before the struct literal: `base` is moved into it below.
+        let history = crate::history::History::load(&base);
         let mut app = PtApp {
             base,
             workspaces,
@@ -482,6 +488,7 @@ impl PtApp {
             update_check: Some(crate::update::spawn_update_check()),
             update_available: None,
             update_download: None,
+            history,
         };
         // Don't let a watcher-skip notice clobber a state-corruption error
         // (set above via `corrupt_msg`) — that one is the more actionable /
@@ -2162,6 +2169,7 @@ mod tests {
             update_check: None,
             update_available: None,
             update_download: None,
+            history: crate::history::History::in_memory(),
         }
     }
 
@@ -2258,6 +2266,7 @@ mod tests {
             update_check: None,
             update_available: None,
             update_download: None,
+            history: crate::history::History::in_memory(),
         }
     }
 
@@ -2300,6 +2309,7 @@ mod tests {
             update_check: None,
             update_available: None,
             update_download: None,
+            history: crate::history::History::in_memory(),
         }
     }
 
