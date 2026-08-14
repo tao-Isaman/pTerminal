@@ -1352,8 +1352,10 @@ impl PtApp {
                 tab.term.poll();
                 if tab.term.exited().is_some() {
                     tab.status = AgentStatus::Exited;
-                    // Step 4: a dead process can't have live subagents.
+                    // Step 4: a dead process can't have live subagents —
+                    // nor live worker processes.
                     tab.children.clear();
+                    tab.procs.clear();
                 }
                 tab.term.set_visible(ws_idx == self.active_ws && tab_idx == ws.active_tab);
                 // Only when a fresh snapshot arrived (~every 2s): the rollup
@@ -1363,17 +1365,18 @@ impl PtApp {
                     let (cpu, mem) = crate::resources::rollup(&tab.root_pids, &self.last_snap);
                     tab.cpu = cpu;
                     tab.mem = mem;
+                    // Worker-process rows ride the same snapshot: agent tabs
+                    // only — a shell tab's child processes are the user's
+                    // own commands, not an agent's background workers.
+                    if tab.kind == TabKind::Agent {
+                        tab.procs =
+                            crate::resources::worker_procs(&tab.root_pids, &self.last_snap);
+                    }
                 }
-                // Step 4: prune finished subagent children a few seconds
-                // after completion, every frame, for every tab — so a
-                // finished child row (tab strip: "`- <desc>", see Step 8
-                // below) lingers just long enough to be seen, then clears
-                // itself without user action.
-                tab.children.retain(|c| {
-                    c.done_at
-                        .map(|d| d.elapsed() < std::time::Duration::from_secs(3))
-                        .unwrap_or(true)
-                });
+                // Finished subagent children are no longer pruned on a timer
+                // here — they clear when the agent's next turn starts
+                // (`UserPromptSubmit`, see `term::apply_subagent_events`), so
+                // a finished run stays readable between turns.
             }
         }
         // FINAL-REVIEW FINDING 1: flush deferred submit Enters for messages

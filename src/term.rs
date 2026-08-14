@@ -357,8 +357,8 @@ pub struct SpawnSpec {
 /// tab strip's child row (rendered `` `- <desc> ``, see `app.rs`'s tab-strip
 /// docs — a live font-coverage finding swapped the original `└` for this
 /// ASCII form). Consumed by Task 5 (child-tab UI + lifecycle:
-/// pushed on `PreToolUse`, `done_at` set on `SubagentStop`, pruned a few
-/// seconds after completion).
+/// pushed on `PreToolUse`, `done_at` set on `SubagentStop`, finished rows
+/// cleared when the next `UserPromptSubmit` starts a new turn).
 pub struct SubTab {
     pub desc: String,
     pub started: std::time::Instant,
@@ -406,6 +406,11 @@ pub struct Tab {
     pub dead_reason: Option<String>,
     /// Live subagent children, oldest first; see [`SubTab`].
     pub children: Vec<SubTab>,
+    /// Live worker-process rows (`resources::worker_procs` over this tab's
+    /// PID tree — grouped `(name, count)`), refreshed on each ~2s sampler
+    /// snapshot for agent tabs only. Catches parallel work that never
+    /// touches the subagent hooks: a script fanning out OS processes.
+    pub procs: Vec<(String, usize)>,
     /// How many parsed `EventRecord`s (`hooks::parse_events`) have already
     /// been consumed for `children` bookkeeping — the drain loop only looks
     /// at `records[events_seen..]` each frame.
@@ -568,6 +573,7 @@ pub fn spawn_agent(
             missing_dir: None,
             dead_reason: None,
             children: vec![],
+            procs: vec![],
             events_seen: 0,
             last_activity: std::time::SystemTime::now(),
         })
@@ -620,6 +626,7 @@ pub fn spawn_shell(
         missing_dir: None,
         dead_reason: None,
         children: vec![],
+        procs: vec![],
         events_seen: 0,
         last_activity: std::time::SystemTime::now(),
     })
@@ -689,6 +696,7 @@ pub fn spawn_dead_tab(
         missing_dir: Some(saved.cwd.clone()),
         dead_reason: Some(reason),
         children: vec![],
+        procs: vec![],
         events_seen: 0,
         last_activity: std::time::SystemTime::now(),
     })
@@ -712,6 +720,11 @@ pub fn spawn_dead_tab(
 ///   row's timing is attributed to the wrong sibling).
 /// - A `SubagentStop` with nothing running is ignored (no panic, no
 ///   retroactive completion of an already-finished child).
+/// - `UserPromptSubmit` starts the agent's next turn: finished children
+///   clear, running ones stay. This is what bounds a finished row's
+///   lifetime — it stays visible until the next prompt, not "3 seconds
+///   after completion" (the old app-side prune, which made real subagent
+///   runs read as "0 subagents" the moment anyone looked).
 ///
 /// `records` must be only the records not yet seen for this tab — the caller
 /// slices `records[events_seen..]`. `now` is passed in rather than read here
@@ -733,6 +746,9 @@ pub fn apply_subagent_events(
                 if let Some(child) = children.iter_mut().find(|c| c.done_at.is_none()) {
                     child.done_at = Some(now);
                 }
+            }
+            "UserPromptSubmit" => {
+                children.retain(|c| c.done_at.is_none());
             }
             _ => {}
         }
@@ -813,6 +829,7 @@ impl Tab {
         self.missing_dir = None;
         self.dead_reason = None;
         self.children = vec![];
+        self.procs = vec![];
         self.events_seen = 0;
         self.last_activity = std::time::SystemTime::now();
         Ok(())
@@ -1199,6 +1216,33 @@ mod tests {
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].desc, "real");
         assert!(children[0].done_at.is_some(), "the stop must land on the only real child");
+    }
+
+    /// A `UserPromptSubmit` record marks the start of the agent's next turn:
+    /// children finished during the previous turn clear, children still
+    /// running stay (a prompt can arrive while a subagent is live). This is
+    /// what keeps finished rows visible between turns instead of the old
+    /// app-side "prune 3 seconds after done_at" rule.
+    #[test]
+    fn user_prompt_submit_clears_finished_children_keeps_running() {
+        let now = Instant::now();
+        let mut children: Vec<SubTab> = Vec::new();
+
+        apply_subagent_events(
+            &mut children,
+            &[
+                rec("PreToolUse", Some("done last turn")),
+                rec("SubagentStop", None),
+                rec("PreToolUse", Some("still running")),
+            ],
+            now,
+        );
+        assert_eq!(children.len(), 2);
+
+        apply_subagent_events(&mut children, &[rec("UserPromptSubmit", None)], now);
+        assert_eq!(children.len(), 1, "finished child must clear on the next prompt");
+        assert_eq!(children[0].desc, "still running");
+        assert!(children[0].done_at.is_none());
     }
 
     /// Events with no subagent meaning must pass straight through — the

@@ -311,6 +311,19 @@ impl PtApp {
                             self.selected_child = Some((tab.id, child_idx));
                         }
                     }
+                    // Worker-process rows (`resources::worker_procs`): real
+                    // child processes of this tab that aren't Claude
+                    // subagents — e.g. a script fanning out parallel
+                    // workers, which no hook event will ever report. Grey
+                    // (an OS-level observation, not a subagent) and not
+                    // selectable — there's no detail pane behind them.
+                    for (name, count) in &tab.procs {
+                        ui.label(
+                            egui::RichText::new(format!("  `- {count}x {name}"))
+                                .color(egui::Color32::from_rgb(150, 150, 150))
+                                .small(),
+                        );
+                    }
                 }
                 if let Some(i) = close_req {
                     self.closing = close_draft_for(ws, active_ws, i);
