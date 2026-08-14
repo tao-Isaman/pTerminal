@@ -45,6 +45,43 @@ fn drag_target_offset(y_frac: f32, history: usize, screen: usize) -> usize {
     (history as f32 - top_line).round().clamp(0.0, history as f32) as usize
 }
 
+/// pTerminal delta (ConPTY resize debounce): how long a differing layout
+/// size must hold still before it is forwarded to the PTY. Every ConPTY
+/// resize makes the client TUI fully repaint, and on Windows those repaints
+/// are what leave duplicated/torn TUI rows behind in the transcript — so a
+/// window drag must not turn into a per-frame resize storm. Windows
+/// Terminal throttles its ConPTY resizes for the same reason.
+const RESIZE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Decides whether a layout size that differs from the PTY's should be
+/// forwarded yet. Takes the current pending marker `(size, since)` and
+/// returns the new marker plus "apply now". The first-ever resize
+/// (`first`) applies immediately — that's the spawn-time jump from the
+/// default 80-column grid to the real rect, where a 150ms letterbox would
+/// be pure loss. After that a resize only applies once the size has held
+/// stable for [`RESIZE_DEBOUNCE`]; any change restarts the clock. Pure for
+/// unit tests.
+fn debounce_resize(
+    pending: Option<(Size, std::time::Instant)>,
+    current: Size,
+    now: std::time::Instant,
+    first: bool,
+) -> (Option<(Size, std::time::Instant)>, bool) {
+    if first {
+        return (None, true);
+    }
+    match pending {
+        Some((size, since)) if size == current => {
+            if now.duration_since(since) >= RESIZE_DEBOUNCE {
+                (None, true)
+            } else {
+                (Some((size, since)), false)
+            }
+        }
+        _ => (Some((current, now)), false),
+    }
+}
+
 #[derive(Debug, Clone)]
 enum InputAction {
     BackendCall(BackendCommand),
@@ -59,6 +96,11 @@ pub struct TerminalViewState {
     // the moment the prefix changes — see `TerminalView::ghost`.
     ghost_last_prefix: String,
     ghost_suppressed: bool,
+    // pTerminal delta (ConPTY resize debounce): the differing layout size
+    // waiting out its stability window, and whether the spawn-time first
+    // resize already happened — see `debounce_resize`.
+    pending_resize: Option<(Size, std::time::Instant)>,
+    resized_once: bool,
     // pTerminal delta (scrollbar): a drag that started on the scrollbar —
     // pointer moves retarget the viewport instead of extending a selection.
     scrollbar_dragging: bool,
@@ -115,7 +157,7 @@ impl Widget for TerminalView<'_> {
         });
 
         self.focus(&layout)
-            .resize(&layout)
+            .resize(&layout, &mut state)
             .process_input(&layout, &mut state)
             .show(&mut state, &layout, &painter);
 
@@ -232,7 +274,7 @@ impl<'a> TerminalView<'a> {
         }
     }
 
-    fn resize(self, layout: &Response) -> Self {
+    fn resize(self, layout: &Response, state: &mut TerminalViewState) -> Self {
         // pTerminal perf delta: skip the command (and its terminal-mutex
         // lock) entirely on the ~every frame where nothing changed —
         // upstream's size check lived inside `resize()`, *after* the lock
@@ -240,8 +282,32 @@ impl<'a> TerminalView<'a> {
         let layout_size = Size::from(layout.rect.size());
         let font_size = self.font.font_measure(&layout.ctx);
         if self.backend.needs_resize(layout_size, font_size) {
-            self.backend
-                .process_command(BackendCommand::Resize(layout_size, font_size));
+            // pTerminal delta (ConPTY resize debounce): a live window drag
+            // used to forward a PTY resize per FRAME; each one makes the
+            // client TUI fully repaint over ConPTY, which is what strews
+            // duplicated/torn rows into the transcript. Forward only once
+            // the size holds still — see `debounce_resize`/`RESIZE_DEBOUNCE`.
+            let (pending, apply) = debounce_resize(
+                state.pending_resize,
+                layout_size,
+                std::time::Instant::now(),
+                !state.resized_once,
+            );
+            state.pending_resize = pending;
+            if apply {
+                state.resized_once = true;
+                self.backend
+                    .process_command(BackendCommand::Resize(layout_size, font_size));
+            } else {
+                // The apply frame must still happen if the app goes idle the
+                // moment the drag ends — schedule it rather than wait for
+                // unrelated input to repaint.
+                layout.ctx.request_repaint_after(RESIZE_DEBOUNCE);
+            }
+        } else {
+            // Rect returned to the PTY's size before the window elapsed —
+            // nothing to forward anymore.
+            state.pending_resize = None;
         }
 
         self
@@ -1386,6 +1452,63 @@ mod shift_enter_event_path_tests {
             left.contains("XYZMARK"),
             "marker executed or vanished; row was {left:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod resize_debounce_tests {
+    use super::{debounce_resize, RESIZE_DEBOUNCE, Size};
+    use std::time::{Duration, Instant};
+
+    const A: Size = Size { width: 800.0, height: 600.0 };
+    const B: Size = Size { width: 810.0, height: 600.0 };
+
+    /// The spawn-time resize (default grid → real rect) must not letterbox
+    /// for 150ms — `first` applies immediately.
+    #[test]
+    fn first_resize_applies_immediately() {
+        let now = Instant::now();
+        let (pending, apply) = debounce_resize(None, A, now, true);
+        assert!(apply);
+        assert!(pending.is_none());
+    }
+
+    /// A fresh size difference only starts the clock; it applies once the
+    /// same size has held for the debounce interval.
+    #[test]
+    fn resize_applies_only_after_size_holds_still() {
+        let t0 = Instant::now();
+
+        let (pending, apply) = debounce_resize(None, A, t0, false);
+        assert!(!apply, "a size seen for the first time must not apply yet");
+        assert_eq!(pending.map(|p| p.0), Some(A));
+
+        let early = t0 + RESIZE_DEBOUNCE - Duration::from_millis(1);
+        let (pending, apply) = debounce_resize(pending, A, early, false);
+        assert!(!apply, "still inside the debounce window");
+        assert_eq!(pending.map(|p| p.0), Some(A));
+
+        let due = t0 + RESIZE_DEBOUNCE;
+        let (pending, apply) = debounce_resize(pending, A, due, false);
+        assert!(apply, "size held still for the whole window");
+        assert!(pending.is_none(), "an applied resize clears the marker");
+    }
+
+    /// A live window drag changes the size every frame — each change must
+    /// restart the clock, so nothing applies until the drag pauses.
+    #[test]
+    fn size_change_mid_window_drag_restarts_the_clock() {
+        let t0 = Instant::now();
+        let (pending, _) = debounce_resize(None, A, t0, false);
+
+        let t1 = t0 + Duration::from_millis(100);
+        let (pending, apply) = debounce_resize(pending, B, t1, false);
+        assert!(!apply, "a NEW size must never apply, however old the previous marker");
+        assert_eq!(pending.map(|p| p.0), Some(B));
+
+        let t2 = t1 + RESIZE_DEBOUNCE - Duration::from_millis(1);
+        let (_, apply) = debounce_resize(pending, B, t2, false);
+        assert!(!apply, "the clock restarted at the size change, not at t0");
     }
 }
 
