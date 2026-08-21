@@ -140,6 +140,23 @@ impl Dimensions for TerminalSize {
     }
 }
 
+/// The PTY-visible grid a layout would produce — `(cols, lines, cell_w,
+/// cell_h)`. Mirrors [`TerminalBackend::resize`]'s math exactly (the `/`
+/// uses `floor()`ed cell sizes, the stored cells truncate), so "the spec
+/// changed" is precisely "`resize` would change the terminal". Everything
+/// that decides whether/when to forward a resize (`needs_resize`, the
+/// view's debounce) keys on this tuple: sub-cell pixel jitter must be
+/// invisible, or the debounce clock restarts forever and the resize never
+/// lands.
+pub fn grid_spec(layout_size: Size, font_size: Size) -> (u16, u16, u16, u16) {
+    (
+        (layout_size.width / font_size.width.floor()) as u16,
+        (layout_size.height / font_size.height.floor()) as u16,
+        font_size.width as u16,
+        font_size.height as u16,
+    )
+}
+
 impl From<TerminalSize> for WindowSize {
     fn from(size: TerminalSize) -> Self {
         Self {
@@ -744,12 +761,24 @@ impl TerminalBackend {
 
     /// pTerminal perf delta: lets `TerminalView::resize` skip
     /// `process_command(Resize)` — and with it a `FairMutex<Term>` lock —
-    /// on the ~every frame where nothing changed. Mirrors the early-return
-    /// condition inside [`Self::resize`] exactly.
+    /// on the ~every frame where nothing changed.
+    ///
+    /// REGRESSION FIX (0.1.11 debounce follow-up): compares [`grid_spec`]s,
+    /// not raw f32 layout sizes. egui rects can jitter sub-pixel between
+    /// frames; under f32 equality that jitter read as "size changed", which
+    /// restarted the debounce clock in `TerminalView::resize` every frame —
+    /// so the resize NEVER reached the PTY. User-visible: the TUI keeps
+    /// drawing for a stale, smaller grid (duplicated status bars, dead
+    /// space below the UI). The PTY only cares about the cell grid, so only
+    /// a grid change is a resize.
     pub fn needs_resize(&self, layout_size: Size, font_size: Size) -> bool {
-        layout_size != self.size.layout_size
-            || font_size.width as u16 != self.size.cell_width
-            || font_size.height as u16 != self.size.cell_height
+        grid_spec(layout_size, font_size)
+            != (
+                self.size.num_cols,
+                self.size.num_lines,
+                self.size.cell_width,
+                self.size.cell_height,
+            )
     }
 
     fn resize(
