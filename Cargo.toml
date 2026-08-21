@@ -26,6 +26,9 @@ serde_json = "1.0.151"
 sysinfo = "0.38.4"
 
 [dev-dependencies]
+# Thai-fallback font metric checks (ui.rs): already in the tree via epaint,
+# so this adds no new download — pin the same minor.
+ab_glyph = "0.2"
 tempfile = "3.27.0"
 
 [build-dependencies]

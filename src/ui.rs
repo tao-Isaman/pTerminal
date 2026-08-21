@@ -870,3 +870,52 @@ pub(crate) fn thai_font_bytes() -> Option<Vec<u8>> {
         .into_iter()
         .find_map(|f| std::fs::read(dir.join(f)).ok())
 }
+
+#[cfg(test)]
+mod thai_font_probe {
+    /// Reference measurement (run with `--nocapture`), not a pass/fail
+    /// gate: prints the unshaped (no-GPOS) metrics of Thai combining marks
+    /// in each candidate font. This is the evidence behind the terminal's
+    /// mark handling (`view.rs`): marks are zero-advance with negative
+    /// bearings (so appending them to the base string overstrikes
+    /// correctly), and the tone marks' default y-band is IDENTICAL to the
+    /// upper vowels' in BOTH fonts (~0.19em tall) — which is why a tone
+    /// stacked on a vowel must be lifted manually (`thai_mark_stack_slots`
+    /// / `THAI_MARK_LIFT_EM`), and why swapping the font order would not
+    /// have fixed it.
+    #[test]
+    fn probe_thai_mark_metrics() {
+        use ab_glyph::{Font, ScaleFont};
+        let dir = std::path::PathBuf::from(std::env::var_os("WINDIR").unwrap()).join("Fonts");
+        for name in ["LeelawUI.ttf", "tahoma.ttf"] {
+            let Ok(bytes) = std::fs::read(dir.join(name)) else {
+                println!("{name}: not present, skipped");
+                continue;
+            };
+            let font = ab_glyph::FontRef::try_from_slice(&bytes).unwrap();
+            let sf = font.as_scaled(ab_glyph::PxScale::from(28.0));
+            println!("=== {name} ===");
+            for (label, ch) in [
+                ("base  KHO KHAI  ข", 'ข'),
+                ("vowel MAI HAN-AKAT ั", '\u{0E31}'),
+                ("vowel SARA I ิ", '\u{0E34}'),
+                ("vowel SARA UE ึ", '\u{0E36}'),
+                ("tone  MAI EK ่", '\u{0E48}'),
+                ("tone  MAI THO ้", '\u{0E49}'),
+                ("below SARA U ุ", '\u{0E38}'),
+            ] {
+                let gid = sf.glyph_id(ch);
+                let adv = sf.h_advance(gid);
+                let glyph = gid.with_scale_and_position(28.0, ab_glyph::point(0.0, 0.0));
+                let bounds = sf.font().outline_glyph(glyph).map(|og| og.px_bounds());
+                match bounds {
+                    Some(b) => println!(
+                        "  {label}: advance={adv:5.2}  x=[{:6.2},{:6.2}]  y=[{:6.2},{:6.2}]",
+                        b.min.x, b.max.x, b.min.y, b.max.y
+                    ),
+                    None => println!("  {label}: advance={adv:5.2}  (no outline)"),
+                }
+            }
+        }
+    }
+}
