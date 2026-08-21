@@ -82,6 +82,51 @@ fn debounce_resize(
     }
 }
 
+/// pTerminal delta (Thai mark stacking): Thai combining marks that sit
+/// ABOVE the base consonant — upper vowels (U+0E31, U+0E34–0E37) and
+/// tones/diacritics (U+0E47–0E4E). Below-base marks (SARA U/UU, PHINTHU,
+/// U+0E38–0E3A) are not in this class.
+fn is_thai_above_mark(c: char) -> bool {
+    matches!(c, '\u{0E31}' | '\u{0E34}'..='\u{0E37}' | '\u{0E47}'..='\u{0E4E}')
+}
+
+/// pTerminal delta (Thai mark stacking): for each zero-width mark in a
+/// cell, its vertical stack slot — the number of Thai above-class marks
+/// preceding it in the same cell. Slot 0 renders at the font's default
+/// overstrike position; slot N>0 renders lifted N mark-bands up.
+///
+/// Why this exists: egui does no OpenType shaping, and BOTH Windows Thai
+/// fallback fonts (Leelawadee UI, Tahoma — measured in `ui.rs`'s
+/// `thai_font_probe`) put upper vowels and tone marks in the SAME default
+/// y-band, relying on GPOS to raise a tone that sits on a vowel. Unshaped,
+/// "ขึ้น"'s tone therefore lands exactly ON the vowel. Stacking by slot is
+/// the poor man's GPOS: enough for real Thai (base + vowel + tone), wrong
+/// for scripts with richer mark layout — which the terminal never shaped
+/// correctly anyway. Non-above marks always get slot 0 (a below vowel must
+/// not lift a following tone: กุ้ง's tone belongs directly above the base).
+fn thai_mark_stack_slots(marks: &[char]) -> Vec<u8> {
+    let mut above_seen = 0u8;
+    marks
+        .iter()
+        .map(|&m| {
+            if is_thai_above_mark(m) {
+                let slot = above_seen;
+                above_seen = above_seen.saturating_add(1);
+                slot
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+/// pTerminal delta (Thai mark stacking): how far one stack slot lifts a
+/// mark, as a fraction of the font size. The mark band in both fallback
+/// fonts measures ~0.19em (`thai_font_probe`), so one band-height per slot.
+// ponytail: eyeballed from measured font metrics, not per-font — tweak here
+// if a future Windows font update changes the band.
+const THAI_MARK_LIFT_EM: f32 = 0.20;
+
 #[derive(Debug, Clone)]
 enum InputAction {
     BackendCall(BackendCommand),
@@ -744,22 +789,53 @@ impl<'a> TerminalView<'a> {
                 // Combining marks (e.g. Thai upper/lower vowels and tone
                 // marks) are zero-width chars alacritty stores next to the
                 // base char — append them so they overstrike it instead of
-                // being silently dropped.
+                // being silently dropped. Marks whose stack slot is >0 (a
+                // tone sitting ON an upper vowel — egui does no GPOS
+                // shaping, and the fallback fonts' default positions
+                // collide, see `thai_mark_stack_slots`) are pulled out and
+                // drawn separately, lifted one mark-band per slot, anchored
+                // at the pen position they would have had in-string (the
+                // base glyph's right edge — mark outlines hang back over
+                // the base via negative bearings, measured zero-advance in
+                // `thai_font_probe`).
                 let mut text = cell.c.to_string();
+                let mut lifted: Vec<(char, u8)> = Vec::new();
                 if let Some(zerowidth) = cell.zerowidth() {
-                    text.extend(zerowidth);
+                    for (&m, slot) in
+                        zerowidth.iter().zip(thai_mark_stack_slots(zerowidth))
+                    {
+                        if slot == 0 {
+                            text.push(m);
+                        } else {
+                            lifted.push((m, slot));
+                        }
+                    }
                 }
+                let center_x = x + (cell_width / 2.0);
                 shapes.push(Shape::text(
                     &fonts,
-                    Pos2 {
-                        x: x + (cell_width / 2.0),
-                        y,
-                    },
+                    Pos2 { x: center_x, y },
                     Align2::CENTER_TOP,
                     text,
                     self.font.font_type(),
                     fg,
                 ));
+                if !lifted.is_empty() {
+                    let font_id = self.font.font_type();
+                    let base_advance = fonts.glyph_width(&font_id, cell.c);
+                    let pen_x = center_x + base_advance / 2.0;
+                    let lift = font_id.size * THAI_MARK_LIFT_EM;
+                    for (m, slot) in lifted {
+                        shapes.push(Shape::text(
+                            &fonts,
+                            Pos2 { x: pen_x, y: y - lift * slot as f32 },
+                            Align2::LEFT_TOP,
+                            m,
+                            font_id.clone(),
+                            fg,
+                        ));
+                    }
+                }
             }
         }
 
@@ -1452,6 +1528,41 @@ mod shift_enter_event_path_tests {
             left.contains("XYZMARK"),
             "marker executed or vanished; row was {left:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod thai_mark_stack_tests {
+    use super::thai_mark_stack_slots;
+
+    /// ขึ้น: upper vowel then tone — the tone must lift one slot so it
+    /// stacks above the vowel instead of drawing on top of it.
+    #[test]
+    fn tone_after_upper_vowel_lifts_one_slot() {
+        assert_eq!(thai_mark_stack_slots(&['\u{0E36}', '\u{0E49}']), vec![0, 1]);
+        assert_eq!(thai_mark_stack_slots(&['\u{0E31}', '\u{0E48}']), vec![0, 1]);
+    }
+
+    /// กุ้ง: below vowel then tone — the tone sits directly above the base,
+    /// no lift (a below mark occupies no above slot).
+    #[test]
+    fn tone_after_below_vowel_does_not_lift() {
+        assert_eq!(thai_mark_stack_slots(&['\u{0E38}', '\u{0E49}']), vec![0, 0]);
+    }
+
+    /// A lone mark — vowel or tone — renders at the font default.
+    #[test]
+    fn single_marks_stay_at_default_position() {
+        assert_eq!(thai_mark_stack_slots(&['\u{0E34}']), vec![0]);
+        assert_eq!(thai_mark_stack_slots(&['\u{0E48}']), vec![0]);
+    }
+
+    /// Non-Thai combining marks are out of scope: never lifted, and they
+    /// don't occupy an above slot for later Thai marks either.
+    #[test]
+    fn non_thai_marks_are_ignored_by_the_stacker() {
+        assert_eq!(thai_mark_stack_slots(&['\u{0301}']), vec![0]);
+        assert_eq!(thai_mark_stack_slots(&['\u{0301}', '\u{0E49}']), vec![0, 0]);
     }
 }
 
