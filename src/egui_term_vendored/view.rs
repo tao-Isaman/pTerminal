@@ -53,29 +53,36 @@ fn drag_target_offset(y_frac: f32, history: usize, screen: usize) -> usize {
 /// Terminal throttles its ConPTY resizes for the same reason.
 const RESIZE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// Decides whether a layout size that differs from the PTY's should be
-/// forwarded yet. Takes the current pending marker `(size, since)` and
-/// returns the new marker plus "apply now". The first-ever resize
-/// (`first`) applies immediately — that's the spawn-time jump from the
-/// default 80-column grid to the real rect, where a 150ms letterbox would
-/// be pure loss. After that a resize only applies once the size has held
-/// stable for [`RESIZE_DEBOUNCE`]; any change restarts the clock. Pure for
+/// The PTY grid a resize would produce — see `backend::grid_spec`. The
+/// debounce keys on THIS, never on raw f32 sizes: egui rects jitter
+/// sub-pixel between frames, and under f32 equality that jitter restarted
+/// the clock every frame, so the resize never landed (0.1.11 regression —
+/// stale smaller grid, duplicated TUI bars).
+type GridSpec = (u16, u16, u16, u16);
+
+/// Decides whether a grid that differs from the PTY's should be forwarded
+/// yet. Takes the current pending marker `(spec, since)` and returns the
+/// new marker plus "apply now". The first-ever resize (`first`) applies
+/// immediately — that's the spawn-time jump from the default 80-column
+/// grid to the real rect, where a 150ms letterbox would be pure loss.
+/// After that a resize only applies once the same target grid has held for
+/// [`RESIZE_DEBOUNCE`]; a different target restarts the clock. Pure for
 /// unit tests.
 fn debounce_resize(
-    pending: Option<(Size, std::time::Instant)>,
-    current: Size,
+    pending: Option<(GridSpec, std::time::Instant)>,
+    current: GridSpec,
     now: std::time::Instant,
     first: bool,
-) -> (Option<(Size, std::time::Instant)>, bool) {
+) -> (Option<(GridSpec, std::time::Instant)>, bool) {
     if first {
         return (None, true);
     }
     match pending {
-        Some((size, since)) if size == current => {
+        Some((spec, since)) if spec == current => {
             if now.duration_since(since) >= RESIZE_DEBOUNCE {
                 (None, true)
             } else {
-                (Some((size, since)), false)
+                (Some((spec, since)), false)
             }
         }
         _ => (Some((current, now)), false),
@@ -141,10 +148,10 @@ pub struct TerminalViewState {
     // the moment the prefix changes — see `TerminalView::ghost`.
     ghost_last_prefix: String,
     ghost_suppressed: bool,
-    // pTerminal delta (ConPTY resize debounce): the differing layout size
-    // waiting out its stability window, and whether the spawn-time first
-    // resize already happened — see `debounce_resize`.
-    pending_resize: Option<(Size, std::time::Instant)>,
+    // pTerminal delta (ConPTY resize debounce): the target grid waiting
+    // out its stability window, and whether the spawn-time first resize
+    // already happened — see `debounce_resize`.
+    pending_resize: Option<(GridSpec, std::time::Instant)>,
     resized_once: bool,
     // pTerminal delta (scrollbar): a drag that started on the scrollbar —
     // pointer moves retarget the viewport instead of extending a selection.
@@ -334,7 +341,7 @@ impl<'a> TerminalView<'a> {
             // the size holds still — see `debounce_resize`/`RESIZE_DEBOUNCE`.
             let (pending, apply) = debounce_resize(
                 state.pending_resize,
-                layout_size,
+                crate::egui_term_vendored::backend::grid_spec(layout_size, font_size),
                 std::time::Instant::now(),
                 !state.resized_once,
             );
@@ -1568,11 +1575,29 @@ mod thai_mark_stack_tests {
 
 #[cfg(test)]
 mod resize_debounce_tests {
-    use super::{debounce_resize, RESIZE_DEBOUNCE, Size};
+    use super::{debounce_resize, GridSpec, RESIZE_DEBOUNCE, Size};
+    use crate::egui_term_vendored::backend::grid_spec;
     use std::time::{Duration, Instant};
 
-    const A: Size = Size { width: 800.0, height: 600.0 };
-    const B: Size = Size { width: 810.0, height: 600.0 };
+    const A: GridSpec = (95, 35, 8, 17);
+    const B: GridSpec = (96, 35, 8, 17);
+
+    /// THE 0.1.11 regression this module exists to prevent: egui rects can
+    /// jitter sub-pixel between frames. Keyed on raw f32 sizes that jitter
+    /// read as "changed" every frame, restarted the debounce clock forever,
+    /// and the resize NEVER reached the PTY (stale smaller grid, duplicated
+    /// TUI bars, dead space below). Sub-cell jitter must map to the SAME
+    /// grid spec; only crossing a cell boundary is a change.
+    #[test]
+    fn sub_cell_layout_jitter_is_the_same_grid() {
+        let font = Size { width: 8.4, height: 17.6 };
+        let a = grid_spec(Size { width: 800.0, height: 600.0 }, font);
+        let jitter = grid_spec(Size { width: 800.4, height: 600.3 }, font);
+        assert_eq!(a, jitter, "sub-cell jitter must not read as a resize");
+
+        let grown = grid_spec(Size { width: 809.0, height: 600.0 }, font);
+        assert_ne!(a, grown, "crossing a cell boundary is a real resize");
+    }
 
     /// The spawn-time resize (default grid → real rect) must not letterbox
     /// for 150ms — `first` applies immediately.
