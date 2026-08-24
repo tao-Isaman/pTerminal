@@ -428,6 +428,17 @@ pub struct Tab {
     pub last_activity: std::time::SystemTime,
 }
 
+/// Wraps compose-box text as ONE bracketed paste (`ESC[200~ … ESC[201~`).
+/// This is the input shape Claude Code's composer handles losslessly for
+/// Thai combining marks — per-keystroke echo corrupts them (live-probed in
+/// `view.rs`'s `thai_composer_probe`: per-char typing, per-char pastes and
+/// cluster rewrites all corrupt; a whole-message bracketed paste is clean,
+/// and keystrokes after it stay clean). The submit `\r` must NOT ride
+/// along — same deferred-Enter rule as message delivery (`pending_submit`).
+pub fn bracketed_paste(text: &str) -> String {
+    format!("\x1b[200~{text}\x1b[201~")
+}
+
 /// Builds the `cmd /c claude ...` argv for an agent tab: a fresh prompt-driven
 /// launch when `resume` is `None` (existing behavior — quotes stripped from
 /// the prompt since Windows' unescaped `cmd /c` would otherwise choke on
@@ -1422,5 +1433,18 @@ mod tests {
     fn agent_args_resume_ignores_prompt() {
         let args = agent_args("ignored prompt entirely", Some("sess-123"));
         assert_eq!(args, vec!["/c", "claude", "--resume", "sess-123"]);
+    }
+
+    /// Compose-box payload: the exact bracketed-paste envelope, Thai
+    /// (multi-byte + combining marks) passed through untouched, and no
+    /// trailing `\r` — the submit Enter goes through `pending_submit`.
+    #[test]
+    fn bracketed_paste_wraps_text_verbatim() {
+        assert_eq!(
+            bracketed_paste("ลองแล้วเห็นเด้งไม่ขึ้น"),
+            "\x1b[200~ลองแล้วเห็นเด้งไม่ขึ้น\x1b[201~"
+        );
+        assert_eq!(bracketed_paste(""), "\x1b[200~\x1b[201~");
+        assert!(!bracketed_paste("x").contains('\r'));
     }
 }
