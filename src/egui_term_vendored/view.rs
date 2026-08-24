@@ -1539,6 +1539,199 @@ mod shift_enter_event_path_tests {
 }
 
 #[cfg(test)]
+mod thai_composer_probe {
+    use crate::egui_term_vendored::backend::{BackendCommand, TerminalBackend};
+    use crate::egui_term_vendored::backend::settings::BackendSettings;
+    use std::time::Duration;
+
+    /// EXPLORATORY PROBE, `#[ignore]`d — launches a real interactive
+    /// `claude` through the full ConPTY backend, types Thai (with stacked
+    /// vowel+tone clusters) into its composer one keystroke at a time like
+    /// a human, then dumps the terminal GRID (base chars + zero-width
+    /// marks per cell). Decides WHERE composer corruption happens: bases
+    /// missing from the grid = the bytes arrive corrupted (Claude Code's
+    /// composer echo — upstream); grid intact = pTerminal's renderer is at
+    /// fault. Run manually:
+    ///   cargo test --bin pterminal thai_composer -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn probe_thai_typing_through_real_claude_composer() {
+        let ctx = egui::Context::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let dir = std::env::temp_dir().join("pt-thai-composer-probe");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut backend = TerminalBackend::new(
+            956,
+            ctx.clone(),
+            tx,
+            BackendSettings {
+                shell: "cmd.exe".to_string(),
+                args: vec!["/c".to_string(), "claude".to_string()],
+                working_directory: Some(dir),
+                scrolling_history: 200,
+            },
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .expect("spawn claude");
+        // Real-ish viewport so the composer lays out normally.
+        backend.process_command(BackendCommand::Resize(
+            super::Size { width: 1000.0, height: 600.0 },
+            super::Size { width: 8.0, height: 17.0 },
+        ));
+
+        // Let claude start up; accept the fresh-directory trust prompt
+        // (Enter on "Yes, I trust this folder"), then wait for the composer.
+        std::thread::sleep(Duration::from_secs(15));
+        backend.process_command(BackendCommand::Write(b"\r".to_vec()));
+        std::thread::sleep(Duration::from_secs(12));
+
+        // Type like a human: one UTF-8 char per write, 80ms apart.
+        // ลองแล้วเห็นเด้งไม่ขึ้น — includes single marks and the stacked
+        // vowel+tone cluster ขึ้น.
+        let typed = "ลองแล้วเห็นเด้งไม่ขึ้น";
+        for ch in typed.chars() {
+            let mut buf = [0u8; 4];
+            let bytes = ch.encode_utf8(&mut buf).as_bytes().to_vec();
+            backend.process_command(BackendCommand::Write(bytes));
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+
+        backend.mark_dirty();
+        backend.sync();
+        {
+            let content = backend.last_content();
+            let line = content.cursor_point.line.0;
+            let mut typed_row = String::new();
+            for (point, cell) in &content.cells {
+                if point.line.0 == line {
+                    typed_row.push(cell.c);
+                    if let Some(z) = cell.zerowidth() {
+                        typed_row.extend(z.iter());
+                    }
+                }
+            }
+            println!("=== TYPED-phase composer row: {}", typed_row.trim_end());
+        }
+
+        // Phase 2: clear the composer (backspaces), then PASTE the whole
+        // string as one bracketed-paste write — the bulk path the composer
+        // redraws once, no per-keystroke drift.
+        for _ in 0..40 {
+            backend.process_command(BackendCommand::Write(vec![0x7f]));
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let mut paste = b"\x1b[200~".to_vec();
+        paste.extend_from_slice(typed.as_bytes());
+        paste.extend_from_slice(b"\x1b[201~");
+        backend.process_command(BackendCommand::Write(paste));
+        std::thread::sleep(Duration::from_secs(3));
+
+        backend.mark_dirty();
+        backend.sync();
+        {
+            let content = backend.last_content();
+            let line = content.cursor_point.line.0;
+            let mut row = String::new();
+            for (point, cell) in &content.cells {
+                if point.line.0 == line {
+                    row.push(cell.c);
+                    if let Some(z) = cell.zerowidth() {
+                        row.extend(z.iter());
+                    }
+                }
+            }
+            println!("=== PASTE-phase composer row: {}", row.trim_end());
+        }
+
+        // Phase 3 (falsified candidate, kept for the record): per-char
+        // bracketed paste — corrupted identically to plain typing.
+        //
+        // Phase 4 candidate: never let a combining mark travel alone. A
+        // mark keystroke becomes backspace + the WHOLE cluster re-sent as
+        // one atomic write (ข → [DEL,ขึ] → [DEL,ขึ้]); plain chars go
+        // through unchanged.
+        for _ in 0..40 {
+            backend.process_command(BackendCommand::Write(vec![0x7f]));
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let is_mark = |c: char| {
+            matches!(c, '\u{0E31}' | '\u{0E34}'..='\u{0E3A}' | '\u{0E47}'..='\u{0E4E}')
+        };
+        let mut cluster = String::new();
+        for ch in typed.chars() {
+            let w = if is_mark(ch) && !cluster.is_empty() {
+                // Backspace once per code point of the cluster as sent so
+                // far (the composer's backspace deletes code points, not
+                // grapheme clusters), then re-insert the grown cluster as
+                // a bracketed mini-paste — the one insert shape proven
+                // clean, with the mark glued to its base.
+                let prev = cluster.chars().count();
+                cluster.push(ch);
+                let mut w = vec![0x7f; prev];
+                w.extend_from_slice(b"\x1b[200~");
+                w.extend_from_slice(cluster.as_bytes());
+                w.extend_from_slice(b"\x1b[201~");
+                w
+            } else {
+                cluster.clear();
+                cluster.push(ch);
+                ch.to_string().into_bytes()
+            };
+            backend.process_command(BackendCommand::Write(w));
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+
+        // Phase 6: does typing AFTER clean Thai retroactively corrupt it?
+        // Clear, bulk-paste the string (proven clean), then type plain
+        // ASCII keystrokes and see whether the earlier Thai degrades.
+        for _ in 0..40 {
+            backend.process_command(BackendCommand::Write(vec![0x7f]));
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let mut paste2 = b"\x1b[200~".to_vec();
+        paste2.extend_from_slice(typed.as_bytes());
+        paste2.extend_from_slice(b"\x1b[201~");
+        backend.process_command(BackendCommand::Write(paste2));
+        std::thread::sleep(Duration::from_secs(2));
+        for ch in " ok done".chars() {
+            backend.process_command(BackendCommand::Write(ch.to_string().into_bytes()));
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+
+        backend.mark_dirty();
+        backend.sync();
+        let content = backend.last_content();
+        // Dump every non-blank grid row, zero-width marks appended per cell.
+        let mut rows: std::collections::BTreeMap<i32, String> = Default::default();
+        for (point, cell) in &content.cells {
+            let row = rows.entry(point.line.0).or_default();
+            if cell.c != ' ' || cell.zerowidth().is_some() {
+                row.push(cell.c);
+                if let Some(z) = cell.zerowidth() {
+                    row.extend(z.iter());
+                }
+            } else {
+                row.push(' ');
+            }
+        }
+        println!("=== GRID DUMP (typed: {typed}) ===");
+        for (line, text) in &rows {
+            let t = text.trim_end();
+            if !t.is_empty() {
+                println!("{line:4}: {t}");
+            }
+        }
+        let bases: String = typed.chars().filter(|c| !matches!(c, '\u{0E31}' | '\u{0E34}'..='\u{0E3A}' | '\u{0E47}'..='\u{0E4E}')).collect();
+        let grid_text: String = rows.values().cloned().collect();
+        println!("=== bases expected: {bases}");
+        println!("=== bases all present: {}", bases.chars().all(|b| grid_text.contains(b)));
+    }
+}
+
+#[cfg(test)]
 mod thai_mark_stack_tests {
     use super::thai_mark_stack_slots;
 

@@ -359,6 +359,13 @@ pub struct PtApp {
     /// own event. Fixing it properly means deferring the message *text* too,
     /// i.e. a per-tab delivery FIFO; deliberately out of scope for this fix.
     pub pending_submit: Vec<(u64, std::time::Instant)>,
+    /// Thai-safe compose box (Ctrl+I on an agent tab): Claude Code's
+    /// composer corrupts per-keystroke Thai combining marks (probe-verified,
+    /// see `term::bracketed_paste`), so this strip lets a message be typed
+    /// in a normal egui field and sent as one clean bracketed paste + the
+    /// usual deferred Enter.
+    pub compose_open: bool,
+    pub compose_text: String,
     /// The once-per-launch update check ([`crate::update::spawn_update_check`],
     /// started in [`PtApp::new`]); `drain_events` polls it and clears it after
     /// the first answer (or a disconnect — the silent-failure case).
@@ -383,7 +390,7 @@ pub struct PtApp {
 /// enough to land in its own PTY write burst (so `claude` sees a keystroke,
 /// not part of a paste), short enough to feel instant. See
 /// [`PtApp::pending_submit`].
-const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+pub(crate) const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
 impl PtApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
@@ -484,6 +491,8 @@ impl PtApp {
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
+            compose_open: false,
+            compose_text: String::new(),
             // once per launch; every failure mode is a silent no-op
             update_check: Some(crate::update::spawn_update_check()),
             update_available: None,
@@ -1734,13 +1743,17 @@ impl PtApp {
         if self.dialog_open() {
             return;
         }
-        let (t, w, cycle, open_file, save_file) = ctx.input_mut(|i| {
+        let (t, w, cycle, open_file, save_file, compose) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::T),
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::W),
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab),
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::O),
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::S),
+                // Ctrl+I toggles the Thai-safe compose strip. Consuming it
+                // steals the terminal's Ctrl+I (legacy Tab alias) — the
+                // real Tab key is a separate egui key and unaffected.
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::I),
             )
         });
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2)) {
@@ -1779,6 +1792,16 @@ impl PtApp {
         if cycle && !ws.tabs.is_empty() {
             ws.active_tab = (ws.active_tab + 1) % ws.tabs.len();
             self.selected_child = None; // Step 8: a keyboard tab switch clears it too
+        }
+        // Compose strip: only meaningful on a live agent tab (Claude's
+        // composer is the thing being worked around); a shell or placeholder
+        // just ignores the toggle.
+        if compose
+            && ws.tabs.get(ws.active_tab).is_some_and(|t| {
+                t.kind == TabKind::Agent && t.missing_dir.is_none()
+            })
+        {
+            self.compose_open = !self.compose_open;
         }
         // Task 1: Ctrl+S saves the active editor tab, if any — a no-op
         // (silently) when no editor is active, same as every other shortcut
@@ -2168,6 +2191,8 @@ mod tests {
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
+            compose_open: false,
+            compose_text: String::new(),
             // tests never talk to the network: no check, no notice, no download
             update_check: None,
             update_available: None,
@@ -2265,6 +2290,8 @@ mod tests {
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
+            compose_open: false,
+            compose_text: String::new(),
             // tests never talk to the network: no check, no notice, no download
             update_check: None,
             update_available: None,
@@ -2308,6 +2335,8 @@ mod tests {
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
+            compose_open: false,
+            compose_text: String::new(),
             // tests never talk to the network: no check, no notice, no download
             update_check: None,
             update_available: None,

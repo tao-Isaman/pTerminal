@@ -444,7 +444,7 @@ impl PtApp {
                     self.machine.cpu_pct,
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label("F2 context  Ctrl+T new tab");
+                    ui.label("F2 context  Ctrl+I compose  Ctrl+T new tab");
                     // Auto-update notice (see `crate::update`): present only
                     // when the startup check found a newer release. One click
                     // downloads the installer; `drain_events` runs it and
@@ -597,6 +597,53 @@ impl PtApp {
                     // `self` fields: `tab` borrows `self.workspaces`,
                     // history is its own field.
                     let is_shell = tab.kind == crate::term::TabKind::Shell;
+                    // Thai-safe compose strip (Ctrl+I, agent tabs): Claude
+                    // Code's composer corrupts per-keystroke Thai combining
+                    // marks (probe-verified: `thai_composer_probe`), so the
+                    // message is typed here — a normal egui field — and sent
+                    // as ONE bracketed paste (`term::bracketed_paste`, the
+                    // proven-clean insert shape) plus the same deferred
+                    // Enter message delivery already uses. `compose_text` /
+                    // `pending_submit` are disjoint `self` fields from the
+                    // `tab` borrow, same pattern as `history` below.
+                    if self.compose_open && !is_shell && !placeholder && tab.term.exited().is_none() {
+                        let mut send: Option<String> = None;
+                        ui.horizontal(|ui| {
+                            ui.label("compose:");
+                            let resp = ui.add_sized(
+                                [ui.available_width() - 56.0, 20.0],
+                                egui::TextEdit::singleline(&mut self.compose_text)
+                                    .hint_text("Enter ส่ง · Esc ปิด — sent as one paste"),
+                            );
+                            // Grab the keyboard when nothing else holds it
+                            // (the terminal is told to stand down while the
+                            // strip is open — see the `focused &&` below).
+                            if !resp.has_focus() && ui.memory(|m| m.focused().is_none()) {
+                                resp.request_focus();
+                            }
+                            let entered = resp.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if ui.button("send").clicked() || entered {
+                                let text = self.compose_text.trim().to_string();
+                                if !text.is_empty() {
+                                    send = Some(text);
+                                    self.compose_text.clear();
+                                }
+                                resp.request_focus(); // stay ready for the next message
+                            }
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                self.compose_open = false;
+                            }
+                        });
+                        if let Some(text) = send {
+                            tab.term.write_input(&crate::term::bracketed_paste(&text));
+                            let tab_id = tab.id;
+                            self.pending_submit.push((
+                                tab_id,
+                                std::time::Instant::now() + crate::app::SUBMIT_DELAY,
+                            ));
+                        }
+                    }
                     let history = if is_shell { Some(&mut self.history) } else { None };
                     // Shift+Enter newline: PowerShell continues a line with a
                     // trailing backtick; Claude Code inserts a newline on a
@@ -604,7 +651,9 @@ impl PtApp {
                     // and CSI-u all insert; LF is the cleanest — one byte,
                     // no continuation character involved).
                     let shift_enter: &[u8] = if is_shell { b"`\r" } else { b"\n" };
-                    let open_req = tab.term.ui(ui, focused, history, shift_enter); // only the ACTIVE tab renders — spec perf requirement
+                    // The compose strip owns the keyboard while open.
+                    let term_focused = focused && !(self.compose_open && !is_shell);
+                    let open_req = tab.term.ui(ui, term_focused, history, shift_enter); // only the ACTIVE tab renders — spec perf requirement
                     // Ctrl+click on a file path in the terminal (see the
                     // backend's path-hover logic): open it in an editor tab
                     // in this workspace. The workspace is re-borrowed fresh —
