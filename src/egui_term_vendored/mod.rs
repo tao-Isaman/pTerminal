@@ -129,6 +129,9 @@ mod view;
 
 pub use backend::settings::BackendSettings;
 pub use backend::{BackendCommand, PtyEvent, TerminalBackend, TerminalMode};
+// pTerminal delta (background-tab size sync): `Size` crosses the vendored
+// boundary via `TabTerm::applied_size`/`resize_to`.
+pub use types::Size;
 pub use bindings::{Binding, BindingAction, InputKind, KeyboardBinding};
 pub use font::{FontSettings, TerminalFont};
 pub use theme::{ColorPalette, TerminalTheme};

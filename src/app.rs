@@ -1352,6 +1352,24 @@ impl PtApp {
                 }
             }
         }
+        // Background-tab size sync: only the ACTIVE tab renders, and until
+        // this existed only rendering resized a PTY — so a resumed
+        // background tab sat at the default 80x50 grid while its
+        // `claude --resume` painted, and the first click's resize forced a
+        // repaint that left the small-grid frame rows behind ("doubled
+        // bars" after every app restart). Feed every other tab the active
+        // tab's applied size; `resize_to`'s lock-free `needs_resize` gate
+        // makes the steady state free, and reading the APPLIED size means
+        // background tabs follow the debounced value, never a mid-drag one.
+        let active_size = self
+            .workspaces
+            .get(self.active_ws)
+            .and_then(|ws| ws.tabs.get(ws.active_tab))
+            .and_then(|t| t.term.applied_size());
+        let (active_ws_idx, active_tab_idx) = (
+            self.active_ws,
+            self.workspaces.get(self.active_ws).map(|w| w.active_tab).unwrap_or(0),
+        );
         // Every tab of every workspace: drain its PTY channel (poll), notice
         // exit, sync visibility to whether it's the on-screen tab, and roll
         // up CPU/mem. This must not be limited to the active tab — that's
@@ -1359,6 +1377,13 @@ impl PtApp {
         for (ws_idx, ws) in self.workspaces.iter_mut().enumerate() {
             for (tab_idx, tab) in ws.tabs.iter_mut().enumerate() {
                 tab.term.poll();
+                if let Some((l, f)) = active_size {
+                    if !(ws_idx == active_ws_idx && tab_idx == active_tab_idx)
+                        && tab.term.exited().is_none()
+                    {
+                        tab.term.resize_to(l, f);
+                    }
+                }
                 if tab.term.exited().is_some() {
                     tab.status = AgentStatus::Exited;
                     // Step 4: a dead process can't have live subagents —
