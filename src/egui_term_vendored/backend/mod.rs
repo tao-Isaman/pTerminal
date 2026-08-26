@@ -478,6 +478,17 @@ impl TerminalBackend {
         &self.last_content
     }
 
+    /// pTerminal delta (background-tab size sync): the `(layout, font)` of
+    /// the last APPLIED resize — the pair a peer terminal must be fed to
+    /// reproduce this grid. The never-resized default state reports a zero
+    /// layout, which callers treat as "no real size yet".
+    pub fn applied_size(&self) -> (Size, Size) {
+        (
+            self.size.layout_size,
+            Size::new(self.size.cell_width as f32, self.size.cell_height as f32),
+        )
+    }
+
     /// pTerminal delta (history ghost suggestions): the cursor row as the
     /// shell rendered it, split at the cursor — `(text left of the cursor,
     /// is there any non-blank cell at or right of the cursor)`. Read from
