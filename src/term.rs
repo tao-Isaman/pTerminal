@@ -2,14 +2,14 @@
 //! that renders its output.
 //!
 //! **Backend decision (locked here, Task 2).** We depend on
-//! `src/egui_term_vendored/` â€” a copy of `egui_term` 0.1.0 (MIT) rather than the
+//! `src/egui_term_vendored/` — a copy of `egui_term` 0.1.0 (MIT) rather than the
 //! crates.io release. The released crate *can* spawn a custom program with args
 //! and a working directory, and it renders and drives ConPTY correctly on Windows,
 //! but it has three defects this app would hit in normal use, none of which are
 //! reachable from outside the crate:
 //!
 //! 1. Its PTY-event forwarding thread busy-spins at 100% CPU forever once its
-//!    channel closes â€” which is exactly what happens when a `TerminalBackend` is
+//!    channel closes — which is exactly what happens when a `TerminalBackend` is
 //!    dropped while its child is still running, i.e. every closed tab.
 //! 2. Keyboard input required the mouse pointer to sit inside the terminal rect,
 //!    so typing stopped whenever the pointer moved away.
@@ -46,7 +46,7 @@ pub struct TabTerm {
     // `Tab::id` (which app.rs does read) mirrors this value. Task 12's exit
     // banner and `Tab::respawn` ended up going through `Tab::id` instead
     // (it's already in scope everywhere a `Tab` is handled), so this field
-    // is still unread outside this struct's own construction â€” left in
+    // is still unread outside this struct's own construction — left in
     // place since it may still find a caller, but the attribute stays
     // honest about that.
     #[allow(dead_code)]
@@ -90,7 +90,7 @@ impl TabTerm {
     }
 
     /// Drains the PTY event channel. **The app loop must call this once per
-    /// frame for every terminal it owns, on screen or not** â€” rendering is not
+    /// frame for every terminal it owns, on screen or not** — rendering is not
     /// what keeps a terminal alive:
     ///
     /// - the channel is unbounded and its events carry owned `String` payloads,
@@ -113,7 +113,7 @@ impl TabTerm {
                 _ => {},
             }
         }
-        // Any PTY event means the terminal's content may have changed â€”
+        // Any PTY event means the terminal's content may have changed —
         // tell the backend so its next `sync` re-snapshots the viewport
         // (while clean, `sync` serves the cached copy; see `mark_dirty`).
         if saw_event {
@@ -121,7 +121,12 @@ impl TabTerm {
         }
     }
 
-    /// The `(layout, font)` pair of the last applied PTY resize â€” what a
+    /// Tells the terminal whether it is currently on screen. A visible terminal
+    /// asks for an immediate repaint whenever its child writes output; a hidden
+    /// one only asks for a lazy one (~250 ms), so a chatty background tab does
+    /// not drive the whole app at full frame rate. Terminals start visible.
+    ///
+    /// The `(layout, font)` pair of the last applied PTY resize — what a
     /// peer tab must be fed to match this terminal's grid. `None` until a
     /// real resize happened (a fresh spawn still sits at the default 80x50
     /// grid, which must never be propagated as a sync source).
@@ -134,10 +139,10 @@ impl TabTerm {
     }
 
     /// Matches this terminal's PTY grid to `layout`/`font` WITHOUT
-    /// rendering it â€” background-tab size sync. Only the active tab
+    /// rendering it — background-tab size sync. Only the active tab
     /// renders (and only rendering resized, before this existed), so a
     /// resumed background tab used to sit at the default 80x50 grid while
-    /// its `claude --resume` painted â€” and the first click resized it,
+    /// its `claude --resume` painted — and the first click resized it,
     /// forcing a full repaint that left the small-grid frame behind as
     /// junk rows ("doubled bars" on every app restart). No-op when the
     /// grid already matches (`needs_resize` is lock-free).
@@ -151,12 +156,7 @@ impl TabTerm {
         }
     }
 
-    /// Tells the terminal whether it is currently on screen. A visible terminal
-    /// asks for an immediate repaint whenever its child writes output; a hidden
-    /// one only asks for a lazy one (~250 ms), so a chatty background tab does
-    /// not drive the whole app at full frame rate. Terminals start visible.
-    ///
-    /// This is only about repaint *urgency* â€” a hidden terminal still needs
+    /// This is only about repaint *urgency* — a hidden terminal still needs
     /// [`TabTerm::poll`] every frame.
     pub fn set_visible(&self, visible: bool) {
         self.visible.store(visible, Ordering::Relaxed);
@@ -178,10 +178,10 @@ impl TabTerm {
         &mut self,
         ui: &mut eframe::egui::Ui,
         focused: bool,
-        // Ghost-suggestion history â€” `Some` only for shell tabs (the caller
+        // Ghost-suggestion history — `Some` only for shell tabs (the caller
         // decides; agent tabs run Claude Code's own input UI, no ghosts).
         history: Option<&mut crate::history::History>,
-        // What Shift+Enter writes instead of `\r` â€” the tab-appropriate
+        // What Shift+Enter writes instead of `\r` — the tab-appropriate
         // line-continuation (caller decides by `TabKind`). Empty = off.
         shift_enter: &[u8],
     ) -> Option<std::path::PathBuf> {
@@ -200,12 +200,12 @@ impl TabTerm {
         //
         // **Borrow approach.** `Response::context_menu` takes `&self` and
         // its own closure parameter is a FRESH `&mut Ui` for the popup's
-        // contents â€” it does not need (or capture) the outer `ui: &mut Ui`
+        // contents — it does not need (or capture) the outer `ui: &mut Ui`
         // this method was given, and by the time `ui.add(view)` above
         // returns, the `&mut self.backend` borrow it took has already
         // ended. So the closure below is free to take `&mut self` (it's
         // the only thing it touches) and call ordinary `&self`/`&mut self`
-        // methods on `TabTerm` directly â€” no action-enum indirection is
+        // methods on `TabTerm` directly — no action-enum indirection is
         // needed here; the borrow checker has nothing left to object to.
         //
         // Right-click always opens this menu: the vendored view only ever
@@ -219,7 +219,7 @@ impl TabTerm {
         // every other input path here (which rides `view.set_focus(focused)`
         // above and `view.rs`'s own `if !layout.has_focus() { return }`),
         // right-click was reaching Paste/Clear even while a dialog was open
-        // (`focused == false` â€” see `app.rs`'s `focused` computation) or,
+        // (`focused == false` — see `app.rs`'s `focused` computation) or,
         // for a background tab, even when it wasn't the one on screen. Only
         // attaching the menu when `focused` is true makes the right-click
         // path respect the same "no terminal interaction right now" rule as
@@ -237,7 +237,7 @@ impl TabTerm {
                 if ui.button("Paste").clicked() {
                     // Menu Paste reads the OS clipboard directly via `arboard`
                     // (unlike keyboard Ctrl+V, which rides egui's own
-                    // `Event::Paste` â€” see `view.rs`'s `process_keyboard_event`).
+                    // `Event::Paste` — see `view.rs`'s `process_keyboard_event`).
                     // Best-effort: a clipboard that can't be opened or holds no
                     // text is silently a no-op rather than an error dialog.
                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
@@ -269,32 +269,32 @@ impl TabTerm {
         self.exited
     }
 
-    /// Whether there's an active selection â€” greys out the context menu's
+    /// Whether there's an active selection — greys out the context menu's
     /// "Copy" item when there's nothing to copy.
     pub fn has_selection(&self) -> bool {
         self.backend.has_selection()
     }
 
-    /// The currently selected text, if any (empty string otherwise) â€” same
+    /// The currently selected text, if any (empty string otherwise) — same
     /// text the context menu's "Copy" and keyboard Ctrl+C put on the
     /// clipboard.
     pub fn copy_selection(&self) -> String {
         self.backend.selectable_content()
     }
 
-    /// Selects the entire buffer (scrollback + visible screen) â€” the
+    /// Selects the entire buffer (scrollback + visible screen) — the
     /// context menu's "Select All".
     pub fn select_all(&mut self) {
         self.backend.process_command(BackendCommand::SelectAll);
     }
 
-    /// Clears the visible screen AND scrollback â€” the context menu's
+    /// Clears the visible screen AND scrollback — the context menu's
     /// "Clear".
     pub fn clear_screen(&mut self) {
         self.backend.process_command(BackendCommand::ClearScreen);
     }
 
-    /// Writes `s` to the child's stdin as-is, with no appended `\r` â€” the
+    /// Writes `s` to the child's stdin as-is, with no appended `\r` — the
     /// context menu's "Paste". Distinct from [`TabTerm::write_input`] only
     /// in name/call site (both end up at the identical
     /// `BackendCommand::Write`); kept separate because they answer
@@ -308,19 +308,19 @@ impl TabTerm {
     }
 
     /// Writes raw bytes to the child's stdin, the same path `view.rs` uses
-    /// for keystrokes (`BackendCommand::Write`) â€” this is how Task 5's
+    /// for keystrokes (`BackendCommand::Write`) — this is how Task 5's
     /// message delivery and any future programmatic input reach the PTY.
     /// The caller is responsible for appending `\r` (ConPTY Enter) when a
-    /// submission â€” not just text sitting on the input line â€” is intended.
+    /// submission — not just text sitting on the input line — is intended.
     ///
     /// **The `\r` must not ride along in the same call as the text when the
     /// receiver is a TUI with paste detection** (final-review finding 1).
     /// `claude`'s input widget classifies a single large stdin burst as a
-    /// paste and *inserts* it â€” newline included â€” instead of submitting it,
+    /// paste and *inserts* it — newline included — instead of submitting it,
     /// so `write_input("text\r")` auto-submitted only sometimes. A second
     /// `write_input("\r")` issued back-to-back doesn't help either: both
     /// land in the same PTY write burst and get classified together. The
-    /// Enter has to arrive as its own burst, a human-scale delay later â€”
+    /// Enter has to arrive as its own burst, a human-scale delay later —
     /// see `PtApp::pending_submit` / `SUBMIT_DELAY` in `app.rs`, which is
     /// the only supported way to submit programmatically delivered text.
     pub fn write_input(&mut self, text: &str) {
@@ -329,7 +329,7 @@ impl TabTerm {
     }
 }
 
-// --- Task 9: tab runtime â€” spawning agents and shells -----------------------
+// --- Task 9: tab runtime — spawning agents and shells -----------------------
 //
 // `Tab` wraps a `TabTerm` with the bookkeeping the app (Task 10/11) needs to
 // render tab chrome and roll up resource usage: what kind of tab it is, its
@@ -345,8 +345,8 @@ impl TabTerm {
 pub enum TabKind { Agent, Shell }
 
 /// Parameters for [`spawn_agent`]. `main_repo_shared_md` always points at the
-/// MAIN checkout's shared context file â€” even when `isolate` is true and the
-/// agent actually runs in a worktree â€” because that file is meant to be a
+/// MAIN checkout's shared context file — even when `isolate` is true and the
+/// agent actually runs in a worktree — because that file is meant to be a
 /// single coordination point for every agent working on the repo, not one per
 /// worktree. The app computes it once via `shared_ctx::ensure_shared_md`
 /// before building this spec.
@@ -356,7 +356,7 @@ pub enum TabKind { Agent, Shell }
 /// `Some`, `spawn_agent` runs `claude --resume <sid>` with no prompt, reuses
 /// `worktree` verbatim if its path still exists on disk (the saved worktree
 /// from the tab's first spawn) instead of creating a new one, and ignores
-/// `isolate` entirely â€” a resumed session must land back in the exact cwd it
+/// `isolate` entirely — a resumed session must land back in the exact cwd it
 /// last ran in, never a fresh isolated worktree. `title`, when `Some`,
 /// overrides the slugged-prompt title (used as-is for both the tab title and
 /// `HookSetup::agent_name`); Task 5 pre-computes it with [`unique_title`] so
@@ -377,15 +377,15 @@ pub struct SpawnSpec {
     pub title: Option<String>,
     /// A worktree to reuse (resume path) rather than create. Ignored for a
     /// fresh spawn unless its path happens to exist and `resume_session` is
-    /// also `Some` â€” see the struct doc above.
+    /// also `Some` — see the struct doc above.
     pub worktree: Option<WorktreeInfo>,
 }
 
 /// A virtual child tab for one subagent invocation (Claude Code's `Task`
 /// tool) inside a parent agent tab, tracked from `PreToolUse`/`SubagentStop`
-/// hook events â€” not a real ConPTY child of its own, just bookkeeping for the
+/// hook events — not a real ConPTY child of its own, just bookkeeping for the
 /// tab strip's child row (rendered `` `- <desc> ``, see `app.rs`'s tab-strip
-/// docs â€” a live font-coverage finding swapped the original `â””` for this
+/// docs — a live font-coverage finding swapped the original `└` for this
 /// ASCII form). Consumed by Task 5 (child-tab UI + lifecycle:
 /// pushed on `PreToolUse`, `done_at` set on `SubagentStop`, finished rows
 /// cleared when the next `UserPromptSubmit` starts a new turn).
@@ -402,7 +402,7 @@ pub struct Tab {
     pub title: String,
     pub kind: TabKind,
     pub term: TabTerm,
-    /// Shell tabs stay `AgentStatus::Unknown` and render no status glyph â€”
+    /// Shell tabs stay `AgentStatus::Unknown` and render no status glyph —
     /// only agent tabs receive Claude Code hook events.
     pub status: AgentStatus,
     /// Read by Task 11's close dialog (worktree badge, merge/keep/discard).
@@ -419,11 +419,11 @@ pub struct Tab {
     pub session_id: Option<String>,
     /// `Some(saved cwd)` when this tab is a **dead placeholder** built by
     /// [`spawn_dead_tab`] on resume for a saved tab that could not be brought
-    /// back â€” either because its cwd no longer exists, or (final-review
+    /// back — either because its cwd no longer exists, or (final-review
     /// finding 3) because the real spawn itself failed. Holds the ORIGINAL
     /// saved cwd in both cases (which may well still exist in the
     /// spawn-failure case), because that is what `PtApp::persist` writes back
-    /// as the saved tab's `cwd` â€” the field is "the directory this
+    /// as the saved tab's `cwd` — the field is "the directory this
     /// placeholder stands in for", not "a directory known to be missing".
     ///
     /// Set together with [`Tab::dead_reason`] by the single constructor that
@@ -432,50 +432,56 @@ pub struct Tab {
     pub missing_dir: Option<PathBuf>,
     /// Human-readable reason this tab is a placeholder, rendered by the
     /// banner above the terminal (final-review finding 3). Always `Some`
-    /// exactly when `missing_dir` is â€” see that field's docs.
+    /// exactly when `missing_dir` is — see that field's docs.
     pub dead_reason: Option<String>,
     /// Live subagent children, oldest first; see [`SubTab`].
     pub children: Vec<SubTab>,
     /// Live worker-process rows (`resources::worker_procs` over this tab's
-    /// PID tree â€” grouped `(name, count)`), refreshed on each ~2s sampler
+    /// PID tree — grouped `(name, count)`), refreshed on each ~2s sampler
     /// snapshot for agent tabs only. Catches parallel work that never
     /// touches the subagent hooks: a script fanning out OS processes.
     pub procs: Vec<(String, usize)>,
     /// How many parsed `EventRecord`s (`hooks::parse_events`) have already
-    /// been consumed for `children` bookkeeping â€” the drain loop only looks
+    /// been consumed for `children` bookkeeping — the drain loop only looks
     /// at `records[events_seen..]` each frame.
     pub events_seen: usize,
     /// Wall-clock time of this tab's last STATUS CHANGE (Task 2: richer live
-    /// status) â€” set at construction (every spawn constructor and
+    /// status) — set at construction (every spawn constructor and
     /// [`Tab::respawn`]) and thereafter only advanced by
     /// [`next_status_and_activity`] when a freshly parsed status actually
     /// differs from the prior one. Rendered into the orchestrator's
     /// `status.md` via `messages::fmt_hms`. Deliberately NOT bumped on every
-    /// poll/frame â€” that's the whole point: it answers "when did this tab's
+    /// poll/frame — that's the whole point: it answers "when did this tab's
     /// status last change", not "when did we last look at it", which is
     /// what keeps status.md stable (no per-second churn) while a tab sits
     /// idle.
     pub last_activity: std::time::SystemTime,
 }
 
-/// Wraps compose-box text as ONE bracketed paste (`ESC[200~ â€¦ ESC[201~`).
+/// Builds the `cmd /c claude ...` argv for an agent tab: a fresh prompt-driven
+/// launch when `resume` is `None` (existing behavior — quotes stripped from
+/// the prompt since Windows' unescaped `cmd /c` would otherwise choke on
+/// them, and the prompt arg is omitted entirely when empty), or
+/// `--resume <sid>` with no prompt at all when `resume` is `Some`. `prompt`
+/// is ignored in the resume case — a resumed session continues where it left
+/// off, it isn't re-primed.
+/// Wraps compose-box text as ONE bracketed paste (`ESC[200~ … ESC[201~`).
 /// This is the input shape Claude Code's composer handles losslessly for
-/// Thai combining marks â€” per-keystroke echo corrupts them (live-probed in
+/// Thai combining marks — per-keystroke echo corrupts them (live-probed in
 /// `view.rs`'s `thai_composer_probe`: per-char typing, per-char pastes and
 /// cluster rewrites all corrupt; a whole-message bracketed paste is clean,
 /// and keystrokes after it stay clean). The submit `\r` must NOT ride
-/// along â€” same deferred-Enter rule as message delivery (`pending_submit`).
+/// along — same deferred-Enter rule as message delivery (`pending_submit`).
 pub fn bracketed_paste(text: &str) -> String {
     format!("\x1b[200~{text}\x1b[201~")
 }
 
-/// Builds the `cmd /c claude ...` argv for an agent tab: a fresh prompt-driven
-/// launch when `resume` is `None` (existing behavior â€” quotes stripped from
-/// the prompt since Windows' unescaped `cmd /c` would otherwise choke on
-/// them, and the prompt arg is omitted entirely when empty), or
-/// `--resume <sid>` with no prompt at all when `resume` is `Some`. `prompt`
-/// is ignored in the resume case â€” a resumed session continues where it left
-/// off, it isn't re-primed.
+/// True when `text` contains any character from the Thai block — the
+/// trigger for the status bar's "use the Ctrl+I compose box" hint.
+pub fn contains_thai(text: &str) -> bool {
+    text.chars().any(|c| ('\u{0E00}'..='\u{0E7F}').contains(&c))
+}
+
 pub fn agent_args(prompt: &str, resume: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = vec!["/c".into(), "claude".into()];
     match resume {
@@ -494,21 +500,21 @@ pub fn agent_args(prompt: &str, resume: Option<&str>) -> Vec<String> {
 }
 
 /// Returns `base` if it isn't in `taken`, else the first `base-2`, `base-3`,
-/// â€¦ suffix that is. Used to keep agent tab titles unique within a
+/// … suffix that is. Used to keep agent tab titles unique within a
 /// workspace (message delivery, Task 4/5, addresses agents by title, so a
 /// collision would make `to: "<title>"` ambiguous).
 ///
 /// **`"orchestrator"` is reserved (Task 4: cross-workspace message
-/// routing)** â€” treated as always-taken regardless of what's actually in
+/// routing)** — treated as always-taken regardless of what's actually in
 /// `taken`, so a normal agent slug that happens to BE `"orchestrator"` is
 /// bumped straight to `"orchestrator-2"` (or further, if that's taken too)
 /// rather than returned unchanged. The orchestrator's own tab is titled
 /// `"orchestrator"` directly (`orchestrator::new_orchestrator_workspace`), never
 /// through this function, and `messages::resolve_target` treats that literal
-/// string as unconditionally special â€” a real agent tab titled it would be
+/// string as unconditionally special — a real agent tab titled it would be
 /// unreachable by its own name and would shadow the orchestrator.
 ///
-/// **`"all"` is reserved too (Task 1: broadcast routing)** â€” same
+/// **`"all"` is reserved too (Task 1: broadcast routing)** — same
 /// always-taken treatment, since `messages::resolve_target` treats `to ==
 /// "all"` as a broadcast address, not a literal agent name. A real agent
 /// titled `"all"` would be unreachable by its own name and would silently
@@ -538,7 +544,7 @@ pub fn unique_title(base: &str, taken: &[String]) -> String {
 /// overwrites `.claude/settings.local.json` at `cwd` unconditionally. When
 /// two direct (non-isolated) agent tabs share the same checkout, the second
 /// `spawn_agent` call repoints all four hook entries at ITS
-/// `hooks::events_file` â€” last writer wins, and the older tab's events stop
+/// `hooks::events_file` — last writer wins, and the older tab's events stop
 /// arriving. This function has no way to detect or prevent that (it only
 /// sees its own call). The app-level rule, enforced by the caller
 /// (Task 10/11), is: when a direct-mode spawn targets a `cwd` where another
@@ -551,9 +557,9 @@ pub fn unique_title(base: &str, taken: &[String]) -> String {
 /// failure (`hooks::write_settings` or `TabTerm::spawn`) does not leak it:
 /// the worktree and its `pt/<slug>` branch are removed best-effort before the
 /// error is returned, and the error explains whether that rollback succeeded
-/// â€” if it didn't, it names the path that needs manual cleanup. Direct-mode
+/// — if it didn't, it names the path that needs manual cleanup. Direct-mode
 /// (`isolate: false`) spawns and resumed spawns that REUSE an existing
-/// worktree (`spec.worktree`) have nothing of their own to roll back â€” a
+/// worktree (`spec.worktree`) have nothing of their own to roll back — a
 /// resume failure must never delete the worktree an earlier, successful
 /// spawn created.
 pub fn spawn_agent(
@@ -564,7 +570,7 @@ pub fn spawn_agent(
     let slug = git::slug(&spec.prompt, id);
     let title = spec.title.clone().unwrap_or_else(|| slug.clone());
 
-    // Resume never creates a worktree â€” `isolate` is ignored entirely for it
+    // Resume never creates a worktree — `isolate` is ignored entirely for it
     // (see the SpawnSpec doc comment): reuse `spec.worktree` when its path is
     // still present on disk, else fall back to the main checkout (matches
     // how a direct-mode tab's cwd was originally chosen). A fresh spawn keeps
@@ -681,13 +687,13 @@ pub fn spawn_shell(
 ///    case), and
 /// 2. **final-review finding 3:** the real `spawn_shell`/`spawn_agent` call
 ///    returned an error. That arm used to only set `self.error` and push
-///    nothing at all, so the very next `persist()` â€” which rebuilds
-///    `saved_tabs` from the LIVE tab list â€” erased the saved tab outright,
+///    nothing at all, so the very next `persist()` — which rebuilds
+///    `saved_tabs` from the LIVE tab list — erased the saved tab outright,
 ///    taking its session id and worktree reference with it. Pushing a
 ///    placeholder instead keeps the saved record alive across the failure.
 ///
 /// Spawns a diagnostic `cmd.exe` that prints one line and exits `1` in
-/// `repo_root` (the workspace's main checkout â€” never `saved.cwd`, which in
+/// `repo_root` (the workspace's main checkout — never `saved.cwd`, which in
 /// case 1 by definition can't be a working directory) purely so the tab has
 /// something to look at and an exit code the existing exit banner can
 /// render; this is NOT a real agent/shell spawn, so no hooks are wired and
@@ -697,11 +703,11 @@ pub fn spawn_shell(
 /// would interpret rather than print. `reason` is shown by the banner
 /// directly above the terminal (`app.rs`), where it needs no escaping.
 ///
-/// Every saved field (`cwd`â†’`missing_dir`, `worktree`, `session_id`,
+/// Every saved field (`cwd`→`missing_dir`, `worktree`, `session_id`,
 /// `title`, `kind`) is carried onto the placeholder `Tab` unchanged (not
 /// reset to `None`) so a later `persist()` round-trip (`app.rs`'s `persist`,
-/// Step 2) writes the SAME `SavedTab` back out â€” `cwd: missing_dir` in
-/// particular, not `repo_root` â€” instead of quietly forgetting the original
+/// Step 2) writes the SAME `SavedTab` back out — `cwd: missing_dir` in
+/// particular, not `repo_root` — instead of quietly forgetting the original
 /// path/session/worktree. That's what lets the banner (and the option to
 /// recover once whatever broke is fixed, e.g. a remounted drive) survive
 /// another restart rather than silently downgrading to "just another
@@ -744,14 +750,14 @@ pub fn spawn_dead_tab(
 }
 
 /// Applies the subagent-child half of a batch of freshly-seen hook records
-/// to `children` (final-review finding 5 â€” extracted out of
+/// to `children` (final-review finding 5 — extracted out of
 /// `PtApp::drain_events` so the ordering rules below are testable without a
 /// live app, an egui context, or a real ConPTY child):
 ///
 /// - `PreToolUse` **with** a `tool_desc` starts a child, pushed at the back
 ///   so `children` stays oldest-first. A `PreToolUse` without one carries no
 ///   description to render and is ignored outright.
-/// - `SubagentStop` completes the OLDEST still-running child â€” the first
+/// - `SubagentStop` completes the OLDEST still-running child — the first
 ///   entry with `done_at == None` scanned from the front. Claude Code's
 ///   `SubagentStop` payload doesn't identify *which* subagent stopped, so
 ///   with N parallel children running this is a heuristic, not a fact:
@@ -763,11 +769,11 @@ pub fn spawn_dead_tab(
 ///   retroactive completion of an already-finished child).
 /// - `UserPromptSubmit` starts the agent's next turn: finished children
 ///   clear, running ones stay. This is what bounds a finished row's
-///   lifetime â€” it stays visible until the next prompt, not "3 seconds
+///   lifetime — it stays visible until the next prompt, not "3 seconds
 ///   after completion" (the old app-side prune, which made real subagent
 ///   runs read as "0 subagents" the moment anyone looked).
 ///
-/// `records` must be only the records not yet seen for this tab â€” the caller
+/// `records` must be only the records not yet seen for this tab — the caller
 /// slices `records[events_seen..]`. `now` is passed in rather than read here
 /// so every child started/stopped from one batch shares a single timestamp
 /// and tests can pin it.
@@ -800,7 +806,7 @@ impl Tab {
     /// Claims the PIDs spawned as a direct result of this tab's launch, for
     /// resource rollup. The caller (app.rs, Task 10) snapshots the set of our
     /// own child PIDs *before* spawning, then calls this with each new
-    /// sampler snapshot until `root_pids` is non-empty or 5s have passed â€”
+    /// sampler snapshot until `root_pids` is non-empty or 5s have passed —
     /// covers the delay between the ConPTY child appearing and the sampler's
     /// next ~2s poll picking it up.
     pub fn claim_pids(&mut self, before: &HashSet<u32>, snap: &[ProcSample]) {
@@ -811,12 +817,12 @@ impl Tab {
     }
 
     /// Rebuilds `self.term` in place after the child process has exited,
-    /// reusing the tab's own identity (`id`, `cwd`, `kind`) â€” this is
+    /// reusing the tab's own identity (`id`, `cwd`, `kind`) — this is
     /// Task 12's "Restart" button. Agent tabs rerun `cmd.exe /c claude`
     /// with **no initial prompt**: a restart is "bring the session back",
     /// not a re-run of whatever prompt the tab originally opened with, and
     /// the events file is truncated the same way `spawn_agent` does on
-    /// first spawn (a fresh child means a fresh event history â€” leaving
+    /// first spawn (a fresh child means a fresh event history — leaving
     /// stale events in place could make `status_from_events` report a
     /// leftover status from the dead process). Hook settings in
     /// `.claude/settings.local.json` are left untouched: `spawn_agent`
@@ -826,13 +832,13 @@ impl Tab {
     ///
     /// Also resets `root_pids` and `spawned_at` so the resource-rollup PID
     /// claim runs again for the new child. This does NOT arm a fresh PID
-    /// claim by itself â€” the caller (`app.rs`) must snapshot its own
+    /// claim by itself — the caller (`app.rs`) must snapshot its own
     /// children *before* calling `respawn` and hand that snapshot to a new
     /// `PendingClaim`, the same dance `open_tab` does for a brand-new tab.
     ///
     /// **Deliberate no-change (Task 3).** Even though this tab may have a
     /// known `session_id` by now, restart still reruns a bare `cmd /c claude`
-    /// rather than `agent_args(_, self.session_id.as_deref())` â€” i.e.
+    /// rather than `agent_args(_, self.session_id.as_deref())` — i.e.
     /// "Restart" does not `--resume`. Task 5 owns that decision (it also has
     /// to decide what happens to `session_id`/`children` display mid-restart
     /// app-wide); this task only guarantees the new bookkeeping fields reset
@@ -842,14 +848,14 @@ impl Tab {
     /// dead process.
     ///
     /// **Never call this on a dead placeholder** (`missing_dir.is_some()`,
-    /// see [`spawn_dead_tab`]) â€” final-review finding 4. A placeholder never
+    /// see [`spawn_dead_tab`]) — final-review finding 4. A placeholder never
     /// went through `spawn_agent`, so `.claude/settings.local.json` in
     /// `self.cwd` (the workspace's MAIN checkout) was never written for this
     /// tab id. Respawning an agent placeholder in place would launch a real
     /// `claude` under whatever hook settings happen to be sitting in that
     /// checkout: at best status capture is dead, at worst those settings
     /// belong to a DIFFERENT live direct-mode tab, and this session's events
-    /// would append to that tab's events file â€” where `drain_events` would
+    /// would append to that tab's events file — where `drain_events` would
     /// read them back and overwrite the other tab's `session_id`. `app.rs`
     /// routes placeholders to `respawn_missing_dir_tab` (a genuine
     /// `spawn_agent`, hook settings and all) instead, and hides the Restart
@@ -881,12 +887,12 @@ impl Tab {
 /// given its PRIOR `(status, last_activity)` and a freshly parsed `status`
 /// (Task 2: richer live status). Called from `PtApp::drain_events` right
 /// where a tab's status used to be assigned unconditionally
-/// (`if tab.status != AgentStatus::Exited { tab.status = status; }`) â€”
+/// (`if tab.status != AgentStatus::Exited { tab.status = status; }`) —
 /// this preserves that exact guard (an exited tab's status, and now its
 /// `last_activity` too, never changes again) and layers one rule on top:
 /// `last_activity` only advances to `now` when `status` actually DIFFERS
 /// from `prior_status`. An unchanged status leaves `last_activity` exactly
-/// where it was â€” this is what keeps the orchestrator's `status.md` (whose
+/// where it was — this is what keeps the orchestrator's `status.md` (whose
 /// `last active HH:MM:SS` line is `messages::fmt_hms(tab.last_activity)`)
 /// byte-identical between polls while nothing has actually changed, instead
 /// of rewriting the file (with a fresh "now") on every single poll. Pure
@@ -969,7 +975,7 @@ mod tests {
     /// visibility. Upstream asked for an *immediate* repaint on every PTY
     /// event, so one chatty background tab drove the whole app at frame rate.
     ///
-    /// The observation point is the repaint callback â€” the same hook eframe
+    /// The observation point is the repaint callback — the same hook eframe
     /// installs to decide when to run its next frame. `delay == ZERO` is
     /// "repaint now"; a non-zero delay is a lazy wake-up.
     #[test]
@@ -995,7 +1001,7 @@ mod tests {
         settle(&ctx);
         seen.lock().unwrap().clear();
 
-        // Hidden: the child keeps printing, so a repaint is requested â€” but a
+        // Hidden: the child keeps printing, so a repaint is requested — but a
         // lazy one, and never an immediate one.
         assert!(
             wait_for(|| {
@@ -1024,7 +1030,7 @@ mod tests {
     }
 
     /// Regression test for vendored delta 2: upstream's PTY forwarding thread
-    /// spun at 100% CPU forever once its event channel closed â€” which is what
+    /// spun at 100% CPU forever once its event channel closed — which is what
     /// happens when a terminal is dropped while its child is still alive, i.e.
     /// every closed tab. The thread owns a clone of the `visible` flag, so the
     /// strong count falling back to 1 is proof that it actually wound down.
@@ -1076,10 +1082,10 @@ mod tests {
 
     /// Locks in the placeholder's contract (Step 5/`app.rs`'s missing-dir
     /// banner depends on all of this): it runs in `repo_root` (never the
-    /// saved path â€” that's the whole reason it exists), always exits
+    /// saved path — that's the whole reason it exists), always exits
     /// `1` (the banner's "Respawn"/"Close" buttons only make sense once
     /// the diagnostic has finished), and carries every saved field
-    /// (`cwd`â†’`missing_dir`, `title`, `kind`, `worktree`, `session_id`)
+    /// (`cwd`→`missing_dir`, `title`, `kind`, `worktree`, `session_id`)
     /// straight onto the `Tab` unchanged so a later `persist()` round-trip
     /// doesn't quietly forget them.
     #[test]
@@ -1127,11 +1133,11 @@ mod tests {
 
     /// FINAL-REVIEW FINDING 3: a placeholder built for a *spawn failure*
     /// (not a missing directory) must carry the saved `cwd` into
-    /// `missing_dir` even though that directory still exists â€” that field is
+    /// `missing_dir` even though that directory still exists — that field is
     /// what `PtApp::persist` writes back as the saved tab's `cwd`, so
     /// anything else would silently rewrite the saved tab to point at the
     /// main checkout. The Shell kind also has to survive the
-    /// `SavedTabKind`â†’`TabKind` mapping.
+    /// `SavedTabKind`→`TabKind` mapping.
     #[test]
     fn dead_tab_for_a_spawn_failure_preserves_an_existing_saved_cwd() {
         let ctx = eframe::egui::Context::default();
@@ -1174,7 +1180,7 @@ mod tests {
     /// OLDEST still-running child, so the first stop lands on "a" and only
     /// the second lands on "b". Applied in three separate batches (the way
     /// `drain_events` sees them as the events file grows) so the
-    /// intermediate state â€” exactly one child done â€” is observable.
+    /// intermediate state — exactly one child done — is observable.
     #[test]
     fn subagent_parallel_stops_complete_oldest_first() {
         let now = Instant::now();
@@ -1195,7 +1201,7 @@ mod tests {
         assert_eq!(children.len(), 2, "stops must never add or remove rows");
     }
 
-    /// The common sequential shape â€” start/stop/start/stop in one batch â€”
+    /// The common sequential shape — start/stop/start/stop in one batch —
     /// pairs each stop with the child that was running at the time, leaving
     /// both done and in start order.
     #[test]
@@ -1239,7 +1245,7 @@ mod tests {
     }
 
     /// `PreToolUse` without a `tool_desc` carries nothing to render, so it
-    /// starts no child at all â€” and therefore must not consume a later
+    /// starts no child at all — and therefore must not consume a later
     /// `SubagentStop` either.
     #[test]
     fn subagent_pretooluse_without_tool_desc_is_ignored() {
@@ -1286,7 +1292,7 @@ mod tests {
         assert!(children[0].done_at.is_none());
     }
 
-    /// Events with no subagent meaning must pass straight through â€” the
+    /// Events with no subagent meaning must pass straight through — the
     /// status events that share the same file are the drain loop's other
     /// consumer, not this function's.
     #[test]
@@ -1301,10 +1307,10 @@ mod tests {
         assert!(children.is_empty());
     }
 
-    // --- Task 2: richer live status â€” Tab::last_activity ---------------------
+    // --- Task 2: richer live status — Tab::last_activity ---------------------
 
     /// Every real spawn constructor stamps `last_activity` at construction
-    /// time â€” seeds `messages::fmt_hms(tab.last_activity)` with a sane value
+    /// time — seeds `messages::fmt_hms(tab.last_activity)` with a sane value
     /// before any status change has ever been observed, instead of leaving
     /// it at some zero/default time.
     #[test]
@@ -1326,7 +1332,7 @@ mod tests {
 
     /// `respawn` resets `last_activity` to "now" along with every other
     /// spawn-time bookkeeping field (`root_pids`, `spawned_at`,
-    /// `session_id`, ...) â€” a stale `last_activity` surviving a restart
+    /// `session_id`, ...) — a stale `last_activity` surviving a restart
     /// would make status.md's `last active <hms>` line describe the DEAD
     /// child's last status change forever, never the fresh one's.
     #[test]
@@ -1344,7 +1350,7 @@ mod tests {
         assert!(wait_for(|| { tab.term.poll(); tab.term.exited().is_some() }), "shell never exited after respawn");
     }
 
-    // --- Task 2: richer live status â€” next_status_and_activity ---------------
+    // --- Task 2: richer live status — next_status_and_activity ---------------
     //
     // Pure and Tab-free (same reasoning as `apply_subagent_events`'s
     // extraction above): the "when does `last_activity` advance" rule is the
@@ -1355,7 +1361,7 @@ mod tests {
     const T0: std::time::SystemTime = std::time::UNIX_EPOCH;
 
     /// A freshly parsed status equal to the prior one must leave
-    /// `last_activity` untouched â€” this is what keeps status.md's `last
+    /// `last_activity` untouched — this is what keeps status.md's `last
     /// active HH:MM:SS` (and therefore the whole file) byte-identical while
     /// an agent's status hasn't actually changed.
     #[test]
@@ -1382,7 +1388,7 @@ mod tests {
 
     /// `Exited` is terminal: once a tab's prior status is `Exited`, neither
     /// `status` nor `last_activity` may change again, regardless of what a
-    /// lingering/late hook-event read parses â€” mirrors the pre-existing `if
+    /// lingering/late hook-event read parses — mirrors the pre-existing `if
     /// tab.status != AgentStatus::Exited` guard this function replaces.
     #[test]
     fn next_status_and_activity_exited_is_terminal_and_never_updates() {
@@ -1412,12 +1418,12 @@ mod tests {
     }
 
     /// Task 4 (cross-workspace message routing): `"orchestrator"` is a
-    /// reserved name â€” the orchestrator's own tab is titled it directly
+    /// reserved name — the orchestrator's own tab is titled it directly
     /// (`orchestrator::new_orchestrator_workspace`, never through `unique_title`), and
     /// `resolve_target` treats it as unconditionally special. A normal
     /// agent slug that happens to BE `"orchestrator"` must never collide
     /// with (or be mistaken for) that reserved tab, even in a workspace
-    /// where nothing named "orchestrator" is in `taken` yet â€” so this must
+    /// where nothing named "orchestrator" is in `taken` yet — so this must
     /// bump straight to `-2` rather than returning the base unchanged, the
     /// way every other base would.
     #[test]
@@ -1431,7 +1437,7 @@ mod tests {
         assert_eq!(unique_title("orchestrator", &taken), "orchestrator-3");
     }
 
-    /// Task 1 (broadcast routing): `"all"` is a second reserved name â€” it
+    /// Task 1 (broadcast routing): `"all"` is a second reserved name — it
     /// now addresses "every agent" via `resolve_target`'s `Broadcast`
     /// handling, so a normal agent slug that happens to BE `"all"` must
     /// never collide with (or be mistaken for) that reserved meaning, the
@@ -1465,10 +1471,32 @@ mod tests {
         assert_eq!(args, vec!["/c", "claude", "--resume", "sess-123"]);
     }
 
+    /// Compose-box payload: the exact bracketed-paste envelope, Thai
+    /// (multi-byte + combining marks) passed through untouched, and no
+    /// trailing `\r` — the submit Enter goes through `pending_submit`.
+    #[test]
+    fn bracketed_paste_wraps_text_verbatim() {
+        assert_eq!(
+            bracketed_paste("ลองแล้วเห็นเด้งไม่ขึ้น"),
+            "\x1b[200~ลองแล้วเห็นเด้งไม่ขึ้น\x1b[201~"
+        );
+        assert_eq!(bracketed_paste(""), "\x1b[200~\x1b[201~");
+        assert!(!bracketed_paste("x").contains('\r'));
+    }
+
+    #[test]
+    fn contains_thai_detects_the_block_only() {
+        assert!(contains_thai("ก"));
+        assert!(contains_thai("abc แล้ว xyz"));
+        assert!(contains_thai("\u{0E48}")); // a lone tone mark counts
+        assert!(!contains_thai("plain ascii"));
+        assert!(!contains_thai("日本語")); // other scripts don't trigger it
+    }
+
     /// Background-tab size sync: a spawned-but-never-rendered terminal
     /// sits at the default grid; `resize_to` must bring its PTY grid to
     /// the given layout without any render, and `applied_size` must report
-    /// it afterwards â€” while a FRESH spawn reports `None`, so the default
+    /// it afterwards — while a FRESH spawn reports `None`, so the default
     /// grid can never be propagated to peers.
     #[test]
     fn resize_to_syncs_grid_without_rendering() {
@@ -1489,18 +1517,5 @@ mod tests {
         let content = term.backend.sync();
         assert_eq!(content.terminal_size.columns(), 100);
         assert_eq!(content.terminal_size.screen_lines(), 20);
-    }
-
-    /// Compose-box payload: the exact bracketed-paste envelope, Thai
-    /// (multi-byte + combining marks) passed through untouched, and no
-    /// trailing `\r` â€” the submit Enter goes through `pending_submit`.
-    #[test]
-    fn bracketed_paste_wraps_text_verbatim() {
-        assert_eq!(
-            bracketed_paste("à¸¥à¸­à¸‡à¹à¸¥à¹‰à¸§à¹€à¸«à¹‡à¸™à¹€à¸”à¹‰à¸‡à¹„à¸¡à¹ˆà¸‚à¸¶à¹‰à¸™"),
-            "\x1b[200~à¸¥à¸­à¸‡à¹à¸¥à¹‰à¸§à¹€à¸«à¹‡à¸™à¹€à¸”à¹‰à¸‡à¹„à¸¡à¹ˆà¸‚à¸¶à¹‰à¸™\x1b[201~"
-        );
-        assert_eq!(bracketed_paste(""), "\x1b[200~\x1b[201~");
-        assert!(!bracketed_paste("x").contains('\r'));
     }
 }

@@ -366,6 +366,11 @@ pub struct PtApp {
     /// usual deferred Enter.
     pub compose_open: bool,
     pub compose_text: String,
+    /// While `Some` and in the future, the status bar shows the "Thai? use
+    /// Ctrl+I" hint — armed whenever Thai characters are typed straight
+    /// into an agent tab's terminal (where Claude Code's composer echo
+    /// corrupts them; the compose box is the safe path).
+    pub thai_hint_until: Option<std::time::Instant>,
     /// The once-per-launch update check ([`crate::update::spawn_update_check`],
     /// started in [`PtApp::new`]); `drain_events` polls it and clears it after
     /// the first answer (or a disconnect — the silent-failure case).
@@ -493,6 +498,7 @@ impl PtApp {
             pending_submit: Vec::new(),
             compose_open: false,
             compose_text: String::new(),
+            thai_hint_until: None,
             // once per launch; every failure mode is a silent no-op
             update_check: Some(crate::update::spawn_update_check()),
             update_available: None,
@@ -1821,12 +1827,28 @@ impl PtApp {
         // Compose strip: only meaningful on a live agent tab (Claude's
         // composer is the thing being worked around); a shell or placeholder
         // just ignores the toggle.
-        if compose
-            && ws.tabs.get(ws.active_tab).is_some_and(|t| {
-                t.kind == TabKind::Agent && t.missing_dir.is_none()
-            })
-        {
+        let agent_tab_active = ws
+            .tabs
+            .get(ws.active_tab)
+            .is_some_and(|t| t.kind == TabKind::Agent && t.missing_dir.is_none());
+        if compose && agent_tab_active {
             self.compose_open = !self.compose_open;
+        }
+        // Thai typed straight into an agent tab's terminal is headed for
+        // Claude Code's composer echo, which corrupts combining marks
+        // (upstream, probe-verified) — surface the Ctrl+I compose box at
+        // exactly that moment. Read-only scan; the keystrokes still go
+        // through to the terminal untouched.
+        if agent_tab_active && !self.compose_open {
+            let thai_typed = ctx.input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(e, egui::Event::Text(t) if crate::term::contains_thai(t))
+                })
+            });
+            if thai_typed {
+                self.thai_hint_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+            }
         }
         // Task 1: Ctrl+S saves the active editor tab, if any — a no-op
         // (silently) when no editor is active, same as every other shortcut
@@ -2218,6 +2240,7 @@ mod tests {
             pending_submit: Vec::new(),
             compose_open: false,
             compose_text: String::new(),
+            thai_hint_until: None,
             // tests never talk to the network: no check, no notice, no download
             update_check: None,
             update_available: None,
@@ -2317,6 +2340,7 @@ mod tests {
             pending_submit: Vec::new(),
             compose_open: false,
             compose_text: String::new(),
+            thai_hint_until: None,
             // tests never talk to the network: no check, no notice, no download
             update_check: None,
             update_available: None,
@@ -2362,6 +2386,7 @@ mod tests {
             pending_submit: Vec::new(),
             compose_open: false,
             compose_text: String::new(),
+            thai_hint_until: None,
             // tests never talk to the network: no check, no notice, no download
             update_check: None,
             update_available: None,

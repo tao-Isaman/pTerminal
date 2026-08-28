@@ -444,6 +444,17 @@ impl PtApp {
                     self.machine.cpu_pct,
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Thai-composer hint (see `PtApp::thai_hint_until`):
+                    // shown for a few seconds after Thai was typed straight
+                    // into an agent tab's terminal, where Claude Code's
+                    // composer corrupts combining marks. Amber = advisory,
+                    // same color the NeedsYou status uses.
+                    if self.thai_hint_until.is_some_and(|t| std::time::Instant::now() < t) {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 170, 40),
+                            "พิมพ์ไทย? Ctrl+I เปิดช่องพิมพ์ที่ไม่เพี้ยน",
+                        );
+                    }
                     ui.label("F2 context  Ctrl+I compose  Ctrl+T new tab");
                     // Auto-update notice (see `crate::update`): present only
                     // when the startup check found a newer release. One click
