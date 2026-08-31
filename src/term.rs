@@ -491,12 +491,6 @@ pub fn bracketed_paste(text: &str) -> String {
     format!("\x1b[200~{text}\x1b[201~")
 }
 
-/// True when `text` contains any character from the Thai block — the
-/// trigger for the status bar's "use the Ctrl+I compose box" hint.
-pub fn contains_thai(text: &str) -> bool {
-    text.chars().any(|c| ('\u{0E00}'..='\u{0E7F}').contains(&c))
-}
-
 /// Claude's context window, for the status-bar readout's denominator.
 pub const CTX_WINDOW: u64 = 200_000;
 /// Usage at which the readout (and the Handoff button) turn amber — time to
@@ -1570,15 +1564,6 @@ mod tests {
         );
         assert_eq!(bracketed_paste(""), "\x1b[200~\x1b[201~");
         assert!(!bracketed_paste("x").contains('\r'));
-    }
-
-    #[test]
-    fn contains_thai_detects_the_block_only() {
-        assert!(contains_thai("ก"));
-        assert!(contains_thai("abc แล้ว xyz"));
-        assert!(contains_thai("\u{0E48}")); // a lone tone mark counts
-        assert!(!contains_thai("plain ascii"));
-        assert!(!contains_thai("日本語")); // other scripts don't trigger it
     }
 
     /// The LAST usage-bearing line wins (context shrinks after a compact, so
