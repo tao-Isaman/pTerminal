@@ -492,14 +492,14 @@ impl PtApp {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Thai-composer hint (see `PtApp::thai_hint_until`):
-                    // shown for a few seconds after Thai was typed straight
-                    // into an agent tab's terminal, where Claude Code's
-                    // composer corrupts combining marks. Amber = advisory,
-                    // same color the NeedsYou status uses.
+                    // shown for a few seconds after Thai typed at an agent
+                    // tab auto-opened the compose box (`thai_redirect`) —
+                    // explains the box that just appeared. Amber =
+                    // advisory, same color the NeedsYou status uses.
                     if self.thai_hint_until.is_some_and(|t| std::time::Instant::now() < t) {
                         ui.colored_label(
                             egui::Color32::from_rgb(255, 170, 40),
-                            "พิมพ์ไทย? Ctrl+I เปิดช่องพิมพ์ที่ไม่เพี้ยน",
+                            "พิมพ์ไทยปลอดภัยในช่อง compose — Enter ส่ง · Esc ปิด",
                         );
                     }
                     ui.label("F2 context  Ctrl+I compose  Ctrl+T new tab");
