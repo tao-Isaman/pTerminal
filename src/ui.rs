@@ -443,6 +443,53 @@ impl PtApp {
                     self.machine.mem_total as f64 / 1e9,
                     self.machine.cpu_pct,
                 ));
+                // Context-window readout + one-click Handoff for the ACTIVE
+                // agent tab. Scoped borrow: everything the widgets need is
+                // copied out first, so `start_handoff` (`&mut self`) can run
+                // at the click.
+                let ctx_info = self
+                    .workspaces
+                    .get(self.active_ws)
+                    .and_then(|w| w.tabs.get(w.active_tab))
+                    .filter(|t| {
+                        t.kind == crate::term::TabKind::Agent
+                            && t.missing_dir.is_none()
+                            && t.term.exited().is_none()
+                    })
+                    .map(|t| (t.ctx_tokens, t.handoff_armed.is_some(),
+                              t.status == crate::hooks::AgentStatus::Working));
+                if let Some((tokens, armed, working)) = ctx_info {
+                    if let Some(used) = tokens {
+                        let color = if used >= crate::term::CTX_URGENT {
+                            egui::Color32::from_rgb(235, 95, 95) // red — hand off now
+                        } else if used >= crate::term::CTX_WARN {
+                            egui::Color32::from_rgb(255, 170, 40) // amber — think about it
+                        } else {
+                            egui::Color32::from_rgb(150, 150, 150)
+                        };
+                        ui.colored_label(
+                            color,
+                            format!("ctx {}k/{}k", used / 1000, crate::term::CTX_WINDOW / 1000),
+                        );
+                    }
+                    if armed {
+                        ui.label("handoff…");
+                    } else {
+                        // Disabled while Working: a handoff prompt pasted
+                        // mid-turn would race the in-flight turn's Stop —
+                        // see `finish_handoff`'s docs.
+                        let clicked = ui
+                            .add_enabled(!working, egui::Button::new("handoff"))
+                            .on_hover_text(
+                                "Write a handoff file, then replace this tab with a fresh \
+                                 session primed from it (context starts near zero)",
+                            )
+                            .clicked();
+                        if clicked {
+                            self.start_handoff();
+                        }
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Thai-composer hint (see `PtApp::thai_hint_until`):
                     // shown for a few seconds after Thai was typed straight

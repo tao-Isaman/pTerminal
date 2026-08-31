@@ -28,6 +28,11 @@ fn build_line(event: &str, payload: &str) -> String {
         if let Some(sid) = v.get("session_id").and_then(|x| x.as_str()) {
             obj.insert("session_id".to_string(), serde_json::json!(sid));
         }
+        // The session's transcript JSONL on disk — every hook payload names
+        // it, and it's how the app reads live context-window usage.
+        if let Some(tp) = v.get("transcript_path").and_then(|x| x.as_str()) {
+            obj.insert("transcript_path".to_string(), serde_json::json!(tp));
+        }
 
         let tool_input = v.get("tool_input");
         let desc = tool_input
@@ -72,12 +77,13 @@ mod tests {
 
     #[test]
     fn full_payload_extracts_all_fields() {
-        let payload = r#"{"session_id":"abc123","hook_event_name":"PreToolUse","tool_input":{"description":"Run tests"}}"#;
+        let payload = r#"{"session_id":"abc123","transcript_path":"C:\\Users\\x\\.claude\\projects\\p\\abc123.jsonl","hook_event_name":"PreToolUse","tool_input":{"description":"Run tests"}}"#;
         let line = build_line("PreToolUse", payload);
         let v: serde_json::Value = serde_json::from_str(&line).expect("valid json line");
         assert_eq!(v["pt"], 1);
         assert_eq!(v["event"], "PreToolUse");
         assert_eq!(v["session_id"], "abc123");
+        assert_eq!(v["transcript_path"], "C:\\Users\\x\\.claude\\projects\\p\\abc123.jsonl");
         assert_eq!(v["tool_desc"], "Run tests");
     }
 

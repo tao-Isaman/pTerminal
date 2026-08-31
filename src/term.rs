@@ -417,6 +417,21 @@ pub struct Tab {
     /// `SessionStart`/etc. hook events (`hooks::latest_session_id`). Persisted
     /// (`state::SavedTab::session_id`) so a restart can `--resume` it.
     pub session_id: Option<String>,
+    /// The session's transcript JSONL on disk, read from hook events
+    /// (`hooks::latest_transcript_path`) — the source of `ctx_tokens`. Not
+    /// persisted: a resumed session's first hook event re-delivers it.
+    pub transcript_path: Option<PathBuf>,
+    /// Live context-window usage (tokens), from the transcript's last
+    /// assistant `usage` block. `None` until the first successful read.
+    pub ctx_tokens: Option<u64>,
+    /// Transcript mtime at the last `ctx_tokens` read — the ~2s sampler tick
+    /// only re-reads the tail when this changed.
+    pub ctx_mtime: Option<std::time::SystemTime>,
+    /// `Some(click time)` while a one-click handoff is in flight: the session
+    /// has been asked to write `hooks::handoff_file(id)`, and the next `Stop`
+    /// hook event decides — file written after this instant → spawn the
+    /// primed replacement tab; no file → report and disarm.
+    pub handoff_armed: Option<std::time::SystemTime>,
     /// `Some(saved cwd)` when this tab is a **dead placeholder** built by
     /// [`spawn_dead_tab`] on resume for a saved tab that could not be brought
     /// back — either because its cwd no longer exists, or (final-review
@@ -480,6 +495,62 @@ pub fn bracketed_paste(text: &str) -> String {
 /// trigger for the status bar's "use the Ctrl+I compose box" hint.
 pub fn contains_thai(text: &str) -> bool {
     text.chars().any(|c| ('\u{0E00}'..='\u{0E7F}').contains(&c))
+}
+
+/// Claude's context window, for the status-bar readout's denominator.
+pub const CTX_WINDOW: u64 = 200_000;
+/// Usage at which the readout (and the Handoff button) turn amber — time to
+/// think about handing off.
+// ponytail: fixed thresholds, no config — user asked for "around 128k-256k";
+// make them settings if a different model/window ever matters.
+pub const CTX_WARN: u64 = 128_000;
+/// Usage at which they turn red — hand off now.
+pub const CTX_URGENT: u64 = 160_000;
+
+/// Current context usage from transcript-JSONL text: the LAST line that is a
+/// main-chain message carrying `message.usage` wins, and usage is what that
+/// turn actually held in context — `input_tokens + cache_creation_input_tokens
+/// + cache_read_input_tokens`. Lines that don't parse (including a partial
+/// first line from a mid-file tail read) or carry no usage are skipped;
+/// `isSidechain: true` lines are old-style subagent traffic, not the main
+/// conversation.
+pub fn context_tokens_from_tail(tail: &str) -> Option<u64> {
+    for line in tail.lines().rev() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue };
+        if v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
+            continue;
+        }
+        let Some(usage) = v.get("message").and_then(|m| m.get("usage")) else { continue };
+        if usage.get("input_tokens").and_then(|x| x.as_u64()).is_none() {
+            continue;
+        }
+        let n = |k: &str| usage.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        return Some(
+            n("input_tokens") + n("cache_creation_input_tokens") + n("cache_read_input_tokens"),
+        );
+    }
+    None
+}
+
+/// [`context_tokens_from_tail`] over the last 128KB of the transcript file —
+/// transcripts grow to many MB over a long session, and the answer only ever
+/// lives at the end. Any IO failure is `None`, never an error: the readout
+/// just shows nothing until the next tick.
+pub fn read_context_tokens(path: &Path) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(128 * 1024))).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    context_tokens_from_tail(&String::from_utf8_lossy(&buf))
+}
+
+/// One-click handoff, the deciding half: given when the button was clicked
+/// and the handoff file's mtime (if it exists), was the file written for
+/// THIS handoff? Called when the armed tab's `Stop` hook event arrives.
+pub fn handoff_ready(armed: std::time::SystemTime, mtime: Option<std::time::SystemTime>) -> bool {
+    mtime.is_some_and(|m| m >= armed)
 }
 
 pub fn agent_args(prompt: &str, resume: Option<&str>) -> Vec<String> {
@@ -617,6 +688,10 @@ pub fn spawn_agent(
             cpu: 0.0,
             mem: 0,
             session_id: None,
+            transcript_path: None,
+            ctx_tokens: None,
+            ctx_mtime: None,
+            handoff_armed: None,
             missing_dir: None,
             dead_reason: None,
             children: vec![],
@@ -670,6 +745,10 @@ pub fn spawn_shell(
         cpu: 0.0,
         mem: 0,
         session_id: None,
+        transcript_path: None,
+        ctx_tokens: None,
+        ctx_mtime: None,
+        handoff_armed: None,
         missing_dir: None,
         dead_reason: None,
         children: vec![],
@@ -740,6 +819,10 @@ pub fn spawn_dead_tab(
         cpu: 0.0,
         mem: 0,
         session_id: saved.session_id.clone(),
+        transcript_path: None,
+        ctx_tokens: None,
+        ctx_mtime: None,
+        handoff_armed: None,
         missing_dir: Some(saved.cwd.clone()),
         dead_reason: Some(reason),
         children: vec![],
@@ -873,6 +956,10 @@ impl Tab {
         self.root_pids = vec![];
         self.spawned_at = std::time::Instant::now();
         self.session_id = None;
+        self.transcript_path = None;
+        self.ctx_tokens = None;
+        self.ctx_mtime = None;
+        self.handoff_armed = None;
         self.missing_dir = None;
         self.dead_reason = None;
         self.children = vec![];
@@ -1173,6 +1260,7 @@ mod tests {
             event: event.to_string(),
             session_id: None,
             tool_desc: tool_desc.map(str::to_string),
+            transcript_path: None,
         }
     }
 
@@ -1491,6 +1579,62 @@ mod tests {
         assert!(contains_thai("\u{0E48}")); // a lone tone mark counts
         assert!(!contains_thai("plain ascii"));
         assert!(!contains_thai("日本語")); // other scripts don't trigger it
+    }
+
+    /// The LAST usage-bearing line wins (context shrinks after a compact, so
+    /// an old larger value must never stick), non-usage and unparseable lines
+    /// are skipped, and usage is the sum of the three input-side counters.
+    #[test]
+    fn context_tokens_takes_the_last_usage_line() {
+        let tail = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","usage":{"input_tokens":5,"cache_creation_input_tokens":1000,"cache_read_input_tokens":150000,"output_tokens":9}}}"#, "\n",
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#, "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","usage":{"input_tokens":3,"cache_creation_input_tokens":200,"cache_read_input_tokens":40000,"output_tokens":7}}}"#, "\n",
+            "not json at all\n",
+        );
+        assert_eq!(context_tokens_from_tail(tail), Some(3 + 200 + 40000));
+    }
+
+    /// A tail read starts mid-file, so the first line is usually a truncated
+    /// JSON fragment — it must be skipped, not poison the scan. Sidechain
+    /// lines (old-style in-file subagent traffic) don't represent the main
+    /// conversation's context and are skipped too.
+    #[test]
+    fn context_tokens_skips_partial_first_line_and_sidechains() {
+        let tail = concat!(
+            r#"reation_input_tokens":9,"cache_read_input_tokens":99999}}}"#, "\n",
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":500}}}"#, "\n",
+            r#"{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":7777,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#, "\n",
+        );
+        assert_eq!(context_tokens_from_tail(tail), Some(510));
+        assert_eq!(context_tokens_from_tail("no usage anywhere\n"), None);
+        assert_eq!(context_tokens_from_tail(""), None);
+    }
+
+    #[test]
+    fn read_context_tokens_reads_a_real_file_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":1,"cache_creation_input_tokens":2,"cache_read_input_tokens":3}}}"#,
+        )
+        .expect("write transcript");
+        assert_eq!(read_context_tokens(&path), Some(6));
+        assert_eq!(read_context_tokens(&dir.path().join("missing.jsonl")), None);
+    }
+
+    #[test]
+    fn handoff_ready_wants_a_file_written_after_arming() {
+        use std::time::{Duration, SystemTime};
+        let armed = SystemTime::now();
+        assert!(!handoff_ready(armed, None), "no file → not ready");
+        assert!(
+            !handoff_ready(armed, Some(armed - Duration::from_secs(60))),
+            "a stale file from before the click must not count"
+        );
+        assert!(handoff_ready(armed, Some(armed + Duration::from_secs(1))));
+        assert!(handoff_ready(armed, Some(armed)), "same-instant mtime counts (coarse clocks)");
     }
 
     /// Background-tab size sync: a spawned-but-never-rendered terminal
