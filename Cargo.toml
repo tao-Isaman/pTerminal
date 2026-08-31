@@ -1,6 +1,6 @@
 [package]
 name = "pterminal"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 # `src/bin/pterm_hook.rs` adds a second binary target; pin `cargo run` to the
 # GUI app so it stays unambiguous without an explicit `--bin`.
