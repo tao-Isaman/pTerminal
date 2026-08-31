@@ -1878,22 +1878,11 @@ impl PtApp {
         if compose && agent_tab_active {
             self.compose_open = !self.compose_open;
         }
-        // Thai typed straight into an agent tab's terminal is headed for
-        // Claude Code's composer echo, which corrupts combining marks
-        // (upstream, probe-verified) — surface the Ctrl+I compose box at
-        // exactly that moment. Read-only scan; the keystrokes still go
-        // through to the terminal untouched.
-        if agent_tab_active && !self.compose_open {
-            let thai_typed = ctx.input(|i| {
-                i.events.iter().any(|e| {
-                    matches!(e, egui::Event::Text(t) if crate::term::contains_thai(t))
-                })
-            });
-            if thai_typed {
-                self.thai_hint_until =
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
-            }
-        }
+        // Thai typed straight into an agent tab used to only raise a status
+        // bar hint here; it now auto-redirects into the compose box — see
+        // `thai_redirect`, which runs in `update` AFTER the terminal-focus
+        // bool is computed (it must not steal text belonging to a dialog,
+        // the F2 panel, or an editor tab).
         // Task 1: Ctrl+S saves the active editor tab, if any — a no-op
         // (silently) when no editor is active, same as every other shortcut
         // here that only fires when its target actually exists.
@@ -2190,6 +2179,85 @@ impl PtApp {
     }
 }
 
+/// Removes every `Event::Text` from `events` and returns their
+/// concatenation in order — the "move the keystrokes into the compose box"
+/// half of the Thai auto-redirect ([`PtApp::thai_redirect`]).
+pub(crate) fn take_text_events(events: &mut Vec<egui::Event>) -> String {
+    let mut out = String::new();
+    events.retain(|e| match e {
+        egui::Event::Text(t) => {
+            out.push_str(t);
+            false
+        }
+        _ => true,
+    });
+    out
+}
+
+/// Decides whether this frame's text events belong to the compose box
+/// rather than the terminal. Box closed: only a Thai keystroke triggers
+/// (and opens it) — ASCII keeps flowing to the terminal untouched. Box
+/// open: harvest exactly while NO widget holds keyboard focus — the 1-2
+/// frame handover after the box opens, where the terminal has surrendered
+/// egui focus but the strip's `TextEdit` hasn't grabbed it yet; without
+/// this, characters typed in that gap would silently vanish. Once the
+/// `TextEdit` holds focus it consumes text events itself and this returns
+/// `false`.
+pub(crate) fn should_take_text(compose_open: bool, focus_vacant: bool, thai_typed: bool) -> bool {
+    if compose_open { focus_vacant } else { thai_typed }
+}
+
+impl PtApp {
+    /// Thai-typing auto-redirect: Claude Code's composer echo corrupts
+    /// per-keystroke Thai combining marks (upstream — probe re-verified
+    /// against claude v2.1.250 on 2026-08-31: the typed-phase composer row
+    /// still mangles marks while a whole-message bracketed paste stays
+    /// clean, `thai_composer_probe`). The old status-bar hint asked the
+    /// user to open Ctrl+I themselves; this doesn't wait — the moment a
+    /// Thai `Event::Text` is headed for a live agent tab's terminal, the
+    /// compose box opens, this frame's typed text moves into it, and the
+    /// broken path is never exercised.
+    ///
+    /// `focused` is `update`'s terminal-focus bool: `false` means a
+    /// dialog, the F2 panel, or an editor owns the keyboard, and their
+    /// text must never be stolen. The active-editor and subagent-pane
+    /// guards cover the two central-panel takeovers where the compose
+    /// strip wouldn't render — harvesting into an invisible box would eat
+    /// keystrokes.
+    fn thai_redirect(&mut self, ctx: &egui::Context, focused: bool) {
+        if !focused || self.selected_child.is_some() {
+            return;
+        }
+        let Some(ws) = self.workspaces.get(self.active_ws) else { return };
+        if ws.active_editor.is_some() {
+            return;
+        }
+        let live_agent = ws.tabs.get(ws.active_tab).is_some_and(|t| {
+            t.kind == TabKind::Agent && t.missing_dir.is_none() && t.term.exited().is_none()
+        });
+        if !live_agent {
+            return;
+        }
+        let focus_vacant = ctx.memory(|m| m.focused().is_none());
+        let thai_typed = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Text(t) if crate::term::contains_thai(t)))
+        });
+        if should_take_text(self.compose_open, focus_vacant, thai_typed) {
+            let taken = ctx.input_mut(|i| take_text_events(&mut i.events));
+            if !taken.is_empty() {
+                self.compose_text.push_str(&taken);
+                self.compose_open = true;
+                // Same amber hint, retargeted: it now explains the box that
+                // just appeared instead of asking the user to open it.
+                self.thai_hint_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+            }
+        }
+    }
+}
+
 impl eframe::App for PtApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // eframe/egui 0.31 is reactive by default: `update` only re-runs when
@@ -2267,6 +2335,9 @@ impl eframe::App for PtApp {
             && self.error.is_none()
             && !self.ctx_panel_has_focus
             && !self.editor_has_focus;
+        // Steal Thai-bound text events BEFORE central_ui renders the
+        // terminal view (which would otherwise write them to the PTY).
+        self.thai_redirect(ctx, focused);
         self.central_ui(ctx, focused);
     }
 }
@@ -3738,6 +3809,41 @@ mod tests {
         let repo = dir.path().to_path_buf();
 
         assert_eq!(agent_readme_for_spawn(false, false, &repo), None);
+    }
+
+    /// Thai auto-redirect, the "move the keystrokes" half: only
+    /// `Event::Text` entries are removed (in order), everything else —
+    /// key presses, pointer events — stays for the widgets that need it.
+    #[test]
+    fn take_text_events_removes_and_concatenates_text_events_only() {
+        let mut events = vec![
+            egui::Event::Text("ส".to_string()),
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Text("วัสดี".to_string()),
+        ];
+        assert_eq!(take_text_events(&mut events), "สวัสดี");
+        assert_eq!(events.len(), 1, "non-text events must survive");
+        assert!(matches!(events[0], egui::Event::Key { .. }));
+        assert_eq!(take_text_events(&mut events), "", "no text events → nothing taken");
+    }
+
+    /// Thai auto-redirect, the deciding half: closed box steals only on a
+    /// Thai keystroke (ASCII keeps flowing to the terminal); open box
+    /// harvests exactly during the focus-handover vacancy, and stands down
+    /// once any widget (the strip's TextEdit) holds focus.
+    #[test]
+    fn should_take_text_truth_table() {
+        assert!(should_take_text(false, true, true));
+        assert!(should_take_text(false, false, true));
+        assert!(!should_take_text(false, true, false), "ASCII with box closed → terminal's");
+        assert!(should_take_text(true, true, false), "handover gap → harvest even ASCII");
+        assert!(!should_take_text(true, false, true), "TextEdit focused → it consumes text itself");
     }
 
     /// One-click handoff, arming half: on a live agent tab `start_handoff`
