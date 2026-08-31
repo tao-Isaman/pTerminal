@@ -644,44 +644,77 @@ impl PtApp {
                     // `self` fields: `tab` borrows `self.workspaces`,
                     // history is its own field.
                     let is_shell = tab.kind == crate::term::TabKind::Shell;
-                    // Thai-safe compose strip (Ctrl+I, agent tabs): Claude
-                    // Code's composer corrupts per-keystroke Thai combining
-                    // marks (probe-verified: `thai_composer_probe`), so the
-                    // message is typed here — a normal egui field — and sent
-                    // as ONE bracketed paste (`term::bracketed_paste`, the
-                    // proven-clean insert shape) plus the same deferred
-                    // Enter message delivery already uses. `compose_text` /
-                    // `pending_submit` are disjoint `self` fields from the
-                    // `tab` borrow, same pattern as `history` below.
-                    if self.compose_open && !is_shell && !placeholder && tab.term.exited().is_none() {
+                    // pTerminal's own input bar, docked at the BOTTOM of
+                    // every live agent tab (user-requested layout, replacing
+                    // the old Ctrl+I top strip): text typed here never
+                    // touches Claude Code's composer until submitted, so its
+                    // per-keystroke echo (which garbles Thai combining
+                    // marks — upstream, probe-verified in
+                    // `thai_composer_probe`) can't corrupt anything. Enter
+                    // sends the whole box as ONE bracketed paste
+                    // (`term::bracketed_paste`, the proven-clean shape) plus
+                    // the same deferred Enter message delivery uses;
+                    // Shift+Enter breaks the line inside the box; Esc
+                    // forwards an interrupt (the bare ESC byte) to claude.
+                    // Clicking the terminal grid steals egui focus back for
+                    // raw interactions (menus, trust prompts, shift+tab) —
+                    // the bar only owns the keyboard while its TextEdit
+                    // holds focus. `compose_text`/`pending_submit`/
+                    // `input_bar_has_focus` are disjoint `self` fields from
+                    // the `tab` borrow, same pattern as `history` below.
+                    if !is_shell && !placeholder && tab.term.exited().is_none() {
+                        // Consumed BEFORE the TextEdit sees them: a bare
+                        // Enter must send (not insert a newline), and Esc
+                        // must interrupt claude (not just drop the
+                        // TextEdit's focus). Shift+Enter is left alone — the
+                        // TextEdit inserts that newline itself. Gated on
+                        // the bar actually holding focus, so the terminal's
+                        // own Enter/Esc handling is untouched when typing
+                        // directly into the grid.
+                        let entered = self.input_bar_has_focus
+                            && ui.input_mut(|i| {
+                                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                            });
+                        let esc = self.input_bar_has_focus
+                            && ui.input_mut(|i| {
+                                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                            });
                         let mut send: Option<String> = None;
-                        ui.horizontal(|ui| {
-                            ui.label("compose:");
-                            let resp = ui.add_sized(
-                                [ui.available_width() - 56.0, 20.0],
-                                egui::TextEdit::singleline(&mut self.compose_text)
-                                    .hint_text("Enter ส่ง · Esc ปิด — sent as one paste"),
-                            );
-                            // Grab the keyboard when nothing else holds it
-                            // (the terminal is told to stand down while the
-                            // strip is open — see the `focused &&` below).
-                            if !resp.has_focus() && ui.memory(|m| m.focused().is_none()) {
-                                resp.request_focus();
-                            }
-                            let entered = resp.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            if ui.button("send").clicked() || entered {
-                                let text = self.compose_text.trim().to_string();
-                                if !text.is_empty() {
-                                    send = Some(text);
-                                    self.compose_text.clear();
-                                }
-                                resp.request_focus(); // stay ready for the next message
-                            }
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                self.compose_open = false;
-                            }
-                        });
+                        egui::TopBottomPanel::bottom(egui::Id::new(("input_bar", tab.id)))
+                            .show_inside(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    // Grow with content up to 5 rows; the
+                                    // resize debounce absorbs the terminal
+                                    // grid change when the height moves.
+                                    let rows =
+                                        self.compose_text.lines().count().clamp(1, 5);
+                                    let resp = ui.add_sized(
+                                        [
+                                            ui.available_width() - 56.0,
+                                            8.0 + 18.0 * rows as f32,
+                                        ],
+                                        egui::TextEdit::multiline(&mut self.compose_text)
+                                            .hint_text(
+                                                "Enter ส่ง · Shift+Enter ขึ้นบรรทัด · Esc หยุด claude",
+                                            ),
+                                    );
+                                    if ui.button("send").clicked() || entered {
+                                        let text = self.compose_text.trim().to_string();
+                                        if !text.is_empty() {
+                                            send = Some(text);
+                                            self.compose_text.clear();
+                                        }
+                                        resp.request_focus(); // stay ready for the next message
+                                    }
+                                    if self.focus_input_bar {
+                                        resp.request_focus(); // Ctrl+I
+                                    }
+                                    self.input_bar_has_focus = resp.has_focus();
+                                });
+                            });
+                        if esc {
+                            tab.term.write_input("\x1b");
+                        }
                         if let Some(text) = send {
                             tab.term.write_input(&crate::term::bracketed_paste(&text));
                             let tab_id = tab.id;
@@ -690,7 +723,14 @@ impl PtApp {
                                 std::time::Instant::now() + crate::app::SUBMIT_DELAY,
                             ));
                         }
+                    } else {
+                        // No bar rendered (shell / placeholder / exited):
+                        // deterministic reset, same convention as
+                        // `ctx_panel_has_focus`, so a stale `true` can't
+                        // starve the terminal of keyboard focus.
+                        self.input_bar_has_focus = false;
                     }
+                    self.focus_input_bar = false; // one-frame request, always consumed
                     let history = if is_shell { Some(&mut self.history) } else { None };
                     // Shift+Enter newline: PowerShell continues a line with a
                     // trailing backtick; Claude Code inserts a newline on a
@@ -698,8 +738,10 @@ impl PtApp {
                     // and CSI-u all insert; LF is the cleanest — one byte,
                     // no continuation character involved).
                     let shift_enter: &[u8] = if is_shell { b"`\r" } else { b"\n" };
-                    // The compose strip owns the keyboard while open.
-                    let term_focused = focused && !(self.compose_open && !is_shell);
+                    // The input bar owns the keyboard while its TextEdit
+                    // holds egui focus (set just above, this same frame —
+                    // the bar renders before the terminal).
+                    let term_focused = focused && !self.input_bar_has_focus;
                     let open_req = tab.term.ui(ui, term_focused, history, shift_enter); // only the ACTIVE tab renders — spec perf requirement
                     // Ctrl+click on a file path in the terminal (see the
                     // backend's path-hover logic): open it in an editor tab
