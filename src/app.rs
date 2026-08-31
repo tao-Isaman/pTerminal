@@ -359,13 +359,23 @@ pub struct PtApp {
     /// own event. Fixing it properly means deferring the message *text* too,
     /// i.e. a per-tab delivery FIFO; deliberately out of scope for this fix.
     pub pending_submit: Vec<(u64, std::time::Instant)>,
-    /// Thai-safe compose box (Ctrl+I on an agent tab): Claude Code's
-    /// composer corrupts per-keystroke Thai combining marks (probe-verified,
-    /// see `term::bracketed_paste`), so this strip lets a message be typed
-    /// in a normal egui field and sent as one clean bracketed paste + the
-    /// usual deferred Enter.
-    pub compose_open: bool,
+    /// pTerminal's own input bar, docked at the BOTTOM of every live agent
+    /// tab (user-requested layout): text is composed in a normal egui field
+    /// and sent to claude as ONE bracketed paste + the usual deferred
+    /// Enter, so Claude Code's composer echo (which garbles per-keystroke
+    /// Thai combining marks — upstream, probe-verified in
+    /// `thai_composer_probe`) never sees individual keystrokes.
+    /// `compose_text` is the bar's buffer.
     pub compose_text: String,
+    /// Mirrors the bar TextEdit's egui focus, set every frame the bar
+    /// renders (same convention as `ctx_panel_has_focus`); the terminal
+    /// stands down while `true`, and clicking the terminal grid naturally
+    /// steals egui focus back for raw interactions (menus, trust prompts,
+    /// shift+tab).
+    pub input_bar_has_focus: bool,
+    /// One-frame focus request for the bar (Ctrl+I), consumed by the bar's
+    /// render pass the same frame `shortcuts` sets it.
+    pub focus_input_bar: bool,
     /// The once-per-launch update check ([`crate::update::spawn_update_check`],
     /// started in [`PtApp::new`]); `drain_events` polls it and clears it after
     /// the first answer (or a disconnect — the silent-failure case).
@@ -491,8 +501,10 @@ impl PtApp {
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
-            compose_open: false,
-            compose_text: String::new(),            // once per launch; every failure mode is a silent no-op
+            compose_text: String::new(),
+            input_bar_has_focus: false,
+            focus_input_bar: false,
+            // once per launch; every failure mode is a silent no-op
             update_check: Some(crate::update::spawn_update_check()),
             update_available: None,
             update_download: None,
@@ -1861,23 +1873,22 @@ impl PtApp {
             ws.active_tab = (ws.active_tab + 1) % ws.tabs.len();
             self.selected_child = None; // Step 8: a keyboard tab switch clears it too
         }
-        // Compose strip: only meaningful on a live agent tab (Claude's
-        // composer is the thing being worked around); a shell or placeholder
-        // just ignores the toggle.
+        // Ctrl+I: focus the bottom input bar (only meaningful on a live
+        // agent tab — a shell or placeholder has no bar to focus). The bar
+        // itself is always visible on agent tabs; this just hands it the
+        // keyboard without reaching for the mouse.
         let agent_tab_active = ws
             .tabs
             .get(ws.active_tab)
             .is_some_and(|t| t.kind == TabKind::Agent && t.missing_dir.is_none());
         if compose && agent_tab_active {
-            self.compose_open = !self.compose_open;
+            self.focus_input_bar = true;
         }
-        // Thai typed straight into an agent tab flows through untouched —
-        // BY USER CHOICE (0.1.18): the 0.1.17 auto-redirect into the compose
-        // box was removed on request ("อยากให้พิมพ์ในแชทได้ปกติ"). Claude
-        // Code's composer echo still garbles Thai marks while typing
-        // (upstream, `thai_composer_probe`), but its internal buffer stays
-        // correct, so submits are intact; Ctrl+I above remains the opt-in
-        // clean path. Don't reintroduce interception here.
+        // Typing into the terminal grid itself still flows through
+        // untouched — clicking the grid is the raw path for menus, trust
+        // prompts and shift+tab. The 0.1.17 keystroke interception stays
+        // removed (user choice); the bottom input bar is where composed
+        // messages are typed safely instead.
         // Task 1: Ctrl+S saves the active editor tab, if any — a no-op
         // (silently) when no editor is active, same as every other shortcut
         // here that only fires when its target actually exists.
@@ -2380,8 +2391,10 @@ mod tests {
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
-            compose_open: false,
-            compose_text: String::new(),            // tests never talk to the network: no check, no notice, no download
+            compose_text: String::new(),
+            input_bar_has_focus: false,
+            focus_input_bar: false,
+            // tests never talk to the network: no check, no notice, no download
             update_check: None,
             update_available: None,
             update_download: None,
@@ -2478,8 +2491,10 @@ mod tests {
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
-            compose_open: false,
-            compose_text: String::new(),            // tests never talk to the network: no check, no notice, no download
+            compose_text: String::new(),
+            input_bar_has_focus: false,
+            focus_input_bar: false,
+            // tests never talk to the network: no check, no notice, no download
             update_check: None,
             update_available: None,
             update_download: None,
@@ -2522,8 +2537,10 @@ mod tests {
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
-            compose_open: false,
-            compose_text: String::new(),            // tests never talk to the network: no check, no notice, no download
+            compose_text: String::new(),
+            input_bar_has_focus: false,
+            focus_input_bar: false,
+            // tests never talk to the network: no check, no notice, no download
             update_check: None,
             update_available: None,
             update_download: None,
