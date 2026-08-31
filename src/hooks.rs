@@ -25,6 +25,9 @@ pub struct EventRecord {
     pub event: String,
     pub session_id: Option<String>,
     pub tool_desc: Option<String>,
+    /// Path of the session's transcript JSONL (every hook payload carries
+    /// `transcript_path`) — how the app reads live context-window usage.
+    pub transcript_path: Option<String>,
 }
 
 const KNOWN_EVENTS: [&str; 6] = [
@@ -74,6 +77,7 @@ pub fn parse_events(contents: &str) -> Vec<EventRecord> {
                 event: event.to_string(),
                 session_id: v.get("session_id").and_then(|s| s.as_str()).map(str::to_string),
                 tool_desc: v.get("tool_desc").and_then(|s| s.as_str()).map(str::to_string),
+                transcript_path: v.get("transcript_path").and_then(|s| s.as_str()).map(str::to_string),
             });
             continue;
         }
@@ -83,12 +87,24 @@ pub fn parse_events(contents: &str) -> Vec<EventRecord> {
                 event,
                 session_id: extract_marker(line, "\"session_id\":\""),
                 tool_desc: None,
+                // The raw-payload format is JSON text scanned without a
+                // parser, so a Windows path arrives with its backslashes
+                // still JSON-escaped (`C:\\Users\\...`) — undo just that.
+                // ponytail: only `\\` is unescaped; a path with a literal
+                // `\"` or `\n` in it doesn't happen on real filesystems.
+                transcript_path: extract_marker(line, "\"transcript_path\":\"")
+                    .map(|p| p.replace("\\\\", "\\")),
             });
             continue;
         }
 
         if KNOWN_EVENTS.contains(&line) {
-            out.push(EventRecord { event: line.to_string(), session_id: None, tool_desc: None });
+            out.push(EventRecord {
+                event: line.to_string(),
+                session_id: None,
+                tool_desc: None,
+                transcript_path: None,
+            });
         }
     }
     out
@@ -99,6 +115,20 @@ pub fn parse_events(contents: &str) -> Vec<EventRecord> {
 /// clone on every hook event just to (usually) throw the copy away.
 pub fn latest_session_id(records: &[EventRecord]) -> Option<&str> {
     records.iter().rev().find_map(|r| r.session_id.as_deref())
+}
+
+/// The transcript path from the last record that carries one, if any —
+/// same borrow rationale as [`latest_session_id`].
+pub fn latest_transcript_path(records: &[EventRecord]) -> Option<&str> {
+    records.iter().rev().find_map(|r| r.transcript_path.as_deref())
+}
+
+/// Where a tab's handoff document lands: the one-click handoff button asks
+/// the running session to write this file, then a fresh session is spawned
+/// primed to read it. Lives next to the events files so it needs no new
+/// directory handling.
+pub fn handoff_file(tab_id: u64) -> PathBuf {
+    events_dir().join(format!("handoff-{tab_id}.md"))
 }
 
 /// Status from the last record whose event maps to one (`UserPromptSubmit`→
@@ -518,17 +548,45 @@ mod tests {
     #[test]
     fn latest_session_id_finds_last_present() {
         let records = vec![
-            EventRecord { event: "SessionStart".into(), session_id: Some("first".into()), tool_desc: None },
-            EventRecord { event: "PreToolUse".into(), session_id: None, tool_desc: Some("desc".into()) },
-            EventRecord { event: "Stop".into(), session_id: Some("last".into()), tool_desc: None },
+            EventRecord { event: "SessionStart".into(), session_id: Some("first".into()), tool_desc: None, transcript_path: None },
+            EventRecord { event: "PreToolUse".into(), session_id: None, tool_desc: Some("desc".into()), transcript_path: None },
+            EventRecord { event: "Stop".into(), session_id: Some("last".into()), tool_desc: None, transcript_path: None },
         ];
         assert_eq!(latest_session_id(&records), Some("last"));
     }
 
     #[test]
     fn latest_session_id_none_when_absent() {
-        let records = vec![EventRecord { event: "Stop".into(), session_id: None, tool_desc: None }];
+        let records = vec![EventRecord { event: "Stop".into(), session_id: None, tool_desc: None, transcript_path: None }];
         assert_eq!(latest_session_id(&records), None);
+    }
+
+    #[test]
+    fn parse_events_reads_transcript_path_from_both_json_formats() {
+        // pt:1 line: proper JSON parse, backslashes come out real.
+        let pt1 = r#"{"pt":1,"event":"Stop","transcript_path":"C:\\u\\s.jsonl"}"#;
+        let records = parse_events(pt1);
+        assert_eq!(records[0].transcript_path.as_deref(), Some("C:\\u\\s.jsonl"));
+
+        // Raw-payload line: marker scan sees the JSON-escaped text, so the
+        // `\\` → `\` unescape must happen here.
+        let raw = "C:\\wt\\a>{\"session_id\":\"x\",\"transcript_path\":\"C:\\\\u\\\\s.jsonl\",\"hook_event_name\":\"Stop\"}\r\n";
+        let records = parse_events(raw);
+        assert_eq!(records[0].transcript_path.as_deref(), Some("C:\\u\\s.jsonl"));
+
+        // Bare event name: no transcript path to be had.
+        assert_eq!(parse_events("Stop\n")[0].transcript_path, None);
+    }
+
+    #[test]
+    fn latest_transcript_path_finds_last_present() {
+        let records = parse_events(concat!(
+            "{\"pt\":1,\"event\":\"SessionStart\",\"transcript_path\":\"C:\\\\old.jsonl\"}\n",
+            "{\"pt\":1,\"event\":\"UserPromptSubmit\"}\n",
+            "{\"pt\":1,\"event\":\"Stop\",\"transcript_path\":\"C:\\\\new.jsonl\"}\n",
+        ));
+        assert_eq!(latest_transcript_path(&records), Some("C:\\new.jsonl"));
+        assert_eq!(latest_transcript_path(&parse_events("Stop\n")), None);
     }
 
     /// Final-review finding 6: `drain_events` now derives status from the
