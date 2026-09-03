@@ -2606,7 +2606,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "pterminal"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "ab_glyph",
  "alacritty_terminal",
