@@ -937,6 +937,14 @@ impl Tab {
     /// routes placeholders to `respawn_missing_dir_tab` (a genuine
     /// `spawn_agent`, hook settings and all) instead, and hides the Restart
     /// button for them so the path isn't reachable from the UI at all.
+    /// True when this tab renders the bottom input bar (`ui::input_bar`):
+    /// a live agent tab — not a shell, not a dead placeholder, not exited.
+    /// The one definition `central_ui` (whether to draw it) and the
+    /// background size-sync (how much terrain it takes) both read.
+    pub fn has_input_bar(&self) -> bool {
+        self.kind == TabKind::Agent && self.missing_dir.is_none() && self.term.exited().is_none()
+    }
+
     pub fn respawn(&mut self, ctx: &eframe::egui::Context) -> anyhow::Result<()> {
         let term = match self.kind {
             TabKind::Agent => {
