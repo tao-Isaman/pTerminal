@@ -376,6 +376,14 @@ pub struct PtApp {
     /// One-frame focus request for the bar (Ctrl+I), consumed by the bar's
     /// render pass the same frame `shortcuts` sets it.
     pub focus_input_bar: bool,
+    /// Height the bar's panel occupied at its last render, logical px —
+    /// exactly what an agent tab's terminal grid loses to it. The
+    /// background size-sync in `drain_events` adds/subtracts it when the
+    /// active and background tabs differ in having a bar, so a shell↔agent
+    /// switch never lands as a PTY resize (each one forces a TUI repaint
+    /// that leaves junk rows — upstream ConPTY). Starts at
+    /// `ui::INPUT_BAR_PX_SEED` so the very first switch is exact too.
+    pub input_bar_px: f32,
     /// The once-per-launch update check ([`crate::update::spawn_update_check`],
     /// started in [`PtApp::new`]); `drain_events` polls it and clears it after
     /// the first answer (or a disconnect — the silent-failure case).
@@ -504,6 +512,7 @@ impl PtApp {
             compose_text: String::new(),
             input_bar_has_focus: false,
             focus_input_bar: false,
+            input_bar_px: crate::ui::INPUT_BAR_PX_SEED,
             // once per launch; every failure mode is a silent no-op
             update_check: Some(crate::update::spawn_update_check()),
             update_available: None,
@@ -1416,11 +1425,19 @@ impl PtApp {
         // tab's applied size; `resize_to`'s lock-free `needs_resize` gate
         // makes the steady state free, and reading the APPLIED size means
         // background tabs follow the debounced value, never a mid-drag one.
-        let active_size = self
+        let active_tab = self
             .workspaces
             .get(self.active_ws)
-            .and_then(|ws| ws.tabs.get(ws.active_tab))
-            .and_then(|t| t.term.applied_size());
+            .and_then(|ws| ws.tabs.get(ws.active_tab));
+        let active_size = active_tab.and_then(|t| t.term.applied_size());
+        // Since 0.1.19 a live agent tab renders the bottom input bar and a
+        // shell tab doesn't, so their terminal rects differ by exactly
+        // `input_bar_px`. Syncing the active tab's raw size across that
+        // difference made every shell↔agent switch a PTY resize (= a TUI
+        // repaint that leaves junk rows behind, upstream ConPTY) — adjust
+        // the height so each background tab gets the size IT will render at.
+        let active_has_bar = active_tab.is_some_and(term::Tab::has_input_bar);
+        let bar_px = self.input_bar_px;
         let (active_ws_idx, active_tab_idx) = (
             self.active_ws,
             self.workspaces.get(self.active_ws).map(|w| w.active_tab).unwrap_or(0),
@@ -1432,10 +1449,15 @@ impl PtApp {
         for (ws_idx, ws) in self.workspaces.iter_mut().enumerate() {
             for (tab_idx, tab) in ws.tabs.iter_mut().enumerate() {
                 tab.term.poll();
-                if let Some((l, f)) = active_size {
+                if let Some((mut l, f)) = active_size {
                     if !(ws_idx == active_ws_idx && tab_idx == active_tab_idx)
                         && tab.term.exited().is_none()
                     {
+                        match (active_has_bar, tab.has_input_bar()) {
+                            (false, true) => l.height -= bar_px,
+                            (true, false) => l.height += bar_px,
+                            _ => {}
+                        }
                         tab.term.resize_to(l, f);
                     }
                 }
@@ -2394,6 +2416,7 @@ mod tests {
             compose_text: String::new(),
             input_bar_has_focus: false,
             focus_input_bar: false,
+            input_bar_px: crate::ui::INPUT_BAR_PX_SEED,
             // tests never talk to the network: no check, no notice, no download
             update_check: None,
             update_available: None,
@@ -2494,6 +2517,7 @@ mod tests {
             compose_text: String::new(),
             input_bar_has_focus: false,
             focus_input_bar: false,
+            input_bar_px: crate::ui::INPUT_BAR_PX_SEED,
             // tests never talk to the network: no check, no notice, no download
             update_check: None,
             update_available: None,
@@ -2540,6 +2564,7 @@ mod tests {
             compose_text: String::new(),
             input_bar_has_focus: false,
             focus_input_bar: false,
+            input_bar_px: crate::ui::INPUT_BAR_PX_SEED,
             // tests never talk to the network: no check, no notice, no download
             update_check: None,
             update_available: None,

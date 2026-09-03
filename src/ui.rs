@@ -679,39 +679,16 @@ impl PtApp {
                             && ui.input_mut(|i| {
                                 i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
                             });
-                        let mut send: Option<String> = None;
-                        egui::TopBottomPanel::bottom(egui::Id::new(("input_bar", tab.id)))
-                            .show_inside(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    // Grow with content up to 5 rows; the
-                                    // resize debounce absorbs the terminal
-                                    // grid change when the height moves.
-                                    let rows =
-                                        self.compose_text.lines().count().clamp(1, 5);
-                                    let resp = ui.add_sized(
-                                        [
-                                            ui.available_width() - 56.0,
-                                            8.0 + 18.0 * rows as f32,
-                                        ],
-                                        egui::TextEdit::multiline(&mut self.compose_text)
-                                            .hint_text(
-                                                "Enter ส่ง · Shift+Enter ขึ้นบรรทัด · Esc หยุด claude",
-                                            ),
-                                    );
-                                    if ui.button("send").clicked() || entered {
-                                        let text = self.compose_text.trim().to_string();
-                                        if !text.is_empty() {
-                                            send = Some(text);
-                                            self.compose_text.clear();
-                                        }
-                                        resp.request_focus(); // stay ready for the next message
-                                    }
-                                    if self.focus_input_bar {
-                                        resp.request_focus(); // Ctrl+I
-                                    }
-                                    self.input_bar_has_focus = resp.has_focus();
-                                });
-                            });
+                        let out = input_bar(
+                            ui,
+                            egui::Id::new(("input_bar", tab.id)),
+                            &mut self.compose_text,
+                            entered,
+                            self.focus_input_bar,
+                        );
+                        self.input_bar_has_focus = out.has_focus;
+                        self.input_bar_px = out.height;
+                        let send = out.send;
                         if esc {
                             tab.term.write_input("\x1b");
                         }
@@ -1055,5 +1032,140 @@ mod thai_font_probe {
                 }
             }
         }
+    }
+}
+
+/// What one render of the bottom input bar reported back to `central_ui`.
+pub(crate) struct InputBarOut {
+    /// Trimmed text to send, when Enter/`send` fired on a non-empty box.
+    pub send: Option<String>,
+    /// Whether the bar's TextEdit holds egui keyboard focus this frame.
+    pub has_focus: bool,
+    /// Full height the bar's panel occupied, logical px — the exact amount
+    /// the terminal grid above lost to it (`PtApp::input_bar_px`).
+    pub height: f32,
+}
+
+/// Height of the input bar's text well, logical px — CONSTANT by design.
+/// The terminal grid above is sized from what's left, and any change here is
+/// a PTY resize, which forces Claude Code's TUI to repaint and (upstream
+/// ConPTY — reproduces in Windows Terminal) leaves junk rows behind. Two
+/// text rows are visible; a longer message scrolls inside the well, the
+/// cursor line kept in view by egui's own scroll-to-cursor.
+// ponytail: fixed at two rows. A taller well is one number; a user-draggable
+// one would need a debounced resize of its own — not worth it.
+pub(crate) const INPUT_BAR_TEXT_HEIGHT: f32 = 44.0;
+
+/// The bar's FULL footprint (well + panel frame + spacing) as egui lays it
+/// out — what `PtApp::input_bar_px` starts at, so the background size-sync
+/// is exact from the very first frame instead of only after an agent tab
+/// has rendered once (otherwise an app launched on a shell tab took one
+/// PTY resize on its first agent switch). Locked to the live layout by
+/// `input_bar_tests::input_bar_footprint_matches_seed`.
+pub(crate) const INPUT_BAR_PX_SEED: f32 = 68.0;
+
+/// Renders the bottom input bar into `ui`'s remaining rect (a
+/// `TopBottomPanel::bottom` shown inside it). App-free on purpose: takes the
+/// text buffer and the two keyboard signals, returns what happened — so a
+/// headless egui run can pin its geometry (`input_bar_tests`).
+///
+/// Geometry is pinned in two layers: the well is allocated at exactly
+/// `INPUT_BAR_TEXT_HEIGHT`, and inside it a `ScrollArea` with
+/// `auto_shrink([false, false])` fills that height whether the text is one
+/// line or fifty — the `TextEdit` grows freely INSIDE the scroll area
+/// instead of growing the bar. (`TextEdit::multiline` on its own wants four
+/// rows by default and grows per line, which is exactly the 0.1.19
+/// regression the test below locks out.)
+pub(crate) fn input_bar(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    text: &mut String,
+    entered: bool,
+    focus_req: bool,
+) -> InputBarOut {
+    let mut send: Option<String> = None;
+    let mut has_focus = false;
+    let text_id = id.with("text");
+    let panel = egui::TopBottomPanel::bottom(id).show_inside(ui, |ui| {
+        ui.horizontal(|ui| {
+            let well = egui::vec2(ui.available_width() - 56.0, INPUT_BAR_TEXT_HEIGHT);
+            ui.allocate_ui_with_layout(well, egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_min_size(well);
+                egui::ScrollArea::vertical()
+                    .max_height(INPUT_BAR_TEXT_HEIGHT)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let resp = ui.add(
+                            egui::TextEdit::multiline(text)
+                                .id(text_id)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(2)
+                                .hint_text("Enter ส่ง · Shift+Enter ขึ้นบรรทัด · Esc หยุด claude"),
+                        );
+                        has_focus = resp.has_focus();
+                    });
+            });
+            if ui.button("send").clicked() || entered {
+                let t = text.trim().to_string();
+                if !t.is_empty() {
+                    send = Some(t);
+                    text.clear();
+                }
+                ui.memory_mut(|m| m.request_focus(text_id)); // stay ready for the next message
+            }
+            if focus_req {
+                ui.memory_mut(|m| m.request_focus(text_id)); // Ctrl+I
+            }
+        });
+    });
+    InputBarOut { send, has_focus, height: panel.response.rect.height() }
+}
+
+#[cfg(test)]
+mod input_bar_tests {
+    use super::*;
+
+    /// Renders the bar headless (no window, no GPU) for a few frames — enough
+    /// for egui's panel sizing to settle — and reports its final height.
+    fn bar_height(text: &str) -> f32 {
+        let ctx = egui::Context::default();
+        let mut buf = text.to_string();
+        let mut height = 0.0;
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    height = input_bar(ui, egui::Id::new("bar"), &mut buf, false, false).height;
+                });
+            });
+        }
+        height
+    }
+
+    /// REGRESSION (0.1.19 → user screenshot 2026-09-03): the bar grew one
+    /// text row per line typed, shrinking the terminal grid by a cell row
+    /// each Shift+Enter; every such PTY resize forces Claude Code's TUI to
+    /// repaint and (upstream ConPTY, reproduces in Windows Terminal) leaves
+    /// junk rows behind — three stacked prompt boxes in the screenshot. The
+    /// bar must reserve the same height whatever the buffer holds.
+    /// The seed the size-sync starts from must be the bar's real footprint,
+    /// or the first shell→agent switch after launch lands as a PTY resize.
+    #[test]
+    fn input_bar_footprint_matches_seed() {
+        assert_eq!(bar_height("x"), INPUT_BAR_PX_SEED);
+    }
+
+    #[test]
+    fn input_bar_height_does_not_depend_on_content_rows() {
+        let one = bar_height("one line");
+        let many = bar_height("l1\nl2\nl3\nl4\nl5\nl6\nl7");
+        assert!(one > 0.0, "bar rendered nothing");
+        assert_eq!(one, many, "bar height must not follow content: {one} vs {many}");
     }
 }
