@@ -1146,11 +1146,17 @@ pub(crate) fn input_bar(
     let mut enter_pressed = false;
     if bar_focused {
         ui.input_mut(|i| {
+            // The authoritative keyboard state for THIS frame. A key event's
+            // own `modifiers` snapshot can arrive empty on some platforms
+            // even while Shift is genuinely held (the live 0.1.21 Shift+Enter
+            // report), so Shift is "held" if EITHER source says so — this is
+            // what keeps Shift+Enter a newline instead of a stray send.
+            let frame_shift = i.modifiers.shift;
             i.events.retain(|e| {
                 let egui::Event::Key { key, pressed: true, modifiers, .. } = e else {
                     return true;
                 };
-                if *key == egui::Key::Enter && !modifiers.shift {
+                if *key == egui::Key::Enter && !(modifiers.shift || frame_shift) {
                     enter_pressed = true;
                     return false; // consume; send/forward decided once text is known
                 }
@@ -1300,12 +1306,23 @@ mod input_bar_tests {
         buf: &mut String,
         events: Vec<egui::Event>,
     ) -> InputBarOut {
+        frame_mods(ctx, focus_req, buf, egui::Modifiers::NONE, events)
+    }
+
+    fn frame_mods(
+        ctx: &egui::Context,
+        focus_req: bool,
+        buf: &mut String,
+        modifiers: egui::Modifiers,
+        events: Vec<egui::Event>,
+    ) -> InputBarOut {
         let mut out = None;
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(800.0, 600.0),
             )),
+            modifiers,
             events,
             ..Default::default()
         };
@@ -1332,6 +1349,34 @@ mod input_bar_tests {
         let out = frame(&ctx, false, &mut buf, vec![key(egui::Key::Tab, egui::Modifiers::NONE)]);
         assert_eq!(out.forward, "	", "Tab must forward to Claude");
         assert!(buf.is_empty(), "Tab must not become a literal tab in the box: {buf:?}");
+    }
+
+    /// The Shift+Enter regression the user hit live (0.1.21): on some
+    /// platforms the Enter KEY EVENT arrives with an EMPTY per-event modifier
+    /// snapshot even though the frame-level modifier state correctly has
+    /// Shift down. Reading only the event's own `modifiers.shift` then
+    /// mistakes Shift+Enter for a plain Enter and SENDS instead of
+    /// newlining. The bar must consult the authoritative frame modifiers
+    /// too. This models that exact mismatch: RawInput.modifiers = SHIFT
+    /// (frame state) while the Key event carries Modifiers::NONE.
+    #[test]
+    fn shift_enter_with_empty_event_modifiers_still_newlines() {
+        let ctx = egui::Context::default();
+        let mut buf = "hello".to_string();
+        // focus the bar
+        frame_mods(&ctx, true, &mut buf, egui::Modifiers::NONE, vec![]);
+        frame_mods(&ctx, false, &mut buf, egui::Modifiers::NONE, vec![]);
+        // Shift is down at the frame level, but the Enter event's own
+        // modifiers are empty — the platform bug we are hardening against.
+        let out = frame_mods(
+            &ctx,
+            false,
+            &mut buf,
+            egui::Modifiers::SHIFT,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert_eq!(out.send, None, "frame Shift must veto the send even if the event lost its modifier");
+        assert!(buf.contains('\n'), "must newline instead: {buf:?}");
     }
 
     /// The Shift+Enter regression: with the bar focused and holding text, a
