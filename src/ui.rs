@@ -671,28 +671,25 @@ impl PtApp {
                         // the bar actually holding focus, so the terminal's
                         // own Enter/Esc handling is untouched when typing
                         // directly into the grid.
-                        let entered = self.input_bar_has_focus
-                            && ui.input_mut(|i| {
-                                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                            });
-                        let esc = self.input_bar_has_focus
-                            && ui.input_mut(|i| {
-                                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
-                            });
                         let out = input_bar(
                             ui,
                             egui::Id::new(("input_bar", tab.id)),
                             &mut self.compose_text,
-                            entered,
                             self.focus_input_bar,
                         );
                         self.input_bar_has_focus = out.has_focus;
                         self.input_bar_px = out.height;
-                        let send = out.send;
-                        if esc {
-                            tab.term.write_input("\x1b");
+                        // Navigation/control keys the bar forwarded to
+                        // Claude verbatim (arrows/Tab/Shift+Tab/PageUp/Down,
+                        // Esc, and a bare Enter on an empty box) — this is
+                        // what makes Claude's own history (↑↓), autocomplete
+                        // and menu accept (Tab), mode cycling (Shift+Tab)
+                        // and "press enter to continue" prompts reachable
+                        // while the Thai-safe bar holds the keyboard.
+                        if !out.forward.is_empty() {
+                            tab.term.write_input(&out.forward);
                         }
-                        if let Some(text) = send {
+                        if let Some(text) = out.send {
                             tab.term.write_input(&crate::term::bracketed_paste(&text));
                             let tab_id = tab.id;
                             self.pending_submit.push((
@@ -1037,13 +1034,64 @@ mod thai_font_probe {
 
 /// What one render of the bottom input bar reported back to `central_ui`.
 pub(crate) struct InputBarOut {
-    /// Trimmed text to send, when Enter/`send` fired on a non-empty box.
+    /// Trimmed text to send as one bracketed paste, when a non-empty box was
+    /// submitted with Enter (or the `send` button).
     pub send: Option<String>,
+    /// Raw bytes to write straight to the PTY this frame: navigation/control
+    /// keys the bar intercepted and forwarded to Claude verbatim — arrows,
+    /// Tab/Shift+Tab, PageUp/Down, Esc, and a bare Enter on an empty box.
+    /// Empty in the common (plain-typing) case.
+    pub forward: String,
     /// Whether the bar's TextEdit holds egui keyboard focus this frame.
     pub has_focus: bool,
     /// Full height the bar's panel occupied, logical px — the exact amount
     /// the terminal grid above lost to it (`PtApp::input_bar_px`).
     pub height: f32,
+}
+
+/// What a bare (no-Shift) Enter does in the bar, decided from whether Shift
+/// is held and whether the box is empty. Pure so the three-way split is
+/// unit-tested without egui.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EnterAction {
+    /// Shift+Enter: insert a newline in the box (left to the TextEdit).
+    Newline,
+    /// Enter on an empty box: forward a bare CR to Claude, so "press enter
+    /// to continue" / accept-default prompts work without clicking the grid.
+    ForwardEnter,
+    /// Enter on a non-empty box: submit the draft as one bracketed paste.
+    Send,
+}
+
+pub(crate) fn enter_action(shift: bool, empty: bool) -> EnterAction {
+    if shift {
+        EnterAction::Newline
+    } else if empty {
+        EnterAction::ForwardEnter
+    } else {
+        EnterAction::Send
+    }
+}
+
+/// Navigation/control keys that belong to Claude, not to the text box, even
+/// while the bar holds the keyboard — returns the terminal byte sequence to
+/// forward, or `None` to leave the key for the TextEdit. Only bare or
+/// Shift-modified keys forward; a Ctrl/Alt/Cmd combo returns `None` so it
+/// keeps its normal meaning. Pure and `&'static str` (all ASCII) so it is
+/// exhaustively unit-tested and needs no allocation.
+pub(crate) fn nav_passthrough(key: egui::Key, m: egui::Modifiers) -> Option<&'static str> {
+    if m.ctrl || m.alt || m.command || m.mac_cmd {
+        return None;
+    }
+    Some(match key {
+        egui::Key::ArrowUp => "\x1b[A",
+        egui::Key::ArrowDown => "\x1b[B",
+        egui::Key::Tab if m.shift => "\x1b[Z", // CBT — Claude cycles modes
+        egui::Key::Tab => "\t",
+        egui::Key::PageUp => "\x1b[5~",
+        egui::Key::PageDown => "\x1b[6~",
+        _ => return None,
+    })
 }
 
 /// Height of the input bar's text well, logical px — CONSTANT by design.
@@ -1080,12 +1128,47 @@ pub(crate) fn input_bar(
     ui: &mut egui::Ui,
     id: egui::Id,
     text: &mut String,
-    entered: bool,
     focus_req: bool,
 ) -> InputBarOut {
+    let text_id = id.with("text");
+    // The bar only intercepts keys while it actually owns the keyboard —
+    // otherwise the terminal's own key handling (when the grid is focused)
+    // must be left completely alone. `focus_req` (Ctrl+I this frame) counts
+    // too, since focus is about to land here.
+    let bar_focused = focus_req || ui.memory(|m| m.has_focus(text_id));
+
+    // Intercept BEFORE the TextEdit reads the event queue, so Tab doesn't
+    // insert a literal tab, ↑↓ don't just move the cursor, and a plain
+    // Enter doesn't newline. Shift+Enter is deliberately LEFT in the queue
+    // so the multiline TextEdit inserts the newline itself. Returns the
+    // bytes to forward to Claude plus whether a send-Enter fired.
+    let mut forward = String::new();
+    let mut enter_pressed = false;
+    if bar_focused {
+        ui.input_mut(|i| {
+            i.events.retain(|e| {
+                let egui::Event::Key { key, pressed: true, modifiers, .. } = e else {
+                    return true;
+                };
+                if *key == egui::Key::Enter && !modifiers.shift {
+                    enter_pressed = true;
+                    return false; // consume; send/forward decided once text is known
+                }
+                if *key == egui::Key::Escape {
+                    forward.push('\x1b'); // interrupt claude
+                    return false;
+                }
+                if let Some(seq) = nav_passthrough(*key, *modifiers) {
+                    forward.push_str(seq);
+                    return false;
+                }
+                true
+            });
+        });
+    }
+
     let mut send: Option<String> = None;
     let mut has_focus = false;
-    let text_id = id.with("text");
     let panel = egui::TopBottomPanel::bottom(id).show_inside(ui, |ui| {
         ui.horizontal(|ui| {
             let well = egui::vec2(ui.available_width() - 56.0, INPUT_BAR_TEXT_HEIGHT);
@@ -1100,25 +1183,40 @@ pub(crate) fn input_bar(
                                 .id(text_id)
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(2)
-                                .hint_text("Enter ส่ง · Shift+Enter ขึ้นบรรทัด · Esc หยุด claude"),
+                                .hint_text("Enter ส่ง · Shift+Enter ขึ้นบรรทัด · ↑↓ Tab → claude"),
                         );
                         has_focus = resp.has_focus();
                     });
             });
-            if ui.button("send").clicked() || entered {
-                let t = text.trim().to_string();
-                if !t.is_empty() {
-                    send = Some(t);
-                    text.clear();
+            let clicked = ui.button("send").clicked();
+            // Enter's meaning depends on the (now-known) buffer: send a
+            // draft, or forward a bare CR when empty. The send button is
+            // always a send attempt.
+            let action = if enter_pressed {
+                Some(enter_action(false, text.trim().is_empty()))
+            } else if clicked {
+                Some(EnterAction::Send)
+            } else {
+                None
+            };
+            match action {
+                Some(EnterAction::Send) => {
+                    let t = text.trim().to_string();
+                    if !t.is_empty() {
+                        send = Some(t);
+                        text.clear();
+                    }
+                    ui.memory_mut(|m| m.request_focus(text_id)); // ready for the next message
                 }
-                ui.memory_mut(|m| m.request_focus(text_id)); // stay ready for the next message
+                Some(EnterAction::ForwardEnter) => forward.push('\r'),
+                Some(EnterAction::Newline) | None => {}
             }
             if focus_req {
                 ui.memory_mut(|m| m.request_focus(text_id)); // Ctrl+I
             }
         });
     });
-    InputBarOut { send, has_focus, height: panel.response.rect.height() }
+    InputBarOut { send, forward, has_focus, height: panel.response.rect.height() }
 }
 
 #[cfg(test)]
@@ -1141,7 +1239,7 @@ mod input_bar_tests {
             };
             let _ = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    height = input_bar(ui, egui::Id::new("bar"), &mut buf, false, false).height;
+                    height = input_bar(ui, egui::Id::new("bar"), &mut buf, false).height;
                 });
             });
         }
@@ -1159,6 +1257,99 @@ mod input_bar_tests {
     #[test]
     fn input_bar_footprint_matches_seed() {
         assert_eq!(bar_height("x"), INPUT_BAR_PX_SEED);
+    }
+
+    /// Enter's three-way split. Shift+Enter is a newline in the box; a bare
+    /// Enter forwards a CR to Claude when the box is empty (so accept-default
+    /// prompts work) but submits the draft when it has text.
+    #[test]
+    fn enter_action_splits_newline_forward_send() {
+        assert_eq!(enter_action(true, true), EnterAction::Newline);
+        assert_eq!(enter_action(true, false), EnterAction::Newline);
+        assert_eq!(enter_action(false, true), EnterAction::ForwardEnter);
+        assert_eq!(enter_action(false, false), EnterAction::Send);
+    }
+
+    /// The nav keys that belong to Claude even while the bar holds the
+    /// keyboard, and their exact byte sequences. A Ctrl/Alt/Cmd combo keeps
+    /// its own meaning (None); plain typing keys are never intercepted.
+    #[test]
+    fn nav_passthrough_maps_history_and_completion_keys() {
+        let none = egui::Modifiers::NONE;
+        let shift = egui::Modifiers::SHIFT;
+        let ctrl = egui::Modifiers::COMMAND;
+        assert_eq!(nav_passthrough(egui::Key::ArrowUp, none), Some("[A"));
+        assert_eq!(nav_passthrough(egui::Key::ArrowDown, none), Some("[B"));
+        assert_eq!(nav_passthrough(egui::Key::Tab, none), Some("	"));
+        assert_eq!(nav_passthrough(egui::Key::Tab, shift), Some("[Z"));
+        assert_eq!(nav_passthrough(egui::Key::PageUp, none), Some("[5~"));
+        assert_eq!(nav_passthrough(egui::Key::PageDown, none), Some("[6~"));
+        // Ctrl+Tab / a plain letter are not ours.
+        assert_eq!(nav_passthrough(egui::Key::Tab, ctrl), None);
+        assert_eq!(nav_passthrough(egui::Key::A, none), None);
+        assert_eq!(nav_passthrough(egui::Key::ArrowLeft, none), None);
+    }
+
+    /// End-to-end through a real (headless) egui frame: with the bar focused,
+    /// a Tab key press is forwarded to Claude as 	 and does NOT land in the
+    /// text box as a literal tab — the 2026-09-03 "can't Tab to autocomplete"
+    /// regression. Frame 1 grabs focus (Ctrl+I); frame 2 injects the key.
+    fn frame(
+        ctx: &egui::Context,
+        focus_req: bool,
+        buf: &mut String,
+        events: Vec<egui::Event>,
+    ) -> InputBarOut {
+        let mut out = None;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                out = Some(input_bar(ui, egui::Id::new("bar"), buf, focus_req));
+            });
+        });
+        out.unwrap()
+    }
+
+    fn key(k: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    #[test]
+    fn focused_bar_forwards_tab_to_claude_not_into_the_box() {
+        // One Context across frames so egui's focus persists: frame 1 grabs
+        // focus (Ctrl+I), frames settle it, then Tab arrives while focused.
+        let ctx = egui::Context::default();
+        let mut buf = String::new();
+        frame(&ctx, true, &mut buf, vec![]);
+        frame(&ctx, false, &mut buf, vec![]);
+        let out = frame(&ctx, false, &mut buf, vec![key(egui::Key::Tab, egui::Modifiers::NONE)]);
+        assert_eq!(out.forward, "	", "Tab must forward to Claude");
+        assert!(buf.is_empty(), "Tab must not become a literal tab in the box: {buf:?}");
+    }
+
+    /// The Shift+Enter regression: with the bar focused and holding text, a
+    /// Shift+Enter must add a newline to the box and NOT submit — while a
+    /// plain Enter on the same text submits it.
+    #[test]
+    fn shift_enter_newlines_and_plain_enter_sends() {
+        let ctx = egui::Context::default();
+        let mut buf = "hello".to_string();
+        frame(&ctx, true, &mut buf, vec![]);
+        frame(&ctx, false, &mut buf, vec![]);
+        let out = frame(&ctx, false, &mut buf, vec![key(egui::Key::Enter, egui::Modifiers::SHIFT)]);
+        assert_eq!(out.send, None, "Shift+Enter must not send");
+        assert!(buf.contains('\n'), "Shift+Enter must add a newline: {buf:?}");
+
+        let out = frame(&ctx, false, &mut buf, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        assert_eq!(out.send.as_deref(), Some("hello"), "plain Enter must send the draft");
+        assert!(buf.is_empty(), "sending clears the box: {buf:?}");
     }
 
     #[test]
