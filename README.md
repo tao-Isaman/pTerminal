@@ -1,6 +1,48 @@
 # pTerminal
 
-A native Windows terminal for running and monitoring multiple Claude Code agents.
+A native Windows terminal for running and monitoring Claude Code and Codex CLI agents.
+
+## Codex CLI
+
+Install and sign in to Codex CLI first (`codex login`). Open a workspace, press
+**Ctrl+T**, and select **Codex CLI**. Optional prompts, isolated worktrees, terminal
+shortcuts, resource monitoring, shared context, and workspace messaging are supported.
+Codex uses its native terminal input interface. Hover a tab to see its provider.
+Windows native installations and standard global npm installations are detected on PATH.
+
+To use Codex as the coordinator, right-click **Orchestrator** and choose **Codex CLI**.
+This starts a new conversation; the provider is remembered on subsequent app launches.
+Existing Claude tabs and saved state remain compatible.
+
+Transfer an existing Codex conversation with:
+
+```text
+pterminal resume --provider codex --id <session-id> [--dir <path>]
+```
+
+Codex tabs restore using `codex resume <session-id>`. The session ID is captured
+after the first completed turn through Codex's notification command. Closing a fresh
+tab before that notification means it opens a fresh session next time. A transferred
+session's supplied ID is saved immediately.
+
+Build both executables with `cargo build --release --bins` and keep `pterm_hook.exe`
+beside `pterminal.exe` for session capture. The integration passes `notify` and
+`developer_instructions` overrides for this process only (replacing those configured
+values for the tab); it does not edit Codex configuration or `AGENTS.md`. Instructions
+point to the main checkout's shared context and messaging protocol, including when
+the agent runs in a worktree. Codex's configured model, login, and approval/sandbox
+settings remain in effect. The main checkout's `.pterminal` coordination directory
+is added as a writable directory so worktree agents can send messages.
+
+Monitoring currently reports **unknown**, **turn completed/idle**, and **exited**.
+It does not detect Codex approval requests, track its subagents, or display token
+usage; the Claude-specific handoff button is hidden. Check Codex's terminal for live
+progress and approval prompts. Without the helper executable, session capture and
+completion status are unavailable.
+
+Command and notification behavior follow the official
+[CLI reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli#codex-resume)
+and [notification documentation](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications).
 
 - **Workspaces** (left) — one per repo. **Tabs** (top) — one per agent or shell.
 - Agent tabs can run in an isolated **git worktree**; closing offers merge / keep / discard.
@@ -279,4 +321,5 @@ Ctrl+T new tab · Ctrl+W close · Ctrl+Tab cycle · Ctrl+1..9 jump · F2 shared 
 Ctrl+O open file · Ctrl+S save file
 
 ## Build
-`cargo build --release` (needs `git` and `claude` on PATH). Design docs in `docs/superpowers/`.
+`cargo build --release --bins` (needs `git` and your chosen agent CLI on PATH).
+Design docs in `docs/superpowers/`.

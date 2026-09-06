@@ -15,6 +15,8 @@ pub enum SavedTabKind {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SavedTab {
+    #[serde(default)]
+    pub provider: crate::provider::AgentProvider,
     pub tab_id: u64,
     pub kind: SavedTabKind,
     pub title: String,
@@ -118,6 +120,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn saved_provider_is_backward_compatible_and_round_trips() {
+        let mut tab: SavedTab = serde_json::from_str(
+            r#"{"tab_id":1,"kind":"Agent","title":"agent","cwd":"repo"}"#
+        ).unwrap();
+        assert_eq!(tab.provider, crate::provider::AgentProvider::Claude);
+        tab.provider = crate::provider::AgentProvider::Codex;
+        tab.session_id = Some("codex-session-123".into());
+        assert_eq!(serde_json::from_str::<SavedTab>(&serde_json::to_string(&tab).unwrap()).unwrap(), tab);
+    }
+
+    #[test]
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let s = AppState {
@@ -129,6 +142,7 @@ mod tests {
                 kept_worktrees: vec![WorktreeInfo { path: "D:\\projectx-wt\\fix".into(), branch: "pt/fix".into() }],
                 saved_tabs: vec![
                     SavedTab {
+                        provider: crate::provider::AgentProvider::Claude,
                         tab_id: 1,
                         kind: SavedTabKind::Agent,
                         title: "agent-1".into(),
@@ -137,6 +151,7 @@ mod tests {
                         session_id: Some("session-123".into()),
                     },
                     SavedTab {
+                        provider: crate::provider::AgentProvider::Claude,
                         tab_id: 2,
                         kind: SavedTabKind::Shell,
                         title: "shell-1".into(),

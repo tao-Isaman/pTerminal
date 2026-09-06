@@ -362,6 +362,7 @@ pub enum TabKind { Agent, Shell }
 /// `HookSetup::agent_name`); Task 5 pre-computes it with [`unique_title`] so
 /// a resumed or duplicate-prompt tab never collides with a live one.
 pub struct SpawnSpec {
+    pub provider: crate::provider::AgentProvider,
     pub workspace_repo: PathBuf,
     pub main_repo_shared_md: Option<PathBuf>,
     pub prompt: String,
@@ -398,6 +399,9 @@ pub struct SubTab {
 /// A running tab: its terminal plus everything the app needs to render tab
 /// chrome and roll up resource usage without re-deriving it every frame.
 pub struct Tab {
+    pub codex_shared: Option<PathBuf>,
+    pub codex_readme: Option<PathBuf>,
+    pub provider: crate::provider::AgentProvider,
     pub id: u64,
     pub title: String,
     pub kind: TabKind,
@@ -661,18 +665,30 @@ pub fn spawn_agent(
             agent_readme: spec.agent_readme.as_deref(),
             agent_name: &title,
         };
-        hooks::write_settings(&cwd, &hook_setup)?;
+        if spec.provider == crate::provider::AgentProvider::Claude {
+            hooks::write_settings(&cwd, &hook_setup)?;
+        }
+        std::fs::create_dir_all(hooks::events_dir())?;
         // truncate any stale event file from a previous run of this id
         let _ = std::fs::write(hooks::events_file(id), "");
 
         // claude is an npm shim on Windows -> run through cmd.
         let args = agent_args(&spec.prompt, spec.resume_session.as_deref());
 
-        let term = TabTerm::spawn(ctx, id, "cmd.exe", &args, &cwd)?;
+        let term = if spec.provider == crate::provider::AgentProvider::Codex {
+            let executable = crate::provider::codex_executable()?;
+            let args = crate::provider::codex_args(id, &title,
+                spec.main_repo_shared_md.as_deref(), spec.agent_readme.as_deref(),
+                &spec.prompt, spec.resume_session.as_deref(), hooks::pterm_hook_exe().as_deref());
+            TabTerm::spawn(ctx, id, &executable.to_string_lossy(), &args, &cwd)?
+        } else { TabTerm::spawn(ctx, id, "cmd.exe", &args, &cwd)? };
         Ok(Tab {
+            codex_shared: spec.main_repo_shared_md.clone(),
+            codex_readme: spec.agent_readme.clone(),
             id,
             title: title.clone(),
             kind: TabKind::Agent,
+            provider: spec.provider,
             term,
             status: AgentStatus::Unknown,
             worktree: worktree.clone(),
@@ -727,9 +743,12 @@ pub fn spawn_shell(
 ) -> anyhow::Result<Tab> {
     let term = TabTerm::spawn(ctx, id, "powershell.exe", &[], cwd)?;
     Ok(Tab {
+        codex_shared: None,
+        codex_readme: None,
         id,
         title: "shell".into(),
         kind: TabKind::Shell,
+        provider: crate::provider::AgentProvider::Claude,
         term,
         status: AgentStatus::Unknown,
         worktree: None,
@@ -798,8 +817,11 @@ pub fn spawn_dead_tab(
             .collect();
     let term = TabTerm::spawn(ctx, saved.tab_id, "cmd.exe", &args, repo_root)?;
     Ok(Tab {
+        codex_shared: None,
+        codex_readme: None,
         id: saved.tab_id,
         title: saved.title.clone(),
+        provider: saved.provider,
         kind: match saved.kind {
             crate::state::SavedTabKind::Agent => TabKind::Agent,
             crate::state::SavedTabKind::Shell => TabKind::Shell,
@@ -942,14 +964,23 @@ impl Tab {
     /// The one definition `central_ui` (whether to draw it) and the
     /// background size-sync (how much terrain it takes) both read.
     pub fn has_input_bar(&self) -> bool {
-        self.kind == TabKind::Agent && self.missing_dir.is_none() && self.term.exited().is_none()
+        self.kind == TabKind::Agent && self.provider == crate::provider::AgentProvider::Claude
+            && self.missing_dir.is_none() && self.term.exited().is_none()
     }
 
     pub fn respawn(&mut self, ctx: &eframe::egui::Context) -> anyhow::Result<()> {
         let term = match self.kind {
             TabKind::Agent => {
                 let _ = std::fs::write(hooks::events_file(self.id), "");
-                TabTerm::spawn(ctx, self.id, "cmd.exe", &["/c".to_string(), "claude".to_string()], &self.cwd)?
+                if self.provider == crate::provider::AgentProvider::Codex {
+                    let executable = crate::provider::codex_executable()?;
+                    let args = crate::provider::codex_args(self.id, &self.title,
+                        self.codex_shared.as_deref(), self.codex_readme.as_deref(), "", None,
+                        hooks::pterm_hook_exe().as_deref());
+                    TabTerm::spawn(ctx, self.id, &executable.to_string_lossy(), &args, &self.cwd)?
+                } else {
+                    TabTerm::spawn(ctx, self.id, "cmd.exe", &["/c".to_string(), "claude".to_string()], &self.cwd)?
+                }
             }
             TabKind::Shell => TabTerm::spawn(ctx, self.id, "powershell.exe", &[], &self.cwd)?,
         };
@@ -1058,6 +1089,19 @@ mod tests {
             "child never reported an exit through poll()",
         );
         assert_eq!(term.exited(), Some(3));
+    }
+
+    #[test]
+    #[ignore = "requires an installed Codex CLI; only runs --help in ConPTY"]
+    fn installed_codex_runs_in_embedded_terminal() {
+        let ctx = eframe::egui::Context::default();
+        let executable = crate::provider::codex_executable().unwrap();
+        let mut args = crate::provider::codex_args(90_501, "codex", None, None, "", None, None);
+        args.push("--help".into());
+        let mut term = TabTerm::spawn(&ctx, 90_501, &executable.to_string_lossy(),
+            &args, &std::env::current_dir().unwrap()).unwrap();
+        assert!(wait_for(|| { term.poll(); term.exited().is_some() }));
+        assert_eq!(term.exited(), Some(0));
     }
 
     /// Regression test for vendored delta 4: repaint urgency must follow
@@ -1184,6 +1228,7 @@ mod tests {
         let missing = PathBuf::from("D:\\pterminal-test-missing-dir-does-not-exist");
         let wt = WorktreeInfo { path: PathBuf::from("D:\\wt\\x"), branch: "pt/x".into() };
         let saved = crate::state::SavedTab {
+            provider: crate::provider::AgentProvider::Claude,
             tab_id: 9,
             kind: crate::state::SavedTabKind::Agent,
             title: "my-agent".to_string(),
@@ -1232,6 +1277,7 @@ mod tests {
         let ctx = eframe::egui::Context::default();
         let existing = PathBuf::from("C:\\Windows");
         let saved = crate::state::SavedTab {
+            provider: crate::provider::AgentProvider::Claude,
             tab_id: 11,
             kind: crate::state::SavedTabKind::Shell,
             title: "shell".to_string(),

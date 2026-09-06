@@ -23,6 +23,7 @@ impl PtApp {
             ui.heading("WORKSPACES");
             ui.separator();
             let mut clicked = None;
+            let mut orchestrator_provider = None;
             // Collected outside the loop, same borrow pattern as `clicked`
             // above: `ws.meta.kept_worktrees` is borrowed immutably by the
             // `for` loop over `self.workspaces`, so acting on a click (which
@@ -63,6 +64,15 @@ impl PtApp {
                     // afterward (`orch-1-fresh-launch-orchestrator-active.png`).
                     let label = format!("{} Orchestrator", if i == self.active_ws { ">" } else { " " });
                     let row_resp = ui.selectable_label(i == self.active_ws, label);
+                    row_resp.context_menu(|ui| {
+                        ui.label("Start a new orchestrator session with:");
+                        for provider in [crate::provider::AgentProvider::Claude, crate::provider::AgentProvider::Codex] {
+                            if ui.add_enabled(!dialog_open, egui::Button::new(provider.label())).clicked() {
+                                orchestrator_provider = Some((i, provider));
+                                ui.close_menu();
+                            }
+                        }
+                    });
                     if row_resp.clicked() {
                         clicked = Some(i);
                     }
@@ -137,6 +147,9 @@ impl PtApp {
             if let Some((ws_idx, wt)) = kept_clicked {
                 self.open_kept_worktree(ctx, ws_idx, wt);
             }
+            if let Some((ws_idx, provider)) = orchestrator_provider {
+                self.switch_orchestrator_provider(ctx, ws_idx, provider);
+            }
             if let Some(draft) = close_ws_clicked {
                 self.closing_ws = Some(draft);
             }
@@ -185,10 +198,10 @@ impl PtApp {
                     // hooks, no `.claude/settings.local.json` writes), so it
                     // can't take over another tab's status routing the way
                     // a second direct-mode agent spawn does.
-                    let shared_dir_warning = tab.kind == TabKind::Agent
+                    let shared_dir_warning = tab.provider == crate::provider::AgentProvider::Claude && tab.kind == TabKind::Agent
                         && tab.worktree.is_none()
                         && ws.tabs.iter().enumerate().any(|(j, other)| {
-                            j != i && other.kind == TabKind::Agent && other.cwd == tab.cwd
+                            j != i && other.provider == crate::provider::AgentProvider::Claude && other.kind == TabKind::Agent && other.cwd == tab.cwd
                         });
                     // Two-section label: the status marker keeps its own
                     // color while the title stays in the theme's text color,
@@ -237,6 +250,12 @@ impl PtApp {
                     let resp = ui
                         .selectable_label(i == ws.active_tab, text)
                         .on_hover_ui(|ui| {
+                            if tab.kind == TabKind::Agent {
+                                ui.label(tab.provider.label());
+                                if tab.provider == crate::provider::AgentProvider::Codex {
+                                    ui.small("Status reflects turn completion; approval and subagent tracking are unavailable.");
+                                }
+                            }
                             let mut hover = format!(
                                 "{}\ncpu {:.0}%  ram {:.0} MB",
                                 tab.cwd.display(),
@@ -396,6 +415,7 @@ impl PtApp {
                     if ui.add_enabled(!dialog_open, egui::Button::new("+")).clicked() {
                         let isolate = ws.meta.default_isolate && ws.meta.is_git;
                         self.new_tab = Some(NewTabDraft {
+                            provider: crate::provider::AgentProvider::Claude,
                             ws_index: active_ws,
                             prompt: String::new(),
                             isolate,
@@ -453,6 +473,7 @@ impl PtApp {
                     .and_then(|w| w.tabs.get(w.active_tab))
                     .filter(|t| {
                         t.kind == crate::term::TabKind::Agent
+                            && t.provider == crate::provider::AgentProvider::Claude
                             && t.missing_dir.is_none()
                             && t.term.exited().is_none()
                     })
@@ -716,6 +737,10 @@ impl PtApp {
                     // holds egui focus (set just above, this same frame —
                     // the bar renders before the terminal).
                     let term_focused = focused && !self.input_bar_has_focus;
+                    if term_focused && tab.provider == crate::provider::AgentProvider::Codex
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        tab.status = AgentStatus::Unknown;
+                    }
                     let open_req = tab.term.ui(ui, term_focused, history, shift_enter); // only the ACTIVE tab renders — spec perf requirement
                     // Ctrl+click on a file path in the terminal (see the
                     // backend's path-hover logic): open it in an editor tab

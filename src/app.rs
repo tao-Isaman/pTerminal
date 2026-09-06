@@ -80,6 +80,7 @@ pub struct PendingClaim {
 /// dialog body and `open_tab` both resolve the workspace by this index and
 /// drop the draft if it no longer resolves, rather than guessing.
 pub struct NewTabDraft {
+    pub provider: crate::provider::AgentProvider,
     pub ws_index: usize,
     pub prompt: String,
     pub isolate: bool,
@@ -198,7 +199,7 @@ pub(crate) fn agent_readme_for_spawn(is_orchestrator: bool, is_git: bool, repo_r
 /// update again.
 pub(crate) fn degrade_direct_mode_peers(ws: &mut WsRt, repo: &Path) {
     for other in ws.tabs.iter_mut() {
-        if other.kind == TabKind::Agent
+        if other.provider == crate::provider::AgentProvider::Claude && other.kind == TabKind::Agent
             && other.worktree.is_none()
             && other.cwd == repo
             && other.status != AgentStatus::Exited
@@ -651,6 +652,7 @@ impl PtApp {
                                 ctx,
                                 saved.tab_id,
                                 &term::SpawnSpec {
+                                    provider: saved.provider,
                                     workspace_repo: repo_root.clone(),
                                     main_repo_shared_md: shared,
                                     prompt: String::new(),
@@ -700,7 +702,7 @@ impl PtApp {
                         // this resumed tab just overwrote hook routing for
                         // any other live direct-mode agent tab already
                         // sitting at the same cwd.
-                        if tab.kind == TabKind::Agent && tab.worktree.is_none() {
+                        if tab.provider == crate::provider::AgentProvider::Claude && tab.kind == TabKind::Agent && tab.worktree.is_none() {
                             degrade_direct_mode_peers(ws, &tab.cwd);
                         }
                         ws.tabs.push(tab);
@@ -777,6 +779,7 @@ impl PtApp {
                 .tabs
                 .iter()
                 .map(|t| state::SavedTab {
+                    provider: t.provider,
                     tab_id: t.id,
                     kind: match t.kind {
                         TabKind::Agent => state::SavedTabKind::Agent,
@@ -1513,6 +1516,9 @@ impl PtApp {
                     if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
                         if tab.status != AgentStatus::Exited && tab.term.exited().is_none() {
                             tab.term.write_input("\r");
+                            if tab.provider == crate::provider::AgentProvider::Codex {
+                                tab.status = AgentStatus::Unknown;
+                            }
                         }
                         break;
                     }
@@ -1878,6 +1884,7 @@ impl PtApp {
         // as Ctrl+W.
         if t && !ws.meta.is_orchestrator {
             self.new_tab = Some(NewTabDraft {
+                provider: crate::provider::AgentProvider::Claude,
                 ws_index: self.active_ws,
                 prompt: String::new(),
                 isolate: ws.meta.default_isolate && ws.meta.is_git,
@@ -2026,6 +2033,7 @@ impl PtApp {
         let id = old.id;
         let title = old.title.clone();
         let kind = old.kind;
+        let provider = old.provider;
         let repo = ws.meta.repo_path.clone();
         let is_git = ws.meta.is_git;
         let is_orchestrator = ws.meta.is_orchestrator;
@@ -2042,6 +2050,7 @@ impl PtApp {
                     ctx,
                     id,
                     &term::SpawnSpec {
+                        provider,
                         workspace_repo: repo,
                         main_repo_shared_md: shared,
                         prompt: String::new(),
@@ -2081,6 +2090,7 @@ impl PtApp {
         let Some(ws) = self.workspaces.get_mut(self.active_ws) else { return };
         let Some(tab) = ws.tabs.get_mut(ws.active_tab) else { return };
         if tab.kind != TabKind::Agent
+            || tab.provider != crate::provider::AgentProvider::Claude
             || tab.missing_dir.is_some()
             || tab.term.exited().is_some()
             || tab.handoff_armed.is_some()
@@ -2102,6 +2112,39 @@ impl PtApp {
         tab.handoff_armed = Some(std::time::SystemTime::now());
         let id = tab.id;
         self.pending_submit.push((id, std::time::Instant::now() + SUBMIT_DELAY));
+    }
+
+    pub(crate) fn switch_orchestrator_provider(
+        &mut self, ctx: &egui::Context, ws_index: usize,
+        provider: crate::provider::AgentProvider,
+    ) {
+        let Some(ws) = self.workspaces.get(ws_index).filter(|w| w.meta.is_orchestrator) else { return };
+        let repo = ws.meta.repo_path.clone();
+        let before = self.own_child_pids();
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        // A distinct tab id prevents late notifications from the old CLI
+        // from changing the replacement session's identity or status.
+        let result = term::spawn_agent(ctx, id, &term::SpawnSpec {
+            provider, workspace_repo: repo.clone(), main_repo_shared_md: None,
+            agent_readme: agent_readme_for_spawn(true, false, &repo),
+            prompt: String::new(), isolate: false, resume_session: None,
+            title: Some("orchestrator".into()), worktree: None,
+        });
+        match result {
+            Ok(tab) => {
+                let ws = &mut self.workspaces[ws_index];
+                let old_ids: Vec<_> = ws.tabs.iter().map(|t| t.id).collect();
+                self.pending_submit.retain(|(id, _)| !old_ids.contains(id));
+                ws.tabs = vec![tab];
+                ws.active_tab = 0;
+                self.active_ws = ws_index;
+                self.selected_child = None;
+                self.pending_claim = Some(PendingClaim { ws_index, tab_id: id, before });
+                self.persist();
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
     }
 
     /// One-click handoff, the completing half — called by `drain_events`
@@ -2142,6 +2185,7 @@ impl PtApp {
         let old = &ws.tabs[tab_idx];
         let title = old.title.clone();
         let worktree = old.worktree.clone();
+        let provider = old.provider;
         let repo = ws.meta.repo_path.clone();
         let is_git = ws.meta.is_git;
         let is_orchestrator = ws.meta.is_orchestrator;
@@ -2153,6 +2197,7 @@ impl PtApp {
             ctx,
             tab_id,
             &term::SpawnSpec {
+                provider,
                 workspace_repo: repo,
                 main_repo_shared_md: shared,
                 prompt: format!(
@@ -2365,6 +2410,7 @@ mod tests {
         // would also touch, and `cargo test` runs tests in parallel by
         // default within one binary.
         let saved = state::SavedTab {
+            provider: crate::provider::AgentProvider::Claude,
             tab_id: 90_210,
             kind: state::SavedTabKind::Shell,
             title: "test-shell".to_string(),
@@ -2832,6 +2878,7 @@ mod tests {
         seed_message(&repo, "my-agent");
 
         let saved = state::SavedTab {
+            provider: crate::provider::AgentProvider::Claude,
             tab_id: 90_310,
             kind: state::SavedTabKind::Agent,
             title: "my-agent".to_string(),
@@ -2942,6 +2989,7 @@ mod tests {
 
         let wt = state::WorktreeInfo { path: PathBuf::from("D:\\wt\\gone"), branch: "pt/gone".into() };
         let saved = state::SavedTab {
+            provider: crate::provider::AgentProvider::Claude,
             tab_id: 90_340,
             kind: state::SavedTabKind::Agent,
             title: "doomed".to_string(),
@@ -3149,7 +3197,8 @@ mod tests {
 
         app.handle_resume_command(
             &ctx,
-            commands::ResumeCmd { session_id: "abc12345".to_string(), dir: missing.clone() },
+            commands::ResumeCmd {
+        provider: crate::provider::AgentProvider::Claude, session_id: "abc12345".to_string(), dir: missing.clone() },
         );
 
         assert_eq!(app.workspaces.len(), 1, "must not create a workspace for a nonexistent --dir");
@@ -3252,7 +3301,7 @@ mod tests {
         let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws0, ws1, ws2], 2);
         app.selected_child = Some((1, 0));
         app.pending_claim = Some(PendingClaim { ws_index: 2, tab_id: 1, before: HashSet::new() });
-        app.new_tab = Some(NewTabDraft { ws_index: 2, prompt: String::new(), isolate: false, shell: false });
+        app.new_tab = Some(NewTabDraft { provider: crate::provider::AgentProvider::Claude, ws_index: 2, prompt: String::new(), isolate: false, shell: false });
         app.closing = Some(CloseDraft { ws_index: 2, tab_id: 1, dirty: false, confirm_discard: false });
         app.closing_ws = Some(CloseWsDraft { ws_index: 2, name: "ws2".to_string() });
         app.roster_written.insert(2, 0xDEAD_BEEF); // stale fingerprint
@@ -3301,7 +3350,7 @@ mod tests {
         let base = tempfile::tempdir().expect("tempdir");
         let ws0 = ws_with_name(base.path().join("ws0"), "ws0");
         let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws0], 0);
-        app.new_tab = Some(NewTabDraft { ws_index: 0, prompt: "keep-me".to_string(), isolate: false, shell: false });
+        app.new_tab = Some(NewTabDraft { provider: crate::provider::AgentProvider::Claude, ws_index: 0, prompt: "keep-me".to_string(), isolate: false, shell: false });
 
         app.close_workspace(5);
 
@@ -3324,7 +3373,7 @@ mod tests {
         orch.meta.is_orchestrator = true;
         let ws0 = ws_with_name(base.path().join("real0"), "real0");
         let mut app = app_with_workspaces(base.path().to_path_buf(), vec![orch, ws0], 0);
-        app.new_tab = Some(NewTabDraft { ws_index: 0, prompt: "keep-me".to_string(), isolate: false, shell: false });
+        app.new_tab = Some(NewTabDraft { provider: crate::provider::AgentProvider::Claude, ws_index: 0, prompt: "keep-me".to_string(), isolate: false, shell: false });
 
         app.close_workspace(0);
 

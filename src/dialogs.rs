@@ -64,6 +64,10 @@ impl PtApp {
             egui::Window::new("New tab").collapsible(false).show(ctx, |ui| {
                 ui.checkbox(&mut draft.shell, "plain shell (no agent)");
                 if !draft.shell {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut draft.provider, crate::provider::AgentProvider::Claude, "Claude Code");
+                        ui.selectable_value(&mut draft.provider, crate::provider::AgentProvider::Codex, "Codex CLI");
+                    });
                     ui.label("initial prompt (optional):");
                     ui.text_edit_singleline(&mut draft.prompt);
                     ui.add_enabled(is_git, egui::Checkbox::new(&mut draft.isolate, "isolate in worktree"));
@@ -295,7 +299,7 @@ impl PtApp {
         } else {
             // Direct-mode hook takeover — see `degrade_direct_mode_peers`'s
             // doc comment for the full rationale.
-            if !draft.isolate {
+            if !draft.isolate && draft.provider == crate::provider::AgentProvider::Claude {
                 degrade_direct_mode_peers(ws, &repo);
             }
             // shared.md + gitignore entry + per-agent README, once per
@@ -342,6 +346,7 @@ impl PtApp {
                 ctx,
                 id,
                 &SpawnSpec {
+                    provider: draft.provider,
                     workspace_repo: repo,
                     main_repo_shared_md: shared,
                     prompt: draft.prompt,

@@ -176,7 +176,7 @@ fn append_event_cmd(event: &str, file: &Path) -> String {
 /// has it as a sibling, so tests always exercise the `cmd /c echo` fallback
 /// below — matching how a from-source dev build behaves before the first
 /// `cargo build` places both binaries in the same `target/debug/` directory.
-fn pterm_hook_exe() -> Option<PathBuf> {
+pub(crate) fn pterm_hook_exe() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let candidate = exe.parent()?.join("pterm_hook.exe");
     candidate.exists().then_some(candidate)

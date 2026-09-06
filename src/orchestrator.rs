@@ -105,6 +105,7 @@ fn new_orchestrator_workspace() -> state::Workspace {
         default_isolate: false,
         kept_worktrees: vec![],
         saved_tabs: vec![state::SavedTab {
+            provider: crate::provider::AgentProvider::Claude,
             tab_id: 0,
             kind: state::SavedTabKind::Agent,
             title: "orchestrator".to_string(),

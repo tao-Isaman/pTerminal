@@ -20,12 +20,14 @@ use std::path::{Path, PathBuf};
 /// file for the (running or about-to-start) GUI process to pick up.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResumeCmd {
+    #[serde(default)]
+    pub provider: crate::provider::AgentProvider,
     pub session_id: String,
     pub dir: PathBuf,
 }
 
 fn usage() -> String {
-    "usage: pterminal resume --id <session-id> [--dir <path>]".to_string()
+    "usage: pterminal resume --id <session-id> [--dir <path>] [--provider claude|codex]".to_string()
 }
 
 /// Session ids are UUID-shaped (hyphens + hex): an allowlist of ASCII
@@ -51,11 +53,20 @@ pub fn parse_args(args: &[String]) -> Option<Result<ResumeCmd, String>> {
         return Some(Err(usage()));
     }
 
+    let mut provider = crate::provider::AgentProvider::Claude;
     let mut id: Option<String> = None;
     let mut dir: Option<PathBuf> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
+            "--provider" => {
+                provider = match args.get(i + 1).map(String::as_str) {
+                    Some("claude") => crate::provider::AgentProvider::Claude,
+                    Some("codex") => crate::provider::AgentProvider::Codex,
+                    _ => return Some(Err(usage())),
+                };
+                i += 2;
+            }
             "--id" => {
                 let Some(v) = args.get(i + 1) else { return Some(Err(usage())) };
                 id = Some(v.clone());
@@ -97,7 +108,7 @@ pub fn parse_args(args: &[String]) -> Option<Result<ResumeCmd, String>> {
         },
     };
 
-    Some(Ok(ResumeCmd { session_id: id, dir }))
+    Some(Ok(ResumeCmd { provider, session_id: id, dir }))
 }
 
 /// Where command files live for the real app: `<state base>/commands/`.
@@ -193,6 +204,21 @@ pub fn another_instance_running() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_provider_selection_and_legacy_commands() {
+        let args: Vec<String> = ["pterminal", "resume", "--provider", "codex", "--id", "abc-123"]
+            .iter().map(|s| s.to_string()).collect();
+        let cmd = parse_args(&args).unwrap().unwrap();
+        assert_eq!(cmd.provider, crate::provider::AgentProvider::Codex);
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(serde_json::from_str::<ResumeCmd>(&json).unwrap(), cmd);
+        let old: ResumeCmd = serde_json::from_str(r#"{"session_id":"abc-123","dir":"repo"}"#).unwrap();
+        assert_eq!(old.provider, crate::provider::AgentProvider::Claude);
+        let mut invalid = args;
+        invalid[3] = "unknown".into();
+        assert!(parse_args(&invalid).unwrap().is_err());
+    }
     use std::path::{Path, PathBuf};
 
     // ---- parse_args ----
@@ -344,10 +370,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("commands");
 
-        let cmd1 = ResumeCmd { session_id: "aaa111".into(), dir: PathBuf::from("C:\\repo1") };
+        let cmd1 = ResumeCmd { provider: crate::provider::AgentProvider::Claude, session_id: "aaa111".into(), dir: PathBuf::from("C:\\repo1") };
         write_command_in(&cmd1, &dir).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let cmd2 = ResumeCmd { session_id: "bbb222".into(), dir: PathBuf::from("C:\\repo2") };
+        let cmd2 = ResumeCmd { provider: crate::provider::AgentProvider::Claude, session_id: "bbb222".into(), dir: PathBuf::from("C:\\repo2") };
         write_command_in(&cmd2, &dir).unwrap();
 
         std::fs::write(dir.join("resume-malformed.json"), "not valid json {{{").unwrap();
@@ -377,11 +403,11 @@ mod tests {
         let dir = tmp.path().join("commands");
 
         // Write a valid command
-        let cmd_valid = ResumeCmd { session_id: "valid-id-123".into(), dir: PathBuf::from("C:\\repo1") };
+        let cmd_valid = ResumeCmd { provider: crate::provider::AgentProvider::Claude, session_id: "valid-id-123".into(), dir: PathBuf::from("C:\\repo1") };
         write_command_in(&cmd_valid, &dir).unwrap();
 
         // Write a command with an invalid session id (contains `&`)
-        let cmd_invalid = ResumeCmd { session_id: "invalid&id".into(), dir: PathBuf::from("C:\\repo2") };
+        let cmd_invalid = ResumeCmd { provider: crate::provider::AgentProvider::Claude, session_id: "invalid&id".into(), dir: PathBuf::from("C:\\repo2") };
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

@@ -155,7 +155,9 @@ impl PtApp {
         // (isolate: false) spawn, so it just repointed
         // `.claude/settings.local.json`'s hook routing away from any other
         // live direct-mode agent tab already running at `repo`.
-        degrade_direct_mode_peers(ws, &repo);
+        if cmd.provider == crate::provider::AgentProvider::Claude {
+            degrade_direct_mode_peers(ws, &repo);
+        }
 
         let shared = if is_git {
             match shared_ctx::ensure_shared_md(&repo) {
@@ -191,6 +193,7 @@ impl PtApp {
             ctx,
             id,
             &term::SpawnSpec {
+                provider: cmd.provider,
                 workspace_repo: repo,
                 main_repo_shared_md: shared,
                 prompt: String::new(),

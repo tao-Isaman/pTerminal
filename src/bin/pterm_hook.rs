@@ -59,10 +59,16 @@ fn main() {
         return; // malformed invocation: never error out, just do nothing
     };
 
-    let mut payload = String::new();
-    let _ = std::io::stdin().read_to_string(&mut payload);
-
-    let line = build_line(event, &payload);
+    let line = if event == "CodexNotify" {
+        // Codex passes JSON as the final argument, not stdin. Reading stdin
+        // here could wait forever while its interactive terminal is open.
+        let Some(line) = args.get(3).and_then(|payload| codex_line(payload)) else { return };
+        line
+    } else {
+        let mut payload = String::new();
+        let _ = std::io::stdin().read_to_string(&mut payload);
+        build_line(event, &payload)
+    };
 
     // Best-effort append; a locked/missing/unwritable file must not turn
     // into a hook failure, so every error here is swallowed.
@@ -71,9 +77,26 @@ fn main() {
     }
 }
 
+fn codex_line(payload: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if value.get("type")?.as_str()? != "agent-turn-complete" { return None; }
+    let session = value.get("thread-id")?.as_str()?;
+    Some(serde_json::json!({"pt": 1, "event": "Stop", "session_id": session}).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_notification_captures_session_and_ignores_other_events() {
+        let line = codex_line(r#"{"type":"agent-turn-complete","thread-id":"codex-123"}"#).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["event"], "Stop");
+        assert_eq!(value["session_id"], "codex-123");
+        assert!(codex_line(r#"{"type":"other","thread-id":"123"}"#).is_none());
+        assert!(codex_line("invalid").is_none());
+    }
 
     #[test]
     fn full_payload_extracts_all_fields() {
