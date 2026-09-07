@@ -31,6 +31,10 @@ struct RawMessage {
     text: String,
 }
 
+/// UTF-8 byte order mark, stripped from the head of every line before it is
+/// handed to serde — see [`read_new`]'s docs for why it turns up here at all.
+const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
 /// Reads every complete line appended to the append-only messages log at
 /// `path` since byte `offset` (the `new_offset` returned by a previous
 /// call, or `0` to read from the start).
@@ -48,6 +52,18 @@ struct RawMessage {
 /// - A trailing `\r` on a line (CRLF) is tolerated: stripped before the
 ///   line is handed to serde, but still counted in `new_offset` since it's
 ///   still a byte of the consumed line.
+/// - A leading UTF-8 BOM (`EF BB BF`) on a line is tolerated the same way:
+///   stripped before serde sees it, still counted in `new_offset`. Windows
+///   agents create this file with PowerShell (`Out-File`/`Set-Content
+///   -Encoding utf8` in PS 5.1, or `Add-Content` to a not-yet-existing
+///   file), which prefixes a BOM to the FIRST line it writes. serde_json
+///   rejects a BOM outright ("expected value at line 1 column 1"), so
+///   without this the very first message ever appended to a fresh
+///   `messages.jsonl` is silently counted malformed and dropped, while
+///   every later append — which no longer starts the file — delivers fine.
+///   Stripped per line, not just at offset 0, since a file rewritten
+///   (rather than appended to) mid-session can reintroduce one at an
+///   arbitrary offset.
 /// - Each complete line is serde-parsed into `{to, from, text}` (all three
 ///   required); success with a non-empty `to` yields a message, anything
 ///   else (invalid JSON, a missing field, or an empty `to`) increments
@@ -79,6 +95,9 @@ pub fn read_new(path: &Path, offset: u64) -> std::io::Result<Batch> {
 
         if line.last() == Some(&b'\r') {
             line = &line[..line.len() - 1];
+        }
+        if let Some(stripped) = line.strip_prefix(BOM) {
+            line = stripped;
         }
 
         let text = String::from_utf8_lossy(line);
@@ -826,6 +845,41 @@ mod tests {
         assert_eq!(batch.messages[1].to, "carol");
         assert_eq!(batch.malformed, 0);
         assert_eq!(batch.new_offset, content.len() as u64, "the CRLF's \\r must still be counted as a consumed byte");
+    }
+
+    /// Regression-lock (orchestrator bug report: "orchestrator-to-agent
+    /// messaging does not reach a Codex agent"). The real fault had nothing
+    /// to do with the provider: the orchestrator had created its
+    /// `messages.jsonl` from PowerShell, which prefixes a UTF-8 BOM to the
+    /// first line it writes. serde_json rejects a BOM, so line 1 — the one
+    /// addressed to the Codex agent — was counted malformed and dropped,
+    /// while line 2 (no BOM, addressed to a Claude agent) delivered
+    /// normally, which made the failure look provider-specific. Both lines
+    /// must parse, and the BOM's 3 bytes must still be counted in
+    /// `new_offset` — same consumed-bytes contract as the CRLF case above.
+    #[test]
+    fn leading_utf8_bom_on_the_first_line_still_parses_and_is_fully_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("messages.jsonl");
+        let content = concat!(
+            "\u{feff}",
+            r#"{"to":"chiken fighter/agent-108","from":"orchestrator","text":"hi"}"#, "\r\n",
+            r#"{"to":"pTerminal/agent-110","from":"orchestrator","text":"yo"}"#, "\r\n",
+        );
+        std::fs::write(&p, content).unwrap();
+
+        let batch = read_new(&p, 0).unwrap();
+
+        assert_eq!(batch.malformed, 0, "a BOM-prefixed line must not be treated as malformed");
+        assert_eq!(batch.messages.len(), 2);
+        assert_eq!(batch.messages[0].to, "chiken fighter/agent-108");
+        assert_eq!(batch.messages[0].text, "hi");
+        assert_eq!(batch.messages[1].to, "pTerminal/agent-110");
+        assert_eq!(
+            batch.new_offset,
+            content.len() as u64,
+            "the BOM's 3 bytes must still count as consumed, or the next read re-delivers them"
+        );
     }
 
     #[test]

@@ -61,7 +61,12 @@ pub fn write_agent_readme(repo: &Path) -> anyhow::Result<PathBuf> {
         To message the coordinator overseeing every workspace, use the reserved target \
         `\"orchestrator\"`:\n\n\
         `{{\"to\":\"orchestrator\",\"from\":\"<your agent name>\",\"text\":\"...\"}}`\n\n\
-        It is delivered into the orchestrator's own session, same as any other message.\n",
+        It is delivered into the orchestrator's own session, same as any other message.\n\n\
+        ## Appending safely on Windows\n\n\
+        Write the line as UTF-8 with NO byte-order mark, e.g.\n\n\
+        `[IO.File]::AppendAllText($path, $line + \"`n\", [Text.UTF8Encoding]::new($false))`\n\n\
+        PowerShell 5.1's `Out-File`/`Set-Content -Encoding utf8` prefixes a BOM to a file it \
+        creates, and its bare `Add-Content` writes ANSI, which mangles non-ASCII text.\n",
         agents = agents.display(),
         messages = messages.display(),
     );
@@ -101,6 +106,10 @@ pub fn write_orchestrator_readme(orch_dir: &Path) -> anyhow::Result<PathBuf> {
         `{messages}`\n\n\
         containing:\n\n\
         `{{\"to\":\"<workspace>/<agent>\",\"from\":\"orchestrator\",\"text\":\"...\"}}`\n\n\
+        Write the line as UTF-8 with NO byte-order mark, e.g.\n\n\
+        `[IO.File]::AppendAllText($path, $line + \"`n\", [Text.UTF8Encoding]::new($false))`\n\n\
+        PowerShell 5.1's `Out-File`/`Set-Content -Encoding utf8` prefixes a BOM to a file it \
+        creates, and its bare `Add-Content` writes ANSI, which mangles non-ASCII text.\n\n\
         ## Replies\n\n\
         Agents reply to you by addressing their own outgoing message's `to` field to the \
         reserved name `\"orchestrator\"`; their replies are delivered into THIS session \
