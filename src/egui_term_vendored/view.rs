@@ -13,6 +13,7 @@ use egui::{Align2, Painter, Pos2, Rect, Response, Stroke, Vec2};
 use egui::{Id, PointerButton};
 
 use crate::egui_term_vendored::backend::BackendCommand;
+use crate::egui_term_vendored::backend::RenderableContent;
 use crate::egui_term_vendored::backend::TerminalBackend;
 use crate::egui_term_vendored::backend::{LinkAction, MouseButton, SelectionType};
 use crate::egui_term_vendored::bindings::{BindingAction, BindingsLayout, InputKind};
@@ -133,6 +134,668 @@ fn thai_mark_stack_slots(marks: &[char]) -> Vec<u8> {
 // ponytail: eyeballed from measured font metrics, not per-font — tweak here
 // if a future Windows font update changes the band.
 const THAI_MARK_LIFT_EM: f32 = 0.20;
+
+// ---------------------------------------------------------------------------
+// pTerminal perf delta (glyph-run coalescing)
+//
+// Upstream's cell loop emitted one `Shape::text` per non-blank cell, every
+// frame. Each of those costs a `char::to_string()` heap allocation, a
+// `LayoutJob` build, a hash of that job against egui's galley cache, and a
+// fat `TextShape` (an `Arc<Galley>` plus a `Rect`) pushed into the frame's
+// shape vector — then tessellated as its own draw item. A dense 200x50
+// screen is ~10k of those per frame, on top of ~10k background rects.
+//
+// A terminal grid is the one place where that is trivially avoidable:
+// horizontally adjacent cells overwhelmingly share their entire render
+// state, and the font is monospace, so a whole span of them is ONE galley.
+// The tricky part is not the coalescing — it is proving the coalesced
+// glyphs land on exactly the pixels the per-cell code put them on. The
+// three obstacles, and what is done about each:
+//
+//  1. The grid's `cell_width` is `font_size.width as u16` — TRUNCATED to an
+//     integer (see `backend::grid_spec`; the PTY column count depends on it,
+//     so it cannot become a float). The font's real advance is not an
+//     integer: Hack at 14pt advances 8.275pt against a `cell_width` of 8.
+//     egui accumulates `cursor_x += advance` and pixel-rounds after every
+//     glyph, so a naive run drifts off the grid. At 100%/125%/150% display
+//     scaling the rounding happens to absorb the 0.275 and each glyph still
+//     lands on 8n — but at 200% the advance is 8.534, the round lands on
+//     8.5n, and a 40-char run ends 19.5pt (2.4 cells) past where the
+//     per-cell code drew it. `RunGeometry::letter_spacing` cancels the
+//     difference exactly: feeding `cell_width - round_to_pixel(advance)` as
+//     `extra_letter_spacing` makes every glyph land on a whole cell at any
+//     scale. It is the ROUNDED advance that has to be cancelled, because
+//     epaint applies the spacing on top of an already-rounded pen position —
+//     which is also why `run_geometry` measures that value off a galley
+//     rather than recomputing epaint's rounding.
+//
+//  2. The per-cell code anchors `Align2::CENTER_TOP` at the cell's centre,
+//     so the glyph starts at `x + (cell_width - galley_width)/2` — and a
+//     one-glyph galley is `round_ui(advance)` wide (8.28125, not 8), which
+//     bakes in a constant -0.14pt nudge. Runs are drawn `Align2::LEFT_TOP`,
+//     so that same nudge has to be re-applied by hand: it is
+//     `RunGeometry::origin_dx`, measured from a real one-glyph galley rather
+//     than re-derived from epaint's rounding rules. Glyph k of a run then
+//     lands at `x0 + origin_dx + k*cell_width`, which is character for
+//     character where the per-cell path put it. That is not reasoning to be
+//     taken on trust: `run_coalescing_tests` paints real grids both ways and
+//     compares every glyph's absolute position and colour.
+//
+//  3. Fallback fonts do not share the advance. `install_thai_fallback`
+//     appends a PROPORTIONAL system font (Leelawadee UI/Tahoma) to the
+//     monospace family, so a Thai or CJK glyph resolved through it advances
+//     by its own width, not the cell's. Runs are therefore restricted to
+//     printable ASCII, which is what the primary monospace font certainly
+//     covers — everything else keeps the per-cell path, where each glyph is
+//     centred in its own cell regardless of advance.
+//
+// Both (1) and (3) are re-verified at RUNTIME, once per frame, by laying out
+// a probe string of every printable ASCII character and checking each glyph
+// really sits on its cell boundary (`run_geometry`). If a font swap, a DPI
+// change or an egui upgrade ever breaks the assumption, coalescing switches
+// itself off and the renderer falls back to today's per-cell path rather
+// than drawing subtly-misaligned text.
+
+/// Every printable ASCII character, in order — the runtime probe string for
+/// [`run_geometry`], and exactly the set of characters a run may contain.
+/// Laying them out as one run checks the per-glyph advance for all 95 of
+/// them at once, plus the 94 adjacent pairs (a monospace font has no kerning
+/// table; `ascii_pairs_never_kern` checks all 9025 pairs exhaustively for
+/// the bundled font, this catches a font that is not the bundled one).
+const RUN_PROBE: &str = concat!(
+    " !\"#$%&'()*+,-./0123456789:;<=>?",
+    "@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_",
+    "`abcdefghijklmnopqrstuvwxyz{|}~",
+);
+
+/// How far off a cell boundary a probe glyph may sit before coalescing is
+/// abandoned. Well under a device pixel at any sane scale, but far above
+/// f32 noise in epaint's `round(x * ppp) / ppp`.
+const RUN_GRID_TOLERANCE: f32 = 0.01;
+
+/// pTerminal perf delta: the two numbers that make a coalesced glyph run
+/// land on the same pixels as the per-cell path. Obtained from real galley
+/// measurements once per frame — see the module comment above for why each
+/// exists. `None` from [`run_geometry`] means "this font/scale cannot be
+/// coalesced safely", not "coalescing is disabled".
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RunGeometry {
+    /// Fed to `TextFormat::extra_letter_spacing`; cancels the difference
+    /// between the font's fractional advance and the grid's integer
+    /// `cell_width`. Usually a small negative number.
+    letter_spacing: f32,
+    /// Added to a run's left edge to reproduce the sub-pixel offset the
+    /// per-cell `CENTER_TOP` anchor bakes in.
+    origin_dx: f32,
+}
+
+/// Builds the [`LayoutJob`] a run is drawn from. Mirrors
+/// `Fonts::layout_no_wrap` (which is what `Shape::text` uses) in everything
+/// except `extra_letter_spacing`, so the probe in [`run_geometry`] measures
+/// the identical code path the real runs take.
+fn run_layout_job(
+    text: String,
+    font_id: egui::FontId,
+    color: egui::Color32,
+    letter_spacing: f32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::single_section(
+        text,
+        egui::TextFormat {
+            font_id,
+            color,
+            extra_letter_spacing: letter_spacing,
+            ..Default::default()
+        },
+    );
+    job.break_on_newline = false;
+    job
+}
+
+/// Measures whether — and how — glyph runs can be drawn for this font at
+/// this scale. Returns `None` when they cannot, which makes the caller keep
+/// every cell on the per-cell path.
+///
+/// Both galleys laid out here are keyed identically every frame, so egui's
+/// galley cache serves them for free after the first frame; this is not a
+/// per-frame layout cost.
+fn run_geometry(
+    fonts: &egui::epaint::text::Fonts,
+    font_id: &egui::FontId,
+    cell_width: f32,
+) -> Option<RunGeometry> {
+    // The correction has to cancel the PIXEL-ROUNDED advance, not the raw
+    // one: epaint pushes each glyph at `cursor_x + extra_letter_spacing` and
+    // only then does `cursor_x = round_to_pixel(cursor_x + advance)`, so the
+    // spacing lands on top of an already-rounded position. Rather than
+    // reimplement `round_to_pixel` (and have to know `pixels_per_point`),
+    // read the rounded advance straight off a two-glyph galley: with no
+    // spacing, the second glyph sits at exactly `round_to_pixel(advance)`.
+    let plain_pair = fonts.layout_job(run_layout_job(
+        "mm".to_owned(),
+        font_id.clone(),
+        egui::Color32::WHITE,
+        0.0,
+    ));
+    let rounded_advance = plain_pair.rows.first()?.glyphs.get(1)?.pos.x;
+    let letter_spacing = cell_width - rounded_advance;
+
+    let probe = fonts.layout_job(run_layout_job(
+        RUN_PROBE.to_owned(),
+        font_id.clone(),
+        egui::Color32::WHITE,
+        letter_spacing,
+    ));
+    let row = probe.rows.first()?;
+    // A wrap, a dropped glyph or a fallback substitution all show up here;
+    // any of them means the probe no longer describes what runs will do.
+    if probe.rows.len() != 1 || row.glyphs.len() != RUN_PROBE.len() {
+        return None;
+    }
+    for (k, glyph) in row.glyphs.iter().enumerate() {
+        if (glyph.pos.x - k as f32 * cell_width).abs() > RUN_GRID_TOLERANCE {
+            return None;
+        }
+    }
+
+    // The per-cell path's baked-in nudge, measured rather than derived: a
+    // single-glyph galley is `round_ui(advance)` wide and gets centred in a
+    // `cell_width`-wide cell. One measurement covers every runnable
+    // character because the probe above has just established that they all
+    // advance identically — which is the same reason they can share a run at
+    // all. (`m` is only a representative; any of them would do.)
+    let one = fonts.layout_no_wrap(
+        "m".to_owned(),
+        font_id.clone(),
+        egui::Color32::WHITE,
+    );
+    Some(RunGeometry {
+        letter_spacing,
+        origin_dx: (cell_width - one.rect.width()) * 0.5,
+    })
+}
+
+/// pTerminal perf delta: one grid cell reduced to precisely the facts that
+/// decide how it is painted. Two horizontally adjacent cells may share one
+/// text shape, one background rect and one hyperlink underline exactly when
+/// [`joins_run`] says their reductions match.
+///
+/// Note that `fg`/`bg` are the FINAL colours, after DIM, INVERSE and
+/// selection have been applied. Folding those flags into the colours instead
+/// of comparing them separately is not a shortcut — it is strictly more
+/// precise. A selected cell and an unselected one whose fg/bg happen to be
+/// the other's swapped pair paint identically, so they genuinely do belong
+/// in one run, and nothing downstream can tell the difference.
+///
+/// ITALIC, UNDERLINE and STRIKEOUT are deliberately absent: this renderer
+/// never reads them (there is one `FontId` for the whole grid and no
+/// underline/strikeout drawing outside the hyperlink hover), so breaking a
+/// run on them would fragment runs without changing a single pixel.
+///
+/// BOLD *is* folded in, though not on purpose. `Flags::DIM_BOLD` is a
+/// COMPOUND mask (`DIM | BOLD`) in alacritty, so the renderer's
+/// `intersects(DIM | DIM_BOLD)` dim test also fires on a plain-bold cell and
+/// multiplies its foreground by 0.7 — bold text renders DIMMER here, not
+/// brighter. That predates this change; it is reproduced verbatim rather
+/// than quietly corrected, since fixing it is a visible change of its own.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct RunCell {
+    column: usize,
+    line: i32,
+    fg: egui::Color32,
+    bg: egui::Color32,
+    /// A hovered-hyperlink underline segment is drawn beneath this cell.
+    underline: bool,
+    /// False ⇒ this cell must be drawn by the per-cell path. See
+    /// [`cell_is_runnable`].
+    runnable: bool,
+}
+
+/// Whether a cell may be folded into a run at all, independent of its
+/// neighbours. Everything excluded here keeps the exact per-cell code it had
+/// before coalescing existed:
+///
+/// * the cursor cell — it paints an extra rect and, in `APP_CURSOR` mode,
+///   swaps fg/bg for its glyph only;
+/// * cells carrying zero-width combining marks — the Thai mark-lifting logic
+///   (`thai_mark_stack_slots`) appends marks to the cell's own string and
+///   pen-positions lifted ones off the base glyph's advance; none of that
+///   survives being spliced into a shared galley;
+/// * wide characters and their spacers — they occupy two columns, so the
+///   one-glyph-per-cell arithmetic a run is built on does not hold;
+/// * anything outside printable ASCII — a fallback font may advance by its
+///   own width rather than the cell's (see the module comment). This also
+///   excludes `'\t'`, which the per-cell path skips and whose galley advance
+///   is `TAB_SIZE` cells wide.
+fn cell_is_runnable(
+    c: char,
+    flags: cell::Flags,
+    has_zerowidth: bool,
+    is_cursor: bool,
+) -> bool {
+    !is_cursor
+        && !has_zerowidth
+        && !flags
+            .intersects(cell::Flags::WIDE_CHAR | cell::Flags::WIDE_CHAR_SPACER)
+        && matches!(c, ' '..='~')
+}
+
+/// Reduces a cell to its [`RunCell`]. Pure (the caller does the two theme
+/// lookups) so the flag folding can be unit-tested without a `TerminalTheme`
+/// or an egui context.
+#[allow(clippy::too_many_arguments)]
+fn run_cell(
+    point: &TerminalGridPoint,
+    c: char,
+    flags: cell::Flags,
+    has_zerowidth: bool,
+    raw_fg: egui::Color32,
+    raw_bg: egui::Color32,
+    is_selected: bool,
+    is_hyperlink: bool,
+    is_cursor: bool,
+) -> RunCell {
+    let mut fg = raw_fg;
+    let mut bg = raw_bg;
+    if flags.intersects(cell::Flags::DIM | cell::Flags::DIM_BOLD) {
+        fg = fg.linear_multiply(0.7);
+    }
+    if flags.contains(cell::Flags::INVERSE) || is_selected {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    RunCell {
+        column: point.column.0,
+        line: point.line.0,
+        fg,
+        bg,
+        underline: is_hyperlink,
+        runnable: cell_is_runnable(c, flags, has_zerowidth, is_cursor),
+    }
+}
+
+/// Do these two adjacent cells belong to the same run? `next` is the cell
+/// the loop has just reached; `prev` is the run's current last cell.
+///
+/// The adjacency test is `prev.column + 1`, not "the next entry in the
+/// iterator": `RenderableContent::cells` drops trailing blanks, so a row can
+/// have gaps, and a run must never bridge one (its glyphs are positioned by
+/// column arithmetic from the run's first cell).
+fn joins_run(prev: &RunCell, next: &RunCell) -> bool {
+    prev.runnable
+        && next.runnable
+        && next.line == prev.line
+        && next.column == prev.column + 1
+        && next.fg == prev.fg
+        && next.bg == prev.bg
+        && next.underline == prev.underline
+}
+
+/// pTerminal perf delta: how many shapes the last rendered frame emitted,
+/// and how long building them took. Set unconditionally in debug builds (an
+/// atomic store per frame); printed only when `PTERM_SHAPE_STATS` is set in
+/// the environment, so a normal debug run is undisturbed. The statics stay
+/// readable in-process so a debug overlay can show them without an env var.
+///
+/// This is the LIVE readout. The reproducible before/after figures quoted
+/// for this change come from `run_coalescing_tests::reports_shape_counts`,
+/// which paints one fixed grid both ways in a single process — a real
+/// window's numbers depend on whatever happens to be on screen.
+#[cfg(debug_assertions)]
+pub(crate) mod shape_stats {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    pub(crate) static SHAPES: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static MICROS: AtomicU64 = AtomicU64::new(0);
+
+    /// Checked once — reading the environment per frame would itself show up
+    /// in the number being measured.
+    fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("PTERM_SHAPE_STATS").is_some())
+    }
+
+    pub(crate) fn record(shapes: usize, elapsed: std::time::Duration) {
+        SHAPES.store(shapes, Ordering::Relaxed);
+        MICROS.store(elapsed.as_micros() as u64, Ordering::Relaxed);
+        if enabled() {
+            eprintln!(
+                "[pterm shape stats] shapes={shapes} build={:.3}ms",
+                elapsed.as_secs_f64() * 1e3
+            );
+        }
+    }
+}
+
+/// pTerminal perf delta: the per-frame constants a coalesced run needs, so
+/// the flush routine takes four arguments instead of fourteen.
+struct RunPainter<'a> {
+    fonts: &'a egui::epaint::text::Fonts,
+    font_id: &'a egui::FontId,
+    geom: RunGeometry,
+    layout_min: Pos2,
+    cell_width: f32,
+    cell_height: f32,
+    global_bg: egui::Color32,
+    display_offset: i32,
+}
+
+impl RunPainter<'_> {
+    /// Emits the (at most three) shapes that replace `len` cells' worth of
+    /// per-cell shapes. Each is the exact union of what the per-cell path
+    /// drew:
+    ///
+    /// * the background rect — per-cell rects are `cell_width + 1` wide and
+    ///   therefore overlap their right neighbour by a point, so `len` of
+    ///   them cover `[x0, x0 + len*cell_width + 1]`, which is this one rect;
+    /// * the hyperlink underline — per-cell segments are exactly
+    ///   `cell_width` long and abut, so `len` of them cover
+    ///   `[x0, x0 + len*cell_width]`;
+    /// * the glyphs — see [`RunGeometry`].
+    ///
+    /// One ordering difference is worth naming, since "identical output" is
+    /// the whole premise. The per-cell path interleaves rect, glyph, rect,
+    /// glyph..., so each cell's background over-painted the 1-point tail its
+    /// LEFT NEIGHBOUR's galley box extended into it. A run paints its whole
+    /// background first and then all its glyphs, so that tail is no longer
+    /// clipped. This can only ever show up mid-run — i.e. between two cells
+    /// that share a background colour, since a colour change is a run break
+    /// and the runs still flush in left-to-right order — and only for a
+    /// glyph whose ink overhangs its own advance box, which the bundled
+    /// monospace font's do not. Everything the tests can observe (glyph
+    /// positions, colours, covered background area) is unchanged.
+    fn flush(
+        &self,
+        first: &RunCell,
+        len: usize,
+        text: &str,
+        shapes: &mut Vec<Shape>,
+    ) {
+        if len == 0 {
+            return;
+        }
+        // The column arithmetic below assumes one single-byte char per
+        // column; `cell_is_runnable` guarantees it, this catches a future
+        // widening of the runnable set that forgets to revisit the indexing.
+        debug_assert_eq!(text.len(), len, "one ASCII byte per run column");
+        let x0 = self.layout_min.x + self.cell_width * first.column as f32;
+        let y = self.layout_min.y
+            + self.cell_height * (first.line + self.display_offset) as f32;
+        let span = self.cell_width * len as f32;
+
+        if first.bg != self.global_bg {
+            shapes.push(Shape::Rect(RectShape::filled(
+                Rect::from_min_size(
+                    Pos2::new(x0, y),
+                    // + 1.0 is to fill grid border
+                    Vec2::new(span + 1., self.cell_height + 1.),
+                ),
+                CornerRadius::ZERO,
+                first.bg,
+            )));
+        }
+
+        if first.underline {
+            let underline_height = y + self.cell_height;
+            shapes.push(Shape::LineSegment {
+                points: [
+                    Pos2::new(x0, underline_height),
+                    Pos2::new(x0 + span, underline_height),
+                ],
+                stroke: Stroke::new(self.cell_height * 0.15, first.fg).into(),
+            });
+        }
+
+        // Blanks carry no ink and the per-cell path skipped them outright, so
+        // trimming the run down to its real glyphs changes nothing on screen
+        // — but it keeps whole runs of indentation and right-padding out of
+        // the galley cache entirely. An all-blank run emits no text shape at
+        // all, which on a typical screen is most of them.
+        let Some(lead) = text.find(|c: char| c != ' ') else {
+            return;
+        };
+        let tail = text.rfind(|c: char| c != ' ').map_or(0, |i| i + 1);
+
+        // Runs contain printable ASCII only (`cell_is_runnable`), so a byte
+        // offset into `text` IS a column offset from the run's first cell.
+        let galley = self.fonts.layout_job(run_layout_job(
+            text[lead..tail].to_owned(),
+            self.font_id.clone(),
+            first.fg,
+            self.geom.letter_spacing,
+        ));
+        shapes.push(Shape::galley(
+            Pos2::new(
+                x0 + self.cell_width * lead as f32 + self.geom.origin_dx,
+                y,
+            ),
+            galley,
+            first.fg,
+        ));
+    }
+}
+
+/// The run currently being accumulated: its first cell (which carries the
+/// shared render state), its last cell (which adjacency is tested against),
+/// and how many columns it spans.
+type PendingRun = (RunCell, RunCell, usize);
+
+fn flush_pending(
+    run: &mut Option<PendingRun>,
+    text: &mut String,
+    painter: Option<&RunPainter>,
+    shapes: &mut Vec<Shape>,
+) {
+    if let (Some((first, _, len)), Some(p)) = (run.take(), painter) {
+        p.flush(&first, len, text, shapes);
+    }
+    text.clear();
+}
+
+/// pTerminal perf delta: paints the grid body. Free function rather than a
+/// `TerminalView` method so the tests can drive it with a synthetic
+/// `RenderableContent` and a headless `Fonts`, and in particular so they can
+/// render the SAME content twice — once with `geom` and once without — and
+/// assert the two shape lists are identical.
+///
+/// `geom == None` means run coalescing is not safe here (see
+/// [`run_geometry`]) and every cell takes the original per-cell path.
+#[allow(clippy::too_many_arguments)]
+fn emit_grid_shapes(
+    content: &RenderableContent,
+    theme: &TerminalTheme,
+    font_id: &egui::FontId,
+    fonts: &egui::epaint::text::Fonts,
+    layout_min: Pos2,
+    global_bg: egui::Color32,
+    mouse_grid_point: TerminalGridPoint,
+    geom: Option<RunGeometry>,
+    shapes: &mut Vec<Shape>,
+) {
+    let cell_height = content.terminal_size.cell_height as f32;
+    let cell_width = content.terminal_size.cell_width as f32;
+    let is_app_cursor_mode =
+        content.terminal_mode.contains(TermMode::APP_CURSOR);
+    let display_offset = content.display_offset as i32;
+
+    let run_painter = geom.map(|geom| RunPainter {
+        fonts,
+        font_id,
+        geom,
+        layout_min,
+        cell_width,
+        cell_height,
+        global_bg,
+        display_offset,
+    });
+    let run_painter = run_painter.as_ref();
+    let mut run: Option<PendingRun> = None;
+    let mut run_text = String::new();
+
+    // pTerminal perf delta: iterates the synced viewport snapshot —
+    // see `RenderableContent::cells`. Points are original buffer
+    // coordinates, so the selection/hyperlink range checks are unchanged.
+    for (point, cell) in &content.cells {
+        let flags = cell.flags;
+        if flags.contains(cell::Flags::WIDE_CHAR_SPACER) {
+            // A spacer paints nothing (upstream skipped it before emitting
+            // any shape), but it still has to end the run: the wide char it
+            // belongs to already did, and a stray spacer must not let a run
+            // silently bridge two columns' worth of one glyph.
+            flush_pending(&mut run, &mut run_text, run_painter, shapes);
+            continue;
+        }
+
+        let is_cursor = content.cursor_point == *point;
+        let is_selected =
+            content.selectable_range.is_some_and(|r| r.contains(*point));
+        let is_hovered_hyperling =
+            content.hovered_hyperlink.as_ref().is_some_and(|r| {
+                r.contains(point) && r.contains(&mouse_grid_point)
+            });
+
+        let rc = run_cell(
+            point,
+            cell.c,
+            flags,
+            cell.zerowidth().is_some(),
+            theme.get_color(cell.fg),
+            theme.get_color(cell.bg),
+            is_selected,
+            is_hovered_hyperling,
+            is_cursor,
+        );
+
+        if run_painter.is_some() && rc.runnable {
+            match &mut run {
+                Some((_, last, len)) if joins_run(last, &rc) => {
+                    *last = rc;
+                    *len += 1;
+                }
+                _ => {
+                    flush_pending(&mut run, &mut run_text, run_painter, shapes);
+                    run = Some((rc, rc, 1));
+                }
+            }
+            run_text.push(cell.c);
+            continue;
+        }
+
+        flush_pending(&mut run, &mut run_text, run_painter, shapes);
+
+        // ---- per-cell path: byte-for-byte the pre-coalescing code, kept for
+        // every cell `cell_is_runnable` rejects. `rc.fg`/`rc.bg` are the same
+        // values the old inline DIM/INVERSE/selection handling produced.
+        let is_wide_char = flags.contains(cell::Flags::WIDE_CHAR);
+        let x = layout_min.x + (cell_width * point.column.0 as f32);
+        let line_num = point.line.0 + display_offset;
+        let y = layout_min.y + (cell_height * line_num as f32);
+
+        let mut fg = rc.fg;
+        let bg = rc.bg;
+        let cell_width = if is_wide_char {
+            cell_width * 2.0
+        } else {
+            cell_width
+        };
+
+        if global_bg != bg {
+            shapes.push(Shape::Rect(RectShape::filled(
+                Rect::from_min_size(
+                    Pos2::new(x, y),
+                    // + 1.0 is to fill grid border
+                    Vec2::new(cell_width + 1., cell_height + 1.),
+                ),
+                CornerRadius::ZERO,
+                bg,
+            )));
+        }
+
+        // Handle hovered hyperlink underline
+        if is_hovered_hyperling {
+            let underline_height = y + cell_height;
+            shapes.push(Shape::LineSegment {
+                points: [
+                    Pos2::new(x, underline_height),
+                    Pos2::new(x + cell_width, underline_height),
+                ],
+                stroke: Stroke::new(cell_height * 0.15, fg).into(),
+            });
+        }
+
+        // Handle cursor rendering
+        if is_cursor {
+            let cursor_color = theme.get_color(content.cursor.fg);
+            shapes.push(Shape::Rect(RectShape::filled(
+                Rect::from_min_size(
+                    Pos2::new(x, y),
+                    Vec2::new(cell_width, cell_height),
+                ),
+                CornerRadius::default(),
+                cursor_color,
+            )));
+        }
+
+        // Draw text content
+        if cell.c != ' ' && cell.c != '\t' {
+            if is_cursor && is_app_cursor_mode {
+                // Was `swap(&mut fg, &mut bg)`; only `fg` is read below.
+                fg = bg;
+            }
+
+            // Combining marks (e.g. Thai upper/lower vowels and tone
+            // marks) are zero-width chars alacritty stores next to the
+            // base char — append them so they overstrike it instead of
+            // being silently dropped. Marks whose stack slot is >0 (a
+            // tone sitting ON an upper vowel — egui does no GPOS
+            // shaping, and the fallback fonts' default positions
+            // collide, see `thai_mark_stack_slots`) are pulled out and
+            // drawn separately, lifted one mark-band per slot, anchored
+            // at the pen position they would have had in-string (the
+            // base glyph's right edge — mark outlines hang back over
+            // the base via negative bearings, measured zero-advance in
+            // `thai_font_probe`).
+            let mut text = cell.c.to_string();
+            let mut lifted: Vec<(char, u8)> = Vec::new();
+            if let Some(zerowidth) = cell.zerowidth() {
+                for (&m, slot) in
+                    zerowidth.iter().zip(thai_mark_stack_slots(zerowidth))
+                {
+                    if slot == 0 {
+                        text.push(m);
+                    } else {
+                        lifted.push((m, slot));
+                    }
+                }
+            }
+            let center_x = x + (cell_width / 2.0);
+            shapes.push(Shape::text(
+                fonts,
+                Pos2 { x: center_x, y },
+                Align2::CENTER_TOP,
+                text,
+                font_id.clone(),
+                fg,
+            ));
+            if !lifted.is_empty() {
+                let base_advance = fonts.glyph_width(font_id, cell.c);
+                let pen_x = center_x + base_advance / 2.0;
+                let lift = font_id.size * THAI_MARK_LIFT_EM;
+                for (m, slot) in lifted {
+                    shapes.push(Shape::text(
+                        fonts,
+                        Pos2 { x: pen_x, y: y - lift * slot as f32 },
+                        Align2::LEFT_TOP,
+                        m,
+                        font_id.clone(),
+                        fg,
+                    ));
+                }
+            }
+        }
+    }
+
+    flush_pending(&mut run, &mut run_text, run_painter, shapes);
+}
 
 #[derive(Debug, Clone)]
 enum InputAction {
@@ -698,153 +1361,36 @@ impl<'a> TerminalView<'a> {
         // up front serves the entire loop.
         let fonts = painter.fonts(|f| f.clone());
 
+        // pTerminal perf delta: shape-count/build-time readout — see
+        // `shape_stats`. Debug builds only; release keeps the hot path free
+        // of even the clock read.
+        #[cfg(debug_assertions)]
+        let build_started = std::time::Instant::now();
+
         let mut shapes = vec![Shape::Rect(RectShape::filled(
             Rect::from_min_max(layout_min, layout_max),
             CornerRadius::ZERO,
             global_bg,
         ))];
 
-        // pTerminal perf delta: iterates the synced viewport snapshot —
-        // see `RenderableContent::cells`. Points are original buffer
-        // coordinates, so the selection/hyperlink range checks are unchanged.
-        for (point, cell) in &content.cells {
-            let flags = cell.flags;
-            let is_wide_char_spacer =
-                flags.contains(cell::Flags::WIDE_CHAR_SPACER);
-            if is_wide_char_spacer {
-                continue;
-            }
-
-            let is_app_cursor_mode =
-                content.terminal_mode.contains(TermMode::APP_CURSOR);
-            let is_wide_char = flags.contains(cell::Flags::WIDE_CHAR);
-            let is_inverse = flags.contains(cell::Flags::INVERSE);
-            let is_dim =
-                flags.intersects(cell::Flags::DIM | cell::Flags::DIM_BOLD);
-            let is_selected = content
-                .selectable_range
-                .is_some_and(|r| r.contains(*point));
-            let is_hovered_hyperling =
-                content.hovered_hyperlink.as_ref().is_some_and(|r| {
-                    r.contains(point)
-                        && r.contains(&state.current_mouse_position_on_grid)
-                });
-
-            let x = layout_min.x + (cell_width * point.column.0 as f32);
-            let line_num = point.line.0 + content.display_offset as i32;
-            let y = layout_min.y + (cell_height * line_num as f32);
-
-            let mut fg = self.theme.get_color(cell.fg);
-            let mut bg = self.theme.get_color(cell.bg);
-            let cell_width = if is_wide_char {
-                cell_width * 2.0
-            } else {
-                cell_width
-            };
-
-            if is_dim {
-                fg = fg.linear_multiply(0.7);
-            }
-
-            if is_inverse || is_selected {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-
-            if global_bg != bg {
-                shapes.push(Shape::Rect(RectShape::filled(
-                    Rect::from_min_size(
-                        Pos2::new(x, y),
-                        // + 1.0 is to fill grid border
-                        Vec2::new(cell_width + 1., cell_height + 1.),
-                    ),
-                    CornerRadius::ZERO,
-                    bg,
-                )));
-            }
-
-            // Handle hovered hyperlink underline
-            if is_hovered_hyperling {
-                let underline_height = y + cell_height;
-                shapes.push(Shape::LineSegment {
-                    points: [
-                        Pos2::new(x, underline_height),
-                        Pos2::new(x + cell_width, underline_height),
-                    ],
-                    stroke: Stroke::new(cell_height * 0.15, fg).into(),
-                });
-            }
-
-            // Handle cursor rendering
-            if content.cursor_point == *point {
-                let cursor_color = self.theme.get_color(content.cursor.fg);
-                shapes.push(Shape::Rect(RectShape::filled(
-                    Rect::from_min_size(
-                        Pos2::new(x, y),
-                        Vec2::new(cell_width, cell_height),
-                    ),
-                    CornerRadius::default(),
-                    cursor_color,
-                )));
-            }
-
-            // Draw text content
-            if cell.c != ' ' && cell.c != '\t' {
-                if content.cursor_point == *point && is_app_cursor_mode {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-
-                // Combining marks (e.g. Thai upper/lower vowels and tone
-                // marks) are zero-width chars alacritty stores next to the
-                // base char — append them so they overstrike it instead of
-                // being silently dropped. Marks whose stack slot is >0 (a
-                // tone sitting ON an upper vowel — egui does no GPOS
-                // shaping, and the fallback fonts' default positions
-                // collide, see `thai_mark_stack_slots`) are pulled out and
-                // drawn separately, lifted one mark-band per slot, anchored
-                // at the pen position they would have had in-string (the
-                // base glyph's right edge — mark outlines hang back over
-                // the base via negative bearings, measured zero-advance in
-                // `thai_font_probe`).
-                let mut text = cell.c.to_string();
-                let mut lifted: Vec<(char, u8)> = Vec::new();
-                if let Some(zerowidth) = cell.zerowidth() {
-                    for (&m, slot) in
-                        zerowidth.iter().zip(thai_mark_stack_slots(zerowidth))
-                    {
-                        if slot == 0 {
-                            text.push(m);
-                        } else {
-                            lifted.push((m, slot));
-                        }
-                    }
-                }
-                let center_x = x + (cell_width / 2.0);
-                shapes.push(Shape::text(
-                    &fonts,
-                    Pos2 { x: center_x, y },
-                    Align2::CENTER_TOP,
-                    text,
-                    self.font.font_type(),
-                    fg,
-                ));
-                if !lifted.is_empty() {
-                    let font_id = self.font.font_type();
-                    let base_advance = fonts.glyph_width(&font_id, cell.c);
-                    let pen_x = center_x + base_advance / 2.0;
-                    let lift = font_id.size * THAI_MARK_LIFT_EM;
-                    for (m, slot) in lifted {
-                        shapes.push(Shape::text(
-                            &fonts,
-                            Pos2 { x: pen_x, y: y - lift * slot as f32 },
-                            Align2::LEFT_TOP,
-                            m,
-                            font_id.clone(),
-                            fg,
-                        ));
-                    }
-                }
-            }
-        }
+        // pTerminal perf delta (glyph-run coalescing): the grid body is built
+        // by a free function so it can be measured and diff-tested headlessly
+        // — see `emit_grid_shapes`, and the `run_coalescing_tests` module,
+        // which renders the same content with and without `geom` and asserts
+        // the two shape lists are pixel-identical.
+        let font_id = self.font.font_type();
+        let geom = run_geometry(&fonts, &font_id, cell_width);
+        emit_grid_shapes(
+            content,
+            self.theme,
+            &font_id,
+            &fonts,
+            layout_min,
+            global_bg,
+            state.current_mouse_position_on_grid,
+            geom,
+            &mut shapes,
+        );
 
         // pTerminal delta (ghost suggestions): the dim remainder of the
         // matched history entry, drawn after the cursor and clamped to the
@@ -901,6 +1447,9 @@ impl<'a> TerminalView<'a> {
                 egui::Color32::from_rgba_unmultiplied(160, 170, 165, 150),
             )));
         }
+
+        #[cfg(debug_assertions)]
+        shape_stats::record(shapes.len(), build_started.elapsed());
 
         painter.extend(shapes);
     }
@@ -1728,6 +2277,731 @@ mod thai_composer_probe {
         let grid_text: String = rows.values().cloned().collect();
         println!("=== bases expected: {bases}");
         println!("=== bases all present: {}", bases.chars().all(|b| grid_text.contains(b)));
+    }
+}
+
+/// pTerminal perf delta (glyph-run coalescing): the end-to-end claim —
+/// coalescing changes the SHAPE COUNT and nothing else. Every test here
+/// paints the same synthetic-but-real grid twice, once through the run path
+/// and once through the untouched per-cell path, and compares what actually
+/// reaches the screen: the absolute position and colour of every glyph, the
+/// covered area of every background rect, and every hyperlink underline.
+///
+/// The grid is produced by a real `alacritty_terminal::Term` fed real ANSI,
+/// not by hand-built `Cell`s — wide chars, combining marks and SGR state all
+/// have to come out of the same code path the app uses, or the comparison
+/// proves nothing about the app.
+#[cfg(test)]
+mod run_coalescing_tests {
+    use super::*;
+    use alacritty_terminal::event::{Event, EventListener};
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line, Point};
+    use alacritty_terminal::term::{Config, Term};
+    use alacritty_terminal::vte::ansi::Processor;
+    use std::collections::BTreeMap;
+
+    const CELL_W: u16 = 8;
+    const CELL_H: u16 = 17;
+    const COLS: usize = 200;
+    const LINES: usize = 50;
+
+    struct Noop;
+    impl EventListener for Noop {
+        fn send_event(&self, _: Event) {}
+    }
+
+    /// A bare grid geometry — `TerminalSize`'s column/line fields are
+    /// private to the backend, and this test must not reach into it.
+    struct Dim;
+    impl Dimensions for Dim {
+        fn total_lines(&self) -> usize {
+            LINES
+        }
+        fn screen_lines(&self) -> usize {
+            LINES
+        }
+        fn columns(&self) -> usize {
+            COLS
+        }
+        fn last_column(&self) -> Column {
+            Column(COLS - 1)
+        }
+        fn bottommost_line(&self) -> Line {
+            Line(LINES as i32 - 1)
+        }
+    }
+
+    fn fonts(ppp: f32) -> egui::epaint::text::Fonts {
+        egui::epaint::text::Fonts::new(
+            ppp,
+            8 * 1024,
+            egui::FontDefinitions::default(),
+        )
+    }
+
+    fn font_id() -> egui::FontId {
+        TerminalFont::default().font_type()
+    }
+
+    /// Runs `ansi` through a real terminal emulator and snapshots the
+    /// resulting viewport the way `TerminalBackend::sync` does.
+    fn render_content(ansi: &str) -> RenderableContent {
+        let mut term = Term::new(Config::default(), &Dim, Noop);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, ansi.as_bytes());
+
+        // Only `cell_width`/`cell_height` are read by `emit_grid_shapes`;
+        // the column/line fields are the backend's private business and the
+        // grid's real geometry comes from `Dim` above.
+        let mut terminal_size =
+            crate::egui_term_vendored::backend::TerminalSize::default();
+        terminal_size.cell_width = CELL_W;
+        terminal_size.cell_height = CELL_H;
+
+        let cursor = term.grid_mut().cursor_cell().clone();
+        let grid = term.grid();
+        RenderableContent {
+            cells: grid
+                .display_iter()
+                .map(|i| (i.point, i.cell.clone()))
+                .collect(),
+            display_offset: grid.display_offset(),
+            cursor_point: grid.cursor.point,
+            cursor,
+            terminal_size,
+            ..Default::default()
+        }
+    }
+
+    /// A dense screen of the shape this renderer actually spends its life
+    /// on: a full 200x50 viewport of coloured build/agent output, with the
+    /// foreground changing every 24 columns and a bright-background span
+    /// every other row.
+    fn dense_ansi() -> String {
+        let mut s = String::new();
+        for line in 1..=LINES {
+            s.push_str(&format!("\x1b[{line};1H"));
+            for seg in 0..(COLS / 24) {
+                let colour = 31 + (line + seg) % 7;
+                if (line + seg) % 5 == 0 {
+                    s.push_str(&format!("\x1b[{colour};47m"));
+                } else {
+                    s.push_str(&format!("\x1b[{colour};49m"));
+                }
+                s.push_str("error[E0382]: value moved");
+            }
+            s.push_str("\x1b[0m");
+        }
+        s
+    }
+
+    /// Every awkward case in one screen: wide CJK, Thai combining marks,
+    /// box drawing, the cursor, inverse, dim and bold.
+    fn awkward_ansi() -> String {
+        let mut s = String::from("\x1b[2J\x1b[H");
+        s.push_str("plain ascii run then \u{4e2d}\u{6587} wide chars\r\n");
+        s.push_str("thai \u{0E02}\u{0E36}\u{0E49}\u{0E19} then ascii again\r\n");
+        s.push_str("\u{250c}\u{2500}\u{2500}\u{2510} box drawing \u{2502}\r\n");
+        s.push_str("\x1b[7minverse span\x1b[0m normal \x1b[2mdim span\x1b[0m\r\n");
+        s.push_str("\x1b[1mbold span\x1b[0m tail\r\n");
+        s.push_str("trailing spaces here        \r\n");
+        s.push_str("\x1b[44mblue bg run\x1b[0m\r\n");
+        s
+    }
+
+    // ---- what actually reaches the screen -------------------------------
+
+    /// Absolute position + colour of every inked glyph, sorted. Spaces are
+    /// dropped: the per-cell path never emitted a shape for them, the run
+    /// path carries them inside a galley, and a space has no ink either way.
+    fn glyph_prints(shapes: &[Shape]) -> Vec<String> {
+        let mut out = Vec::new();
+        for shape in shapes {
+            let Shape::Text(t) = shape else { continue };
+            for row in &t.galley.rows {
+                for g in &row.glyphs {
+                    if g.chr == ' ' {
+                        continue;
+                    }
+                    let colour =
+                        t.galley.job.sections[g.section_index as usize]
+                            .format
+                            .color;
+                    out.push(format!(
+                        "{:?} @ {:.3},{:.3} {:?}",
+                        g.chr,
+                        t.pos.x + g.pos.x,
+                        t.pos.y + g.pos.y,
+                        colour
+                    ));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Painted background area, as merged x-intervals per (colour, y-band).
+    /// Merging is the whole point: the per-cell path lays down one
+    /// `cell_width + 1` rect per cell, deliberately overlapping its
+    /// neighbour by a point to hide grid seams, and the run path lays down
+    /// one rect covering their union. Only the union is observable.
+    fn rect_coverage(shapes: &[Shape]) -> BTreeMap<String, Vec<(i64, i64)>> {
+        let mut bands: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
+        for shape in shapes {
+            let Shape::Rect(r) = shape else { continue };
+            let key = format!(
+                "{:?} y{:.3}..{:.3}",
+                r.fill,
+                r.rect.min.y,
+                r.rect.max.y
+            );
+            // Sub-milli-point quantisation: these are all sums of integers
+            // and halves, so this is exact, but it keeps f32 noise out of
+            // the interval arithmetic.
+            let q = |v: f32| (v * 1000.0).round() as i64;
+            bands
+                .entry(key)
+                .or_default()
+                .push((q(r.rect.min.x), q(r.rect.max.x)));
+        }
+        merge_bands(&mut bands);
+        bands
+    }
+
+    /// Same treatment for the hovered-hyperlink underline: per-cell segments
+    /// abut end-to-end, so only the merged span is observable.
+    fn line_coverage(shapes: &[Shape]) -> BTreeMap<String, Vec<(i64, i64)>> {
+        let mut bands: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
+        let q = |v: f32| (v * 1000.0).round() as i64;
+        for shape in shapes {
+            let Shape::LineSegment { points, stroke } = shape else {
+                continue;
+            };
+            let key = format!(
+                "{:?} w{:.3} y{:.3}",
+                stroke.color, stroke.width, points[0].y
+            );
+            assert_eq!(points[0].y, points[1].y, "underlines are horizontal");
+            bands
+                .entry(key)
+                .or_default()
+                .push((q(points[0].x), q(points[1].x)));
+        }
+        merge_bands(&mut bands);
+        bands
+    }
+
+    /// Collapses touching/overlapping x-intervals within each band.
+    fn merge_bands(bands: &mut BTreeMap<String, Vec<(i64, i64)>>) {
+        for spans in bands.values_mut() {
+            spans.sort_unstable();
+            let mut merged: Vec<(i64, i64)> = Vec::new();
+            for (lo, hi) in spans.drain(..) {
+                match merged.last_mut() {
+                    Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                    _ => merged.push((lo, hi)),
+                }
+            }
+            *spans = merged;
+        }
+    }
+
+    /// Paints `content` twice and returns `(per_cell_shapes, run_shapes)`.
+    fn paint_both(
+        content: &RenderableContent,
+        ppp: f32,
+    ) -> (Vec<Shape>, Vec<Shape>) {
+        let fonts = fonts(ppp);
+        let font_id = font_id();
+        let theme = &*DEFAULT_THEME;
+        let global_bg = theme.get_color(Color::Named(NamedColor::Background));
+        let cell_width = content.terminal_size.cell_width as f32;
+        let geom = run_geometry(&fonts, &font_id, cell_width)
+            .expect("the bundled monospace font must support coalescing");
+        let origin = Pos2::new(0.0, 0.0);
+        let mouse = TerminalGridPoint::new(Line(0), Column(0));
+
+        let mut per_cell = Vec::new();
+        emit_grid_shapes(
+            content, theme, &font_id, &fonts, origin, global_bg, mouse, None,
+            &mut per_cell,
+        );
+        let mut runs = Vec::new();
+        emit_grid_shapes(
+            content,
+            theme,
+            &font_id,
+            &fonts,
+            origin,
+            global_bg,
+            mouse,
+            Some(geom),
+            &mut runs,
+        );
+        (per_cell, runs)
+    }
+
+    /// Best-of-N wall time to build one frame's grid shapes each way. The
+    /// galley cache is warmed first, because in the app it always is: a
+    /// terminal repaints the same runs frame after frame, so a cold-cache
+    /// number would flatter the change rather than describe it.
+    fn time_both(
+        content: &RenderableContent,
+    ) -> (std::time::Duration, std::time::Duration) {
+        let fonts = fonts(1.0);
+        let font_id = font_id();
+        let theme = &*DEFAULT_THEME;
+        let bg = theme.get_color(Color::Named(NamedColor::Background));
+        let geom =
+            run_geometry(&fonts, &font_id, CELL_W as f32).expect("geometry");
+        let mouse = TerminalGridPoint::new(Line(0), Column(0));
+
+        let once = |geom: Option<RunGeometry>| {
+            let mut shapes = Vec::new();
+            let t = std::time::Instant::now();
+            emit_grid_shapes(
+                content, theme, &font_id, &fonts, Pos2::ZERO, bg, mouse, geom,
+                &mut shapes,
+            );
+            let d = t.elapsed();
+            std::hint::black_box(&shapes);
+            d
+        };
+        // Warm-up, then best-of-25 (the minimum is the least
+        // scheduler-contaminated estimate of the work itself).
+        for _ in 0..5 {
+            once(None);
+            once(Some(geom));
+        }
+        let before = (0..25).map(|_| once(None)).min().unwrap();
+        let after = (0..25).map(|_| once(Some(geom))).min().unwrap();
+        (before, after)
+    }
+
+    fn assert_identical(content: &RenderableContent, ppp: f32, what: &str) {
+        let (per_cell, runs) = paint_both(content, ppp);
+        assert_eq!(
+            glyph_prints(&per_cell),
+            glyph_prints(&runs),
+            "{what} @ ppp {ppp}: a glyph moved, changed colour or vanished"
+        );
+        assert_eq!(
+            rect_coverage(&per_cell),
+            rect_coverage(&runs),
+            "{what} @ ppp {ppp}: background coverage differs"
+        );
+        assert_eq!(
+            line_coverage(&per_cell),
+            line_coverage(&runs),
+            "{what} @ ppp {ppp}: hyperlink underlines differ"
+        );
+    }
+
+    // ---- the tests ------------------------------------------------------
+
+    /// The headline claim, on the workload the optimization exists for.
+    /// 100%, 150% and 200% display scaling: 200% is the case where the
+    /// font's advance (8.53) does not match the grid's truncated
+    /// `cell_width` (8), and where `RunGeometry::letter_spacing` is doing
+    /// all the work — without it a 24-char run ends more than a cell late.
+    #[test]
+    fn dense_screen_renders_identically_at_every_scale() {
+        let content = render_content(&dense_ansi());
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            assert_identical(&content, ppp, "dense screen");
+        }
+    }
+
+    /// Wide chars, Thai combining marks, box drawing, the cursor cell,
+    /// inverse/dim/bold spans and trailing whitespace — everything that is
+    /// supposed to fall back to the per-cell path, mixed with runs that are
+    /// not.
+    #[test]
+    fn awkward_content_renders_identically() {
+        let content = render_content(&awkward_ansi());
+        for ppp in [1.0, 2.0] {
+            assert_identical(&content, ppp, "awkward content");
+        }
+    }
+
+    /// A hovered hyperlink and an active selection both change per-cell
+    /// render state mid-row, so they exercise run splitting at both ends of
+    /// a span as well as the coalesced underline.
+    #[test]
+    fn selection_and_hyperlink_render_identically() {
+        let mut content = render_content(&dense_ansi());
+        content.hovered_hyperlink = Some(
+            Point::new(Line(3), Column(10))..=Point::new(Line(3), Column(40)),
+        );
+        // A selection that starts and ends mid-row and mid-colour-span, so
+        // runs have to split at both of its edges as well as at the SGR
+        // changes inside it.
+        content.selectable_range =
+            Some(alacritty_terminal::selection::SelectionRange::new(
+                Point::new(Line(6), Column(37)),
+                Point::new(Line(9), Column(113)),
+                false,
+            ));
+        let (per_cell, runs) = {
+            // The hover only counts while the mouse is inside the range, so
+            // paint with the mouse parked in it.
+            let fonts = fonts(1.0);
+            let font_id = font_id();
+            let theme = &*DEFAULT_THEME;
+            let bg = theme.get_color(Color::Named(NamedColor::Background));
+            let geom = run_geometry(&fonts, &font_id, CELL_W as f32).unwrap();
+            let mouse = Point::new(Line(3), Column(20));
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            emit_grid_shapes(
+                &content, theme, &font_id, &fonts,
+                Pos2::ZERO, bg, mouse, None, &mut a,
+            );
+            emit_grid_shapes(
+                &content,
+                theme,
+                &font_id,
+                &fonts,
+                Pos2::ZERO,
+                bg,
+                mouse,
+                Some(geom),
+                &mut b,
+            );
+            (a, b)
+        };
+        assert_eq!(glyph_prints(&per_cell), glyph_prints(&runs));
+        assert_eq!(rect_coverage(&per_cell), rect_coverage(&runs));
+        assert_eq!(line_coverage(&per_cell), line_coverage(&runs));
+        assert!(
+            !line_coverage(&runs).is_empty(),
+            "the test set up a hyperlink hover but no underline was drawn"
+        );
+    }
+
+    /// The measurement this change exists to produce. Not an assertion about
+    /// a magic number — the thresholds are loose sanity rails; the printed
+    /// figures are the deliverable. Run with `--nocapture` to read them.
+    #[test]
+    fn reports_shape_counts() {
+        for (name, ansi) in [
+            ("dense 200x50 coloured output", dense_ansi()),
+            ("awkward (wide/Thai/box) content", awkward_ansi()),
+        ] {
+            let content = render_content(&ansi);
+            let (per_cell, runs) = paint_both(&content, 1.0);
+            let texts = |v: &Vec<Shape>| {
+                v.iter().filter(|s| matches!(s, Shape::Text(_))).count()
+            };
+            let rects = |v: &Vec<Shape>| {
+                v.iter().filter(|s| matches!(s, Shape::Rect(_))).count()
+            };
+            println!(
+                "{name}: shapes {} -> {} ({:.1}x), text {} -> {}, rect {} -> {}",
+                per_cell.len(),
+                runs.len(),
+                per_cell.len() as f64 / runs.len().max(1) as f64,
+                texts(&per_cell),
+                texts(&runs),
+                rects(&per_cell),
+                rects(&runs),
+            );
+            let (before, after) = time_both(&content);
+            println!(
+                "  build time/frame (warm galley cache): {before:?} -> \
+                 {after:?} ({:.1}x)",
+                before.as_secs_f64() / after.as_secs_f64().max(1e-12)
+            );
+        }
+        // Rail: the dense screen must actually coalesce, or the optimization
+        // silently did nothing and every other test here passes vacuously.
+        let content = render_content(&dense_ansi());
+        let (per_cell, runs) = paint_both(&content, 1.0);
+        assert!(
+            runs.len() * 4 < per_cell.len(),
+            "dense output should coalesce at least 4x: {} -> {}",
+            per_cell.len(),
+            runs.len()
+        );
+    }
+
+    /// The one assumption `run_geometry`'s 95-character probe cannot fully
+    /// check at runtime: that no ASCII PAIR kerns. A kern pair would shift
+    /// every glyph after it within a run while leaving the per-cell path
+    /// alone. Monospace fonts do not ship kerning tables, and this checks
+    /// all 9025 pairs of the bundled font to make sure the one in use is no
+    /// exception. If a future font swap breaks this, the runtime probe still
+    /// catches the common cases and disables coalescing.
+    #[test]
+    fn ascii_pairs_never_kern() {
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let fonts = fonts(ppp);
+            let font_id = font_id();
+            let cell_width = CELL_W as f32;
+            let geom = run_geometry(&fonts, &font_id, cell_width).unwrap();
+            for a in RUN_PROBE.chars() {
+                let text: String =
+                    RUN_PROBE.chars().flat_map(|b| [a, b]).collect();
+                let galley = fonts.layout_job(run_layout_job(
+                    text,
+                    font_id.clone(),
+                    egui::Color32::WHITE,
+                    geom.letter_spacing,
+                ));
+                for (k, g) in galley.rows[0].glyphs.iter().enumerate() {
+                    assert!(
+                        (g.pos.x - k as f32 * cell_width).abs()
+                            < RUN_GRID_TOLERANCE,
+                        "pair {:?}{:?} at ppp {ppp} kerns: glyph {k} at {} \
+                         instead of {}",
+                        a,
+                        g.chr,
+                        g.pos.x,
+                        k as f32 * cell_width
+                    );
+                }
+            }
+        }
+    }
+
+    /// The safety valve: if the probe cannot be satisfied, `run_geometry`
+    /// must decline rather than draw drifting text. Feeding it a cell width
+    /// the font cannot possibly match is the cheapest way to prove the
+    /// rejection path exists and is wired to the fallback.
+    #[test]
+    fn impossible_geometry_is_declined() {
+        let fonts = fonts(1.0);
+        assert!(run_geometry(&fonts, &font_id(), 8.0).is_some());
+        // `extra_letter_spacing` can absorb a fractional advance, but not a
+        // cell width the pixel grid cannot land on at this scale.
+        assert!(run_geometry(&fonts, &font_id(), 8.5).is_none());
+    }
+}
+
+/// pTerminal perf delta (glyph-run coalescing): the run-splitting decision,
+/// tested as pure logic — no egui context, no font, no PTY. Every break
+/// condition gets its own case, because a missed one does not crash, it just
+/// draws the wrong thing somewhere on a screen nobody is looking at.
+#[cfg(test)]
+mod run_split_tests {
+    use super::{cell_is_runnable, joins_run, run_cell, RunCell};
+    use alacritty_terminal::index::{Column, Line, Point};
+    use alacritty_terminal::term::cell::Flags;
+    use egui::Color32;
+
+    const FG: Color32 = Color32::from_rgb(200, 200, 200);
+    const BG: Color32 = Color32::from_rgb(10, 20, 30);
+
+    /// A plain, unstyled, unselected, non-cursor cell at `col`.
+    fn plain(col: usize) -> RunCell {
+        styled(col, 'a', Flags::empty(), false, false, false)
+    }
+
+    fn styled(
+        col: usize,
+        c: char,
+        flags: Flags,
+        selected: bool,
+        hyperlink: bool,
+        cursor: bool,
+    ) -> RunCell {
+        run_cell(
+            &Point::new(Line(4), Column(col)),
+            c,
+            flags,
+            false,
+            FG,
+            BG,
+            selected,
+            hyperlink,
+            cursor,
+        )
+    }
+
+    #[test]
+    fn identical_neighbours_merge() {
+        assert!(joins_run(&plain(0), &plain(1)));
+        assert!(joins_run(&plain(41), &plain(42)));
+    }
+
+    /// `RenderableContent::cells` drops trailing blanks, so a row can have
+    /// holes — a run that bridged one would position every glyph after the
+    /// hole a column too far left.
+    #[test]
+    fn column_gap_breaks_the_run() {
+        assert!(!joins_run(&plain(0), &plain(2)));
+        // ...and so does going backwards, which a row wrap looks like.
+        assert!(!joins_run(&plain(5), &plain(4)));
+    }
+
+    #[test]
+    fn row_change_breaks_the_run() {
+        let mut next = plain(1);
+        next.line = 5;
+        assert!(!joins_run(&plain(0), &next));
+    }
+
+    #[test]
+    fn foreground_change_breaks_the_run() {
+        let mut next = plain(1);
+        next.fg = Color32::RED;
+        assert!(!joins_run(&plain(0), &next));
+    }
+
+    #[test]
+    fn background_change_breaks_the_run() {
+        let mut next = plain(1);
+        next.bg = Color32::BLUE;
+        assert!(!joins_run(&plain(0), &next));
+    }
+
+    /// INVERSE and DIM are not compared directly — they fold into the final
+    /// colours (see `RunCell`). What matters is that a cell carrying them
+    /// still refuses to join a cell that does not.
+    #[test]
+    fn inverse_breaks_the_run() {
+        let inv = styled(1, 'a', Flags::INVERSE, false, false, false);
+        assert!(!joins_run(&plain(0), &inv));
+        // and inverse-vs-inverse still merges
+        let inv0 = styled(0, 'a', Flags::INVERSE, false, false, false);
+        assert!(joins_run(&inv0, &inv));
+    }
+
+    /// BOLD is in this list, not in `unrendered_flags_do_not_break_the_run`,
+    /// and that is not a mistake: alacritty's `DIM_BOLD` is the compound
+    /// mask `DIM | BOLD`, so the renderer's `intersects(DIM | DIM_BOLD)`
+    /// dims plain-bold cells as well. Whether or not that is what upstream
+    /// meant, it is what the pixels do, so a run must break on it.
+    #[test]
+    fn dim_breaks_the_run() {
+        for dim in [Flags::DIM, Flags::DIM_BOLD, Flags::BOLD] {
+            let d = styled(1, 'a', dim, false, false, false);
+            assert!(!joins_run(&plain(0), &d), "{dim:?} must break the run");
+        }
+    }
+
+    #[test]
+    fn selection_edge_breaks_the_run() {
+        let sel = styled(1, 'a', Flags::empty(), true, false, false);
+        assert!(!joins_run(&plain(0), &sel));
+        let sel0 = styled(0, 'a', Flags::empty(), true, false, false);
+        assert!(joins_run(&sel0, &sel));
+    }
+
+    /// A selected cell and an unselected one that happen to paint the same
+    /// two colours DO belong together: selection is a colour swap and
+    /// nothing else, so the two are indistinguishable on screen. This is the
+    /// one place the reduction is deliberately looser than "same flags".
+    #[test]
+    fn selection_that_paints_the_same_still_merges() {
+        let a = run_cell(
+            &Point::new(Line(0), Column(0)),
+            'a',
+            Flags::empty(),
+            false,
+            FG,
+            BG,
+            true, // selected: paints (BG, FG)
+            false,
+            false,
+        );
+        let b = run_cell(
+            &Point::new(Line(0), Column(1)),
+            'b',
+            Flags::empty(),
+            false,
+            BG,
+            FG,
+            false, // not selected: also paints (BG, FG)
+            false,
+            false,
+        );
+        assert!(joins_run(&a, &b));
+    }
+
+    #[test]
+    fn hyperlink_hover_edge_breaks_the_run() {
+        let link = styled(1, 'a', Flags::empty(), false, true, false);
+        assert!(!joins_run(&plain(0), &link));
+        let link0 = styled(0, 'a', Flags::empty(), false, true, false);
+        assert!(joins_run(&link0, &link));
+    }
+
+    /// ITALIC/UNDERLINE/STRIKEOUT are never read by this renderer (one
+    /// `FontId` for the whole grid, no decoration drawing outside the
+    /// hyperlink hover), so breaking on them would cost runs and change
+    /// nothing on screen. BOLD is NOT here — see `dim_breaks_the_run`.
+    #[test]
+    fn unrendered_flags_do_not_break_the_run() {
+        for f in [Flags::ITALIC, Flags::UNDERLINE, Flags::STRIKEOUT] {
+            let next = styled(1, 'a', f, false, false, false);
+            assert!(joins_run(&plain(0), &next), "{f:?} should not split");
+        }
+    }
+
+    #[test]
+    fn cursor_cell_never_runs() {
+        let cur = styled(1, 'a', Flags::empty(), false, false, true);
+        assert!(!cur.runnable);
+        assert!(!joins_run(&plain(0), &cur));
+        assert!(!joins_run(&cur, &plain(2)));
+    }
+
+    #[test]
+    fn wide_chars_and_their_spacers_never_run() {
+        for f in [Flags::WIDE_CHAR, Flags::WIDE_CHAR_SPACER] {
+            assert!(
+                !cell_is_runnable('a', f, false, false),
+                "{f:?} must stay on the per-cell path"
+            );
+        }
+        let wide = styled(1, '中', Flags::WIDE_CHAR, false, false, false);
+        assert!(!joins_run(&plain(0), &wide));
+        assert!(!joins_run(&wide, &plain(2)));
+    }
+
+    /// A cell carrying combining marks keeps the Thai mark-lifting path,
+    /// which appends marks to that cell's own string and pen-positions the
+    /// lifted ones — none of which survives a shared galley.
+    #[test]
+    fn zerowidth_bearing_cells_never_run() {
+        assert!(!cell_is_runnable('ก', Flags::empty(), true, false));
+        let mark = run_cell(
+            &Point::new(Line(4), Column(1)),
+            'ก',
+            Flags::empty(),
+            true,
+            FG,
+            BG,
+            false,
+            false,
+            false,
+        );
+        assert!(!mark.runnable);
+        assert!(!joins_run(&plain(0), &mark));
+        assert!(!joins_run(&mark, &plain(2)));
+    }
+
+    /// Runs are printable ASCII only: anything else may be resolved through
+    /// the proportional Thai fallback font, whose advance is not the cell
+    /// width. Tab is excluded too — the per-cell path skips it and its
+    /// galley advance is TAB_SIZE cells.
+    #[test]
+    fn only_printable_ascii_runs() {
+        for c in [' ', '!', 'A', 'z', '~', '0'] {
+            assert!(
+                cell_is_runnable(c, Flags::empty(), false, false),
+                "{c:?} should run"
+            );
+        }
+        for c in ['\t', '\n', '\0', '\u{7f}', 'ก', '中', '─', '→', '✓'] {
+            assert!(
+                !cell_is_runnable(c, Flags::empty(), false, false),
+                "{c:?} must stay on the per-cell path"
+            );
+        }
     }
 }
 
