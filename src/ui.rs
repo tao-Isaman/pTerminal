@@ -185,6 +185,81 @@ impl PtApp {
                 // guard in `shortcuts()`). Computed once, read at every
                 // suppression point below.
                 let is_orchestrator = ws.meta.is_orchestrator;
+                // ---- Task P4 (repaint amplification), and what it is worth ----
+                //
+                // Measured first, on this machine, release build, with 4
+                // workspaces x 6 agent tabs (3 subagent rows + 2 worker-proc
+                // rows each) + 2 editor tabs per workspace, min of 8 batches
+                // of 400 frames:
+                //
+                //     sidebar_ui 21 us   tab_strip_ui 40 us   status_bar_ui 7 us
+                //
+                // and, as a control, 180 bare `ui.selectable_label`s with
+                // pre-built strings and no derivation at all: **188 us**. The
+                // panels are therefore ~95% egui widget machinery (roughly
+                // 3 us per widget: id allocation, layout, interaction,
+                // galley lookup, tessellation) and ~5% our own per-frame
+                // derivation. Isolating that derivation — the cpu/mem folds,
+                // the `format!`s, the shared-dir scan — for one workspace's
+                // strip measured 17 us against the strip's 40 us total, and
+                // most of that 17 us is the one owned `String` per label that
+                // egui's `impl Into<String>` API makes mandatory whether the
+                // text is freshly formatted or cloned out of a cache.
+                //
+                // So: NO label/fingerprint cache here, despite that being the
+                // house pattern (`roster_written`, `shared_excerpt_cache`).
+                // A/B measured across three runs each, before vs after every
+                // change in this function, the difference is inside the noise
+                // (67.3-71.0 us total before, 67.8-73.1 us after). A cache
+                // would buy single-digit microseconds per frame and cost a
+                // stale-label hazard in the app's primary UI. The changes
+                // that DID go in below are the ones that are strictly less
+                // work with nothing to invalidate. The measurable P4 win was
+                // somewhere else entirely — `drain_events`' per-frame
+                // `shared.md` stat sweep, 80.2 us/frame to 0.5 us/frame; see
+                // the FINDING at `PtApp::drain_events`' housekeeping throttle.
+                //
+                // Hoisted out of the per-tab loop below: both are constant
+                // for the whole strip — the font came from
+                // `TextStyle::Button.resolve(ui.style())` (an `Arc<Style>`
+                // deref plus a `FontId` clone) and the base color from
+                // `ui.visuals()`, once per tab per frame, to produce the same
+                // two values every time.
+                let font = egui::TextStyle::Button.resolve(ui.style());
+                let base = ui.visuals().text_color();
+                // Task P4: how many Claude AGENT tabs sit in each `cwd`,
+                // counted once per frame. The shared-dir warning marker below
+                // used to answer that with a nested `ws.tabs.iter().any(...)`
+                // per tab — O(n^2) `PathBuf` comparisons (full
+                // component-wise path compares, not pointer compares)
+                // re-derived every frame from data that only changes when a
+                // tab is opened or closed. A scaling fix, not a measured win:
+                // at the 6-tab strip this app actually shows it is a wash
+                // against the nested scan (see the measurement note above),
+                // and it is here because O(n^2) path comparisons in a
+                // frame-rate loop is the wrong shape, not because the clock
+                // moved.
+                //
+                // **The filter here must match the old INNER predicate, not
+                // the outer one.** The nested scan tested `other.provider ==
+                // Claude && other.kind == Agent && other.cwd == tab.cwd` —
+                // and pointedly NOT `other.worktree.is_none()`, even though
+                // the outer condition requires that of `tab` itself. Adding
+                // the worktree filter here (the obvious-looking symmetry, and
+                // my first attempt) would silently narrow the warning: an
+                // isolated tab whose worktree happens to sit at the same path
+                // as a direct-mode tab's cwd would stop being reported.
+                let claude_agents_at: std::collections::HashMap<&std::path::Path, usize> =
+                    ws.tabs
+                        .iter()
+                        .filter(|t| {
+                            t.provider == crate::provider::AgentProvider::Claude
+                                && t.kind == TabKind::Agent
+                        })
+                        .fold(std::collections::HashMap::new(), |mut m, t| {
+                            *m.entry(t.cwd.as_path()).or_insert(0) += 1;
+                            m
+                        });
                 let mut close_req = None;
                 for (i, tab) in ws.tabs.iter().enumerate() {
                     // Shared-dir warning marker (Step 3). Only Agent tabs
@@ -198,11 +273,18 @@ impl PtApp {
                     // hooks, no `.claude/settings.local.json` writes), so it
                     // can't take over another tab's status routing the way
                     // a second direct-mode agent spawn does.
-                    let shared_dir_warning = tab.provider == crate::provider::AgentProvider::Claude && tab.kind == TabKind::Agent
+                    //
+                    // Task P4: the "some OTHER Claude agent tab shares this
+                    // cwd" test is now a lookup into `claude_agents_at`
+                    // (built once above), not a nested scan per tab. `> 1`
+                    // rather than `>= 1` because whenever the outer condition
+                    // holds `tab` is itself a Claude agent tab and so is
+                    // counted in its own group — which is exactly the `j != i`
+                    // the old inner loop excluded by hand.
+                    let shared_dir_warning = tab.provider == crate::provider::AgentProvider::Claude
+                        && tab.kind == TabKind::Agent
                         && tab.worktree.is_none()
-                        && ws.tabs.iter().enumerate().any(|(j, other)| {
-                            j != i && other.provider == crate::provider::AgentProvider::Claude && other.kind == TabKind::Agent && other.cwd == tab.cwd
-                        });
+                        && claude_agents_at.get(tab.cwd.as_path()).is_some_and(|n| *n > 1);
                     // Two-section label: the status marker keeps its own
                     // color while the title stays in the theme's text color,
                     // which a plain `RichText` (one color for the whole
@@ -223,8 +305,6 @@ impl PtApp {
                     } else {
                         (">", None, None)
                     };
-                    let font = egui::TextStyle::Button.resolve(ui.style());
-                    let base = ui.visuals().text_color();
                     let mut text = egui::text::LayoutJob::default();
                     let mut fmt = |s: &str, color: egui::Color32| {
                         text.append(
@@ -316,15 +396,34 @@ impl PtApp {
                         // `char_indices().nth(24)` yields the byte cut point
                         // of the 25th char iff the desc is over 24 chars
                         // (same condition as the old `chars.len() > 24`),
-                        // so the label text is identical and nothing
-                        // allocates beyond the one String the label needs.
-                        let truncated = match child.desc.char_indices().nth(24) {
-                            Some((cut, _)) => format!("{}...", &child.desc[..cut]),
-                            None => child.desc.clone(),
-                        };
+                        // so the label text is identical.
+                        //
+                        // Task P4: built into ONE String instead of two. The
+                        // previous shape (`format!("{}...", ..)` into
+                        // `truncated`, then `format!("  `- {truncated}")`)
+                        // allocated the intermediate and immediately threw it
+                        // away — twice per subagent row, every frame, and a
+                        // busy agent shows several rows per tab. egui's own
+                        // API forces exactly one owned `String` per label
+                        // (`RichText::new` takes `impl Into<String>`), so one
+                        // is the floor; the second was pure waste. Like the
+                        // rest of this function's P4 changes the effect is
+                        // below the measurement floor at realistic tab counts
+                        // (see the note at the top of `tab_strip_ui`) — it is
+                        // here because it is strictly less work with nothing
+                        // to invalidate, not because the clock moved.
+                        let mut label = String::with_capacity(child.desc.len() + 8);
+                        label.push_str("  `- ");
+                        match child.desc.char_indices().nth(24) {
+                            Some((cut, _)) => {
+                                label.push_str(&child.desc[..cut]);
+                                label.push_str("...");
+                            }
+                            None => label.push_str(&child.desc),
+                        }
                         let child_resp = ui.selectable_label(
                             self.selected_child == Some((tab.id, child_idx)),
-                            egui::RichText::new(format!("  `- {truncated}")).color(color).small(),
+                            egui::RichText::new(label).color(color).small(),
                         );
                         if child_resp.clicked() {
                             self.selected_child = Some((tab.id, child_idx));
@@ -375,9 +474,17 @@ impl PtApp {
                     } else {
                         format!("[e] {file_name}")
                     };
+                    // Task P4: `on_hover_ui`, not `on_hover_text` — the
+                    // argument to `on_hover_text` is evaluated eagerly, so
+                    // `ed.path.display().to_string()` formatted and allocated
+                    // the full path of every open editor tab on every frame,
+                    // hovered or not. Same lazy-hover fix (and same rationale)
+                    // already applied to the terminal tabs' hover above.
                     let resp = ui
                         .selectable_label(ws.active_editor == Some(ei), label)
-                        .on_hover_text(ed.path.display().to_string());
+                        .on_hover_ui(|ui| {
+                            ui.label(ed.path.display().to_string());
+                        });
                     if resp.clicked() {
                         ws.active_editor = Some(ei);
                         self.selected_child = None;
@@ -450,13 +557,13 @@ impl PtApp {
                     .flat_map(|w| &w.tabs)
                     .fold((0.0, 0), |(c, m), t| (c + t.cpu, m + t.mem));
                 ui.label(format!("agents: {:.1}GB / {:.0}%", mem as f64 / 1e9, cpu));
-                let own = self
-                    .last_snap
-                    .iter()
-                    .find(|p| p.pid == std::process::id())
-                    .map(|p| p.mem)
-                    .unwrap_or(0);
-                ui.label(format!("pterm: {:.0}MB", own as f64 / 1e6));
+                // Task P4: `self.own_mem` is maintained by `drain_events` on
+                // the sampler's ~2 s tick. This used to be
+                // `last_snap.iter().find(|p| p.pid == std::process::id())`
+                // right here — a linear scan of the machine's entire process
+                // table, plus a `getpid`, per frame, for a value that can
+                // only change when a new snapshot lands. See `PtApp::own_mem`.
+                ui.label(format!("pterm: {:.0}MB", self.own_mem as f64 / 1e6));
                 ui.label(format!(
                     "machine: {:.1}/{:.1}GB  cpu {:.0}%",
                     self.machine.mem_used as f64 / 1e9,
