@@ -292,8 +292,20 @@ fn run_geometry(
     if probe.rows.len() != 1 || row.glyphs.len() != RUN_PROBE.len() {
         return None;
     }
+    // Two separate checks, and the second is not redundant. Positions are
+    // pixel-rounded, so they only pin each advance to within 1/ppp — two
+    // characters whose raw advances differ by a fraction of a device pixel
+    // would step identically here yet produce different single-glyph galley
+    // widths (`round_ui`, granularity 1/32pt), and `origin_dx` below is
+    // measured from ONE character on behalf of all of them. Comparing the
+    // raw `advance_width` the galley already carries closes that gap for
+    // free — no extra layout, no extra font lock.
+    let advance = row.glyphs.first()?.advance_width;
     for (k, glyph) in row.glyphs.iter().enumerate() {
         if (glyph.pos.x - k as f32 * cell_width).abs() > RUN_GRID_TOLERANCE {
+            return None;
+        }
+        if glyph.advance_width != advance {
             return None;
         }
     }
@@ -301,9 +313,9 @@ fn run_geometry(
     // The per-cell path's baked-in nudge, measured rather than derived: a
     // single-glyph galley is `round_ui(advance)` wide and gets centred in a
     // `cell_width`-wide cell. One measurement covers every runnable
-    // character because the probe above has just established that they all
-    // advance identically — which is the same reason they can share a run at
-    // all. (`m` is only a representative; any of them would do.)
+    // character because the loop above has just established that they all
+    // report the same raw `advance_width`, so `round_ui` of it is the same
+    // too. (`m` is only a representative; any of them would do.)
     let one = fonts.layout_no_wrap(
         "m".to_owned(),
         font_id.clone(),
@@ -319,6 +331,9 @@ fn run_geometry(
 /// decide how it is painted. Two horizontally adjacent cells may share one
 /// text shape, one background rect and one hyperlink underline exactly when
 /// [`joins_run`] says their reductions match.
+///
+/// A cell whose final background is not fully opaque is never runnable —
+/// see the `runnable` field in [`run_cell`], where the reasoning lives.
 ///
 /// Note that `fg`/`bg` are the FINAL colours, after DIM, INVERSE and
 /// selection have been applied. Folding those flags into the colours instead
@@ -409,7 +424,22 @@ fn run_cell(
         fg,
         bg,
         underline: is_hyperlink,
-        runnable: cell_is_runnable(c, flags, has_zerowidth, is_cursor),
+        // A TRANSLUCENT background cannot be coalesced, and the reason is
+        // subtle enough to be worth spelling out. `linear_multiply` scales
+        // premultiplied alpha along with the colour channels, so DIM does not
+        // just darken a colour, it makes it ~70% opaque — and the swap two
+        // lines up then moves that into `bg` whenever the cell is also
+        // selected or inverse (`ESC[2m` output dragged through a selection is
+        // the everyday case). The per-cell path emits one `cell_width + 1`
+        // rect per cell, so neighbours overlap by a point on purpose; with an
+        // opaque fill that is invisible, but at alpha 0.7 each seam composites
+        // twice (0.91 vs 0.70 coverage) and paints a 1pt stripe every cell.
+        // One run-wide rect has no interior seams, so those stripes would
+        // disappear inside runs and survive between them — different pixels,
+        // and conspicuously irregular ones. Rare enough that dropping such
+        // cells to the per-cell path costs nothing measurable.
+        runnable: bg.is_opaque()
+            && cell_is_runnable(c, flags, has_zerowidth, is_cursor),
     }
 }
 
@@ -492,17 +522,33 @@ impl RunPainter<'_> {
     ///   `[x0, x0 + len*cell_width]`;
     /// * the glyphs — see [`RunGeometry`].
     ///
-    /// One ordering difference is worth naming, since "identical output" is
-    /// the whole premise. The per-cell path interleaves rect, glyph, rect,
-    /// glyph..., so each cell's background over-painted the 1-point tail its
-    /// LEFT NEIGHBOUR's galley box extended into it. A run paints its whole
-    /// background first and then all its glyphs, so that tail is no longer
-    /// clipped. This can only ever show up mid-run — i.e. between two cells
-    /// that share a background colour, since a colour change is a run break
-    /// and the runs still flush in left-to-right order — and only for a
-    /// glyph whose ink overhangs its own advance box, which the bundled
-    /// monospace font's do not. Everything the tests can observe (glyph
-    /// positions, colours, covered background area) is unchanged.
+    /// THE ONE KNOWN DEVIATION, stated plainly because "identical output"
+    /// is the premise of this whole change.
+    ///
+    /// The per-cell path interleaved rect, glyph, rect, glyph..., and each
+    /// cell's background rect is a point wider than its cell. So every
+    /// glyph had whatever ink it pushed past `x + cell_width` erased by its
+    /// right neighbour's background. A run paints one background and then
+    /// all its glyphs, so that ink now survives.
+    ///
+    /// It is not hypothetical: measured on the bundled font at 14pt,
+    /// `glyph_ink_can_overhang_its_cell` finds glyphs (`#` is the worst,
+    /// and `_`, `~`, `W`, `m` are close) whose rasterised quad reaches
+    /// ~0.7pt beyond the erase point — the antialiased edge of a right-hand
+    /// stem, not a whole stroke.
+    ///
+    /// It is confined to runs on a NON-DEFAULT background (no rect is
+    /// emitted at all on the default one, so nothing erases anything), and
+    /// the run boundary itself is unaffected, since a colour change breaks
+    /// the run and runs still flush left to right. Within such a span the
+    /// change is that glyphs stop being clipped — the seam-hiding `+ 1.0`
+    /// exists to cover gaps BETWEEN cells, and a single run-wide rect has
+    /// no gaps to cover, so not clipping is the more correct result.
+    ///
+    /// Keeping it bit-identical would mean one rect per cell again, which
+    /// on the measured dense screen is ~4400 shapes instead of 482 — five
+    /// times the cost to preserve a sub-pixel artefact. That trade is the
+    /// reason this is documented rather than "fixed".
     fn flush(
         &self,
         first: &RunCell,
@@ -2766,6 +2812,135 @@ mod run_coalescing_tests {
         }
     }
 
+    /// Locks the translucent-background rule end to end, and does it with a
+    /// comparison the other tests cannot make: `rect_coverage` merges
+    /// touching intervals, which is exactly what hides seam double-blending,
+    /// so this one compares the raw, unmerged, ordered rect list. Dim text
+    /// dragged through a selection is the everyday way to produce a
+    /// translucent background — see `run_cell`.
+    #[test]
+    fn dim_selected_text_keeps_its_per_cell_rects() {
+        let mut content =
+            render_content("\x1b[2mdim output, about to be selected\r\n");
+        content.selectable_range =
+            Some(alacritty_terminal::selection::SelectionRange::new(
+                Point::new(Line(0), Column(0)),
+                Point::new(Line(0), Column(30)),
+                false,
+            ));
+        let (per_cell, runs) = paint_both(&content, 1.0);
+
+        let raw_rects = |v: &[Shape]| -> Vec<String> {
+            v.iter()
+                .filter_map(|s| match s {
+                    Shape::Rect(r) => {
+                        Some(format!("{:?} {:?}", r.rect, r.fill))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let translucent = per_cell
+            .iter()
+            .filter(|s| matches!(s, Shape::Rect(r) if !r.fill.is_opaque()))
+            .count();
+        assert!(
+            translucent > 0,
+            "test premise failed: dim + selection should yield translucent \
+             background rects, so this test would pass vacuously"
+        );
+        assert_eq!(
+            raw_rects(&per_cell),
+            raw_rects(&runs),
+            "translucent backgrounds must not be coalesced — the per-cell \
+             rects overlap by a point and double-blend at every seam, which \
+             one run-wide rect cannot reproduce"
+        );
+    }
+
+    /// `origin_dx` is measured from a single `'m'` on behalf of all 95
+    /// runnable characters, which is only sound if they all advance
+    /// identically. `run_geometry` now checks that from the probe galley's
+    /// `advance_width`s; this pins down that the bundled font actually
+    /// satisfies it, and that the single-glyph galley widths it implies
+    /// really are all equal (that width is what the per-cell `CENTER_TOP`
+    /// anchor divides by, so a single outlier would offset that character
+    /// against its run).
+    #[test]
+    fn every_runnable_char_has_the_same_advance() {
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let fonts = fonts(ppp);
+            let font_id = font_id();
+            let widths: std::collections::BTreeSet<String> = RUN_PROBE
+                .chars()
+                .map(|c| {
+                    let g = fonts.layout_no_wrap(
+                        c.to_string(),
+                        font_id.clone(),
+                        egui::Color32::WHITE,
+                    );
+                    format!("{:.6}", g.rect.width())
+                })
+                .collect();
+            assert_eq!(
+                widths.len(),
+                1,
+                "ppp {ppp}: single-glyph galley widths must be uniform, got \
+                 {widths:?}"
+            );
+        }
+    }
+
+    /// Measures the deviation documented on `RunPainter::flush` instead of
+    /// asserting it away. The per-cell path let each cell's background rect
+    /// erase whatever ink its left neighbour pushed past the cell boundary;
+    /// a run-wide rect does not. This records how much ink that is, so the
+    /// claim in the comment is a measured fact and a future font change
+    /// that makes it dramatically worse shows up as a failure here rather
+    /// than as a mystery on screen.
+    #[test]
+    fn glyph_ink_can_overhang_its_cell() {
+        let fonts = fonts(1.0);
+        let font_id = font_id();
+        let cell_width = CELL_W as f32;
+        let geom = run_geometry(&fonts, &font_id, cell_width).unwrap();
+        // Where the next cell's background rect starts, in the coordinates
+        // of a glyph drawn by the per-cell path.
+        let erase_at = cell_width - geom.origin_dx;
+
+        let mut worst = (f32::MIN, ' ');
+        for c in RUN_PROBE.chars() {
+            let g = fonts.layout_no_wrap(
+                c.to_string(),
+                font_id.clone(),
+                egui::Color32::WHITE,
+            );
+            let Some(glyph) = g.rows[0].glyphs.first() else { continue };
+            if glyph.uv_rect.size[0] == 0.0 {
+                continue; // no ink (space)
+            }
+            let ink_right =
+                glyph.pos.x + glyph.uv_rect.offset.x + glyph.uv_rect.size[0];
+            if ink_right > worst.0 {
+                worst = (ink_right, c);
+            }
+        }
+        let overhang = worst.0 - erase_at;
+        println!(
+            "worst ink overhang past the erase point: {:?} by {:.4}pt \
+             (erase at {erase_at:.4}, ink to {:.4})",
+            worst.1, overhang, worst.0
+        );
+        // A whole cell of overhang would mean the font is not monospace in
+        // any useful sense and the deviation stops being sub-pixel.
+        assert!(
+            overhang < cell_width * 0.25,
+            "ink overhang grew to {overhang:.4}pt for {:?}; the deviation \
+             documented on RunPainter::flush is no longer sub-pixel",
+            worst.1
+        );
+    }
+
     /// The safety valve: if the probe cannot be satisfied, `run_geometry`
     /// must decline rather than draw drifting text. Feeding it a cell width
     /// the font cannot possibly match is the cheapest way to prove the
@@ -2982,6 +3157,37 @@ mod run_split_tests {
         assert!(!mark.runnable);
         assert!(!joins_run(&plain(0), &mark));
         assert!(!joins_run(&mark, &plain(2)));
+    }
+
+    /// `linear_multiply` scales premultiplied ALPHA too, so DIM yields a
+    /// ~70%-opaque colour; INVERSE or selection then swaps that into the
+    /// background. The per-cell path's deliberately-overlapping rects
+    /// double-blend at every seam, which one run-wide rect cannot
+    /// reproduce, so such cells must stay per-cell. See `run_cell`.
+    #[test]
+    fn translucent_background_is_never_runnable() {
+        let dim_selected =
+            styled(1, 'a', Flags::DIM, true, false, false);
+        assert!(
+            !dim_selected.bg.is_opaque(),
+            "test premise: dim+selected must produce a translucent bg, \
+             got {:?}",
+            dim_selected.bg
+        );
+        assert!(!dim_selected.runnable);
+        assert!(!joins_run(&plain(0), &dim_selected));
+
+        let dim_inverse =
+            styled(1, 'a', Flags::DIM | Flags::INVERSE, false, false, false);
+        assert!(!dim_inverse.bg.is_opaque());
+        assert!(!dim_inverse.runnable);
+
+        // Dim alone leaves the translucency in the FOREGROUND, where it is
+        // drawn once per glyph either way — that still coalesces.
+        let dim_only = styled(1, 'a', Flags::DIM, false, false, false);
+        assert!(dim_only.bg.is_opaque());
+        assert!(dim_only.runnable);
+        assert!(!dim_only.fg.is_opaque(), "dim should dim the foreground");
     }
 
     /// Runs are printable ASCII only: anything else may be resolved through
