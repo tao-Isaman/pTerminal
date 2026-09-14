@@ -163,6 +163,18 @@ pub struct TerminalViewState {
     // `process_input`. Set true on SelectStart (primary press), false on
     // primary release.
     is_selecting: bool,
+    // pTerminal delta (drag-to-select over mouse-mode apps): a plain primary
+    // press that landed while the app had mouse reporting on, as `(screen
+    // position, grid point)`. Such a press is still reported to the app (an
+    // agent TUI's own clicks must keep working), but it is ALSO remembered
+    // here, because we can't yet tell a click from the start of a
+    // drag-select. `None` between gestures. See `process_mouse_move` for the
+    // promotion, `press_became_drag` for the threshold.
+    mouse_mode_press: Option<(Pos2, TerminalGridPoint)>,
+    // pTerminal delta (drag-to-select over mouse-mode apps): true once
+    // `mouse_mode_press` has been promoted to a local selection, i.e. the
+    // rest of this gesture belongs to us and no longer to the app.
+    mouse_mode_selecting: bool,
     scroll_pixels: f32,
     current_mouse_position_on_grid: TerminalGridPoint,
 }
@@ -573,7 +585,7 @@ impl<'a> TerminalView<'a> {
                     modifiers,
                     pos,
                     ..
-                } if pointer_inside => input_actions.push(process_button_click(
+                } if pointer_inside => input_actions.extend(process_button_click(
                     state,
                     layout,
                     self.backend,
@@ -638,6 +650,19 @@ impl<'a> TerminalView<'a> {
             // stops the scroll on the very next frame after release.
             if !primary_down {
                 state.is_selecting = false;
+                // pTerminal delta (drag-to-select over mouse-mode apps): a
+                // drag released past an edge never reaches the release arm in
+                // the event loop above (`pointer_inside` is false there, by
+                // construction), so clear the mouse-mode gesture here too —
+                // otherwise the next hover would keep extending a selection
+                // with no button held. Safe to do here and NOT in the
+                // pre-event self-heal near the top of `process_input`: this
+                // block runs AFTER the event loop, so it can't strip
+                // `mouse_mode_selecting` out from under an ordinary
+                // release-inside-the-rect and make it report a stray second
+                // release to the app.
+                state.mouse_mode_selecting = false;
+                state.mouse_mode_press = None;
             } else if let Some(pos) = pointer_pos {
                 let lines = autoscroll_lines(
                     pos.y,
@@ -1196,7 +1221,7 @@ fn process_button_click(
     position: Pos2,
     modifiers: &Modifiers,
     pressed: bool,
-) -> InputAction {
+) -> Vec<InputAction> {
     match button {
         PointerButton::Primary => process_left_button(
             state,
@@ -1207,7 +1232,7 @@ fn process_button_click(
             modifiers,
             pressed,
         ),
-        _ => InputAction::Ignore,
+        _ => vec![InputAction::Ignore],
     }
 }
 
@@ -1249,6 +1274,36 @@ mod click_routing_tests {
             &(Modifiers::COMMAND | Modifiers::SHIFT)
         ));
     }
+
+    /// USER-REQUESTED FEATURE (drag to highlight, then copy). The threshold is
+    /// the whole reason a plain click in an agent tab still belongs to the app
+    /// while a plain drag becomes our selection, so lock both sides of it: a
+    /// click with a shaky hand must NOT start selecting, and a deliberate drag
+    /// must.
+    #[test]
+    fn only_movement_past_the_threshold_promotes_a_press_to_a_drag_select() {
+        let press = Pos2::new(100.0, 100.0);
+
+        assert!(!press_became_drag(press, press), "a still press is a click");
+        assert!(
+            !press_became_drag(press, Pos2::new(103.0, 100.0)),
+            "hand jitter under the threshold must stay the app's click"
+        );
+        assert!(
+            !press_became_drag(press, Pos2::new(100.0, 104.0)),
+            "exactly at the threshold is not past it"
+        );
+        assert!(
+            press_became_drag(press, Pos2::new(100.0, 130.0)),
+            "a deliberate drag must select"
+        );
+        // 3-4-5 triangle: 5.0 away, so distance is measured diagonally rather
+        // than per-axis (neither axis alone clears the threshold).
+        assert!(
+            press_became_drag(press, Pos2::new(103.0, 104.0)),
+            "diagonal travel counts too"
+        );
+    }
 }
 
 fn process_left_button(
@@ -1259,16 +1314,12 @@ fn process_left_button(
     position: Pos2,
     modifiers: &Modifiers,
     pressed: bool,
-) -> InputAction {
+) -> Vec<InputAction> {
     let terminal_mode = backend.last_content().terminal_mode;
     if primary_click_reports_to_app(terminal_mode, modifiers) {
-        InputAction::BackendCall(BackendCommand::MouseReport(
-            MouseButton::LeftButton,
-            *modifiers,
-            state.current_mouse_position_on_grid,
-            pressed,
-        ))
-    } else if pressed {
+        return process_mouse_mode_button(state, layout, position, modifiers, pressed);
+    }
+    vec![if pressed {
         process_left_button_pressed(state, layout, position)
     } else {
         process_left_button_released(
@@ -1279,7 +1330,98 @@ fn process_left_button(
             position,
             modifiers,
         )
+    }]
+}
+
+/// USER-REQUESTED FEATURE (drag the mouse to highlight, then copy): the
+/// primary button inside an app that has mouse reporting on (every Claude
+/// Code / Codex tab — they enable SGR reporting for their whole TUI).
+///
+/// Before this, such a press was ONLY forwarded to the app, so there was no
+/// way to select terminal text in an agent tab short of holding Ctrl (the
+/// modifier override in [`primary_click_reports_to_app`]) — undiscoverable,
+/// and the thing users actually reach for is a plain drag.
+///
+/// A press can't yet be told apart from the start of a drag, so it does
+/// both: the app still gets its report (its own clicks must keep working
+/// unchanged), and we remember the press in `state.mouse_mode_press`.
+/// [`process_mouse_move`] promotes it to a local selection once the pointer
+/// travels past [`press_became_drag`]'s threshold; a press that never moves
+/// stays a plain click and the app never knows the difference.
+///
+/// The press also issues a `SelectStart`, which does double duty: it
+/// collapses any leftover highlight from a previous drag (an empty
+/// selection's `Selection::to_range` is `None`, so `has_selection()` goes
+/// false and nothing is painted), and it anchors the selection so promotion
+/// only has to send `SelectUpdate`.
+///
+/// Note this costs the app nothing it was using: `state.is_dragged` — the
+/// only thing that gates the `MOUSE_MOTION` drag-report branch in
+/// `process_mouse_move` — is set exclusively by
+/// [`process_left_button_pressed`], which this branch bypasses, so mouse-mode
+/// apps have never received drag-motion reports from pTerminal in the first
+/// place. Only press and release ever reached them, and both still do.
+fn process_mouse_mode_button(
+    state: &mut TerminalViewState,
+    layout: &Response,
+    position: Pos2,
+    modifiers: &Modifiers,
+    pressed: bool,
+) -> Vec<InputAction> {
+    if pressed {
+        state.mouse_mode_press = Some((position, state.current_mouse_position_on_grid));
+        state.mouse_mode_selecting = false;
+        return vec![
+            InputAction::BackendCall(BackendCommand::MouseReport(
+                MouseButton::LeftButton,
+                *modifiers,
+                state.current_mouse_position_on_grid,
+                true,
+            )),
+            InputAction::BackendCall(build_start_select_command(layout, position)),
+        ];
     }
+
+    if state.mouse_mode_selecting {
+        // This gesture became ours the moment it crossed the drag threshold,
+        // and the app was handed its release right then (see
+        // `process_mouse_move`) — reporting a second one here would read as a
+        // phantom click at wherever the drag happened to end.
+        state.mouse_mode_press = None;
+        state.mouse_mode_selecting = false;
+        state.is_selecting = false;
+        return vec![InputAction::Ignore];
+    }
+
+    state.mouse_mode_press = None;
+    let mut actions = vec![InputAction::BackendCall(BackendCommand::MouseReport(
+        MouseButton::LeftButton,
+        *modifiers,
+        state.current_mouse_position_on_grid,
+        false,
+    ))];
+    // Double/triple click never travels far enough to promote, so word- and
+    // line-select would otherwise be unreachable in an agent tab. They resolve
+    // on the release frame (`layout.double_clicked()` is false at press),
+    // which is why this mirrors `process_left_button_released` rather than the
+    // press arm above.
+    if layout.double_clicked() || layout.triple_clicked() {
+        actions.push(InputAction::BackendCall(build_start_select_command(
+            layout, position,
+        )));
+    }
+    actions
+}
+
+/// How far the pointer must travel from a plain press inside a mouse-mode app
+/// before the gesture stops being that app's click and becomes our local
+/// drag-select, in logical pixels. Big enough to absorb the jitter of a hand
+/// clicking a button, far below one cell of deliberate movement. Pure, for
+/// unit tests.
+const DRAG_SELECT_THRESHOLD: f32 = 4.0;
+
+fn press_became_drag(press: Pos2, current: Pos2) -> bool {
+    press.distance(current) > DRAG_SELECT_THRESHOLD
 }
 
 fn process_left_button_pressed(
@@ -1959,6 +2101,43 @@ fn process_mouse_move(
     }
 
     let mut actions = vec![];
+
+    // pTerminal delta (drag-to-select over mouse-mode apps): the other half of
+    // `process_mouse_mode_button` — decide, on the first real movement, that
+    // this gesture is a drag-select rather than the app's click, and from then
+    // on drive the selection instead of the app.
+    if state.mouse_mode_selecting {
+        actions.push(InputAction::BackendCall(BackendCommand::SelectUpdate(
+            cursor_x, cursor_y,
+        )));
+    } else if let Some((press_pos, press_grid)) = state.mouse_mode_press {
+        if !layout.ctx.input(|i| i.pointer.primary_down()) {
+            // Same self-heal as `is_dragged` just above, for the same reason:
+            // `PointerMoved` fires on a plain hover, so a press whose release
+            // we never saw must not turn a later hover into a selection.
+            state.mouse_mode_press = None;
+        } else if press_became_drag(press_pos, position) {
+            state.mouse_mode_selecting = true;
+            // Enables `process_input`'s auto-scroll while the drag is held
+            // past the top or bottom edge, same as a non-mouse-mode drag.
+            state.is_selecting = true;
+            // Close the app's click at the point it started, so it doesn't
+            // sit there believing the button is still held for the rest of
+            // the drag. Reported at `press_grid`, not the current cell, so it
+            // reads as the plain click the app already half-saw.
+            actions.push(InputAction::BackendCall(BackendCommand::MouseReport(
+                MouseButton::LeftButton,
+                *modifiers,
+                press_grid,
+                false,
+            )));
+            // The anchor was already set by the press's `SelectStart`.
+            actions.push(InputAction::BackendCall(BackendCommand::SelectUpdate(
+                cursor_x, cursor_y,
+            )));
+        }
+    }
+
     // Handle command or selection update based on terminal mode and modifiers
     if state.is_dragged {
         let terminal_mode = terminal_content.terminal_mode;
