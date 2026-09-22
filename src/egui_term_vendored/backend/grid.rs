@@ -202,3 +202,166 @@ pub(super) fn clear_screen<T: EventListener>(terminal: &mut Term<T>) {
 pub(super) fn resize_grid<T: EventListener>(terminal: &mut Term<T>, size: TerminalSize) {
     terminal.resize(TermSize::new(size.num_cols as usize, size.num_lines as usize));
 }
+
+/// Headless `Term` fixtures shared by the snapshot tests and the perf
+/// harness: a real alacritty emulator fed real ANSI, no PTY, no egui.
+#[cfg(test)]
+pub(super) mod fixtures {
+    use super::*;
+    use alacritty_terminal::event::Event;
+    use alacritty_terminal::vte::ansi::Processor;
+
+    pub(crate) const COLS: usize = 200;
+    pub(crate) const LINES: usize = 50;
+
+    pub(crate) struct Noop;
+    impl EventListener for Noop {
+        fn send_event(&self, _: Event) {}
+    }
+
+    /// A `Term` of `cols`x`lines` with `scrollback` lines of history,
+    /// after `ansi` has been run through the parser.
+    pub(crate) fn term_with(
+        cols: usize,
+        lines: usize,
+        scrollback: usize,
+        ansi: &str,
+    ) -> Term<Noop> {
+        let config = alacritty_terminal::term::Config {
+            scrolling_history: scrollback,
+            ..Default::default()
+        };
+        let mut term = Term::new(config, &TermSize::new(cols, lines), Noop);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, ansi.as_bytes());
+        term
+    }
+
+    /// A dense screen of the shape the renderer actually spends its life
+    /// on: a full viewport of coloured build/agent output, the foreground
+    /// changing every 24 columns and a bright background span every fifth
+    /// segment — the same screen `view.rs`'s coalescing tests measure.
+    pub(crate) fn dense_ansi() -> String {
+        let mut s = String::new();
+        for line in 1..=LINES {
+            s.push_str(&format!("\x1b[{line};1H"));
+            for seg in 0..(COLS / 24) {
+                let colour = 31 + (line + seg) % 7;
+                if (line + seg) % 5 == 0 {
+                    s.push_str(&format!("\x1b[{colour};47m"));
+                } else {
+                    s.push_str(&format!("\x1b[{colour};49m"));
+                }
+                s.push_str("error[E0382]: value moved");
+            }
+            s.push_str("\x1b[0m");
+        }
+        s
+    }
+
+    /// The worst case for a per-cell `Cell::clone`: every column carries a
+    /// Thai base with a combining mark, so every cell owns an
+    /// `Arc<CellExtra>` and cloning it is an atomic increment, not a
+    /// memcpy. Also the case the renderer's mark-lifting path reads
+    /// `zerowidth()` on.
+    pub(crate) fn thai_ansi() -> String {
+        let mut s = String::from("\x1b[2J\x1b[H");
+        for line in 1..=LINES {
+            s.push_str(&format!("\x1b[{line};1H"));
+            for col in 0..COLS {
+                // base consonant + upper vowel; a tone mark every third
+                // cell so some cells carry two marks.
+                s.push('\u{0E01}');
+                s.push('\u{0E34}');
+                if col % 3 == 0 {
+                    s.push('\u{0E49}');
+                }
+            }
+        }
+        s
+    }
+
+    /// Rows of ordinary output pushed into scrollback, then scrolled
+    /// back to the middle: a viewport whose buffer lines are negative.
+    pub(crate) fn scrolled_ansi() -> String {
+        let mut s = String::new();
+        for i in 0..(LINES * 3) {
+            s.push_str(&format!("line {i} of a long transcript\r\n"));
+        }
+        s
+    }
+}
+
+/// pTerminal perf delta (P2 measurement): how much a dirty `sync` costs
+/// for a full 200x50 viewport. Not an assertion — the printed figures are
+/// the deliverable; run in release, where the numbers mean something:
+///
+///   cargo test --release --bin pterminal measure_sync -- --ignored --nocapture
+///
+/// Reports per screen: median/p95/min microseconds over 2,000 refreshes of
+/// an always-dirty snapshot, the bytes the cell buffer holds, and how many
+/// cells carried an `Arc<CellExtra>` (each one an atomic refcount bump on
+/// copy). The Thai screen is the Arc-heavy case; the dense screen is the
+/// everyday one.
+#[cfg(test)]
+mod perf {
+    use super::fixtures::*;
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn measure(name: &str, term: &mut Term<Noop>, iters: usize) {
+        let mut size = TerminalSize::default();
+        size.cell_width = 8;
+        size.cell_height = 17;
+        let mut snapshot = GridSnapshot::new(term, size);
+        // warm: the first refresh grows the buffer; the app reuses it
+        for _ in 0..20 {
+            snapshot.mark_dirty();
+            snapshot.refresh(term, size);
+        }
+        let mut samples: Vec<Duration> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            snapshot.mark_dirty();
+            let t = Instant::now();
+            snapshot.refresh(term, size);
+            samples.push(t.elapsed());
+            std::hint::black_box(snapshot.content());
+        }
+        samples.sort();
+        let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize];
+        let content = snapshot.content();
+        let cells = content.cells.len();
+        let bytes = cells * std::mem::size_of::<(Point, Cell)>();
+        let arcs = content
+            .cells
+            .iter()
+            .filter(|(_, c)| c.extra.is_some())
+            .count();
+        println!(
+            "{name}: cells={cells} buffer={bytes}B arc_clones/refresh={arcs} \
+             median={:.1}us p95={:.1}us min={:.1}us (n={iters})",
+            at(0.5).as_secs_f64() * 1e6,
+            at(0.95).as_secs_f64() * 1e6,
+            samples[0].as_secs_f64() * 1e6,
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn measure_sync_snapshot_cost() {
+        let iters = 2_000;
+        measure(
+            "dense 200x50 coloured",
+            &mut term_with(COLS, LINES, 1000, &dense_ansi()),
+            iters,
+        );
+        measure(
+            "thai 200x50 every cell zerowidth",
+            &mut term_with(COLS, LINES, 1000, &thai_ansi()),
+            iters,
+        );
+        let mut scrolled = term_with(COLS, LINES, 1000, &scrolled_ansi());
+        scrolled.scroll_display(alacritty_terminal::grid::Scroll::Delta(40));
+        measure("scrolled-back transcript 200x50", &mut scrolled, iters);
+    }
+}
