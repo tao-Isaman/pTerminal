@@ -15,6 +15,7 @@ mod resources;
 mod resume;
 mod shared_ctx;
 mod state;
+mod tabs;
 mod term;
 #[cfg(test)]
 mod test_support;

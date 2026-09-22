@@ -10,7 +10,8 @@
 //! went wrong; stacking a new decision on top of an unacknowledged error
 //! would only be confusing.
 
-use crate::app::{NewTabDraft, PendingClaim, PtApp};
+use crate::app::{NewTabDraft, PtApp};
+use crate::tabs::PendingClaim;
 use crate::term::{self, SpawnSpec, TabKind};
 use crate::{git, shared_ctx};
 use eframe::egui;

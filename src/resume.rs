@@ -3,7 +3,8 @@
 //! the resumed agent tab into the right workspace. The command-file
 //! format itself lives in `commands.rs`.
 
-use crate::app::{PendingClaim, PtApp, agent_readme_for_spawn};
+use crate::app::PtApp;
+use crate::tabs::{PendingClaim, agent_readme_for_spawn};
 use crate::commands;
 use crate::shared_ctx;
 use crate::term::{self, Tab, TabKind};

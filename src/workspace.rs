@@ -269,7 +269,8 @@ impl PtApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{CloseDraft, CloseWsDraft, NewTabDraft, PendingClaim};
+    use crate::app::{CloseDraft, CloseWsDraft, NewTabDraft};
+    use crate::tabs::PendingClaim;
     use crate::term;
     use crate::test_support::{bare_app, exit_and_drain, seed_message, ws_with_name};
 
