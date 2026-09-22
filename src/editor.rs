@@ -4,7 +4,8 @@
 //! CentralPanel render). Split out of `app.rs` — same sibling-`impl PtApp`
 //! convention as `dialogs.rs`.
 
-use crate::app::{PtApp, WsRt};
+use crate::app::PtApp;
+use crate::workspace::WsRt;
 use eframe::egui;
 use std::path::PathBuf;
 

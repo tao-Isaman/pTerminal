@@ -2,7 +2,8 @@
 //! watcher covers and how it is (re)built. The watcher implementation
 //! itself lives in `watcher.rs`.
 
-use crate::app::{PtApp, WsRt};
+use crate::app::PtApp;
+use crate::workspace::WsRt;
 use crate::commands;
 use crate::hooks;
 use crate::watcher;

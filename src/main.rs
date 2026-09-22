@@ -22,6 +22,7 @@ mod update;
 mod ui;
 mod watch;
 mod watcher;
+mod workspace;
 
 fn main() -> eframe::Result<()> {
     let argv: Vec<String> = std::env::args().collect();

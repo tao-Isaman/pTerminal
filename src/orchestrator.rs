@@ -3,7 +3,8 @@
 //! keeping its generated `status.md` in step with every other
 //! workspace's live agent-tab roster.
 
-use crate::app::{PtApp, WsRt};
+use crate::app::PtApp;
+use crate::workspace::WsRt;
 use crate::messages;
 use crate::shared_ctx;
 use crate::state;

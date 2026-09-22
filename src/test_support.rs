@@ -17,7 +17,8 @@
 //! on the `PtApp` it is handed. Compiled only under `#[cfg(test)]` (see
 //! `main.rs`), so nothing in here can leak into a release build.
 
-use crate::app::{PtApp, SUBMIT_DELAY, WsRt};
+use crate::app::{PtApp, SUBMIT_DELAY};
+use crate::workspace::WsRt;
 use crate::hooks::AgentStatus;
 use crate::resources::{MachineStats, SAMPLE_FAST, SamplerControl};
 use crate::shared_ctx;
