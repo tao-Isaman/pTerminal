@@ -77,8 +77,13 @@ impl LinkDetector {
     /// pTerminal perf delta: the matched text is extracted here, at hover
     /// time, from the LIVE grid (upstream walked the cloned grid at click
     /// time — the snapshot no longer carries the full grid to walk).
-    pub(super) fn hover_at<T>(&self, terminal: &Term<T>, point: Point) -> Option<LinkHover> {
-        let url_range = regex_match_at(terminal, point, &mut self.url_regex.clone());
+    ///
+    /// `&mut self` because `RegexSearch` searches through `&mut` (it owns
+    /// scratch DFA caches). The pre-split code cloned both compiled regexes
+    /// on every hover to get around a borrow of the whole backend; a
+    /// detector of its own needs no such workaround.
+    pub(super) fn hover_at<T>(&mut self, terminal: &Term<T>, point: Point) -> Option<LinkHover> {
+        let url_range = regex_match_at(terminal, point, &mut self.url_regex);
         if let Some(range) = url_range {
             let url = match_text(terminal, &range);
             return Some(LinkHover::Url { range, url });
@@ -87,7 +92,7 @@ impl LinkDetector {
         // pointer — try a file-path candidate. It only becomes a
         // hover target (underline + clickable) if the file EXISTS,
         // which is what keeps the loose regex honest.
-        let path_range = regex_match_at(terminal, point, &mut self.path_regex.clone());
+        let path_range = regex_match_at(terminal, point, &mut self.path_regex);
         let range = path_range?;
         let path =
             resolve_existing_file(&match_text(terminal, &range), self.spawn_cwd.as_deref())?;

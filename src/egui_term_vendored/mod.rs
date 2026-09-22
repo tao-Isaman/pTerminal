@@ -10,7 +10,11 @@
 //! 1. `backend/settings.rs` + `backend/mod.rs` — `BackendSettings::scrolling_history`
 //!    is now a setting instead of `alacritty_terminal`'s hardcoded default
 //!    (needed to cap scrollback per tab).
-//! 2. `backend/mod.rs` — the PTY event forwarding thread used
+//! (`backend/mod.rs` was split in wave 2 into `pty.rs`, `grid.rs`,
+//! `selection.rs`, `links.rs`, `mouse.rs`, `size.rs` and a thin facade; the
+//! entries below name the file each delta lives in NOW.)
+//!
+//! 2. `backend/pty.rs` — the PTY event forwarding thread used
 //!    `loop { if let Ok(e) = rx.recv() { .. } }`, which spins at 100% CPU forever
 //!    once the channel closes (i.e. every time a `TerminalBackend` is dropped
 //!    while its child is still alive — closing a tab). It now stops instead, and
@@ -18,18 +22,18 @@
 //! 3. `view.rs` — keyboard input required the mouse pointer to be inside the
 //!    terminal rect, so typing stopped whenever the pointer moved away. Keyboard
 //!    input now follows focus; only mouse input still requires the pointer.
-//! 4. `backend/mod.rs` — the forwarding thread called `request_repaint()` for
+//! 4. `backend/pty.rs` — the forwarding thread called `request_repaint()` for
 //!    every PTY event, so a single *background* tab producing output drove the
 //!    whole app at full frame rate (and each frame deep-clones the visible
 //!    terminal's grid). `TerminalBackend::new` now takes a shared
 //!    `Arc<AtomicBool>` visibility flag; off-screen terminals get
 //!    `request_repaint_after(250ms)` instead, which is enough for the app loop
 //!    to keep draining them.
-//! 5. `backend/mod.rs` — `tty::Options::escape_args` (Windows-only) defaulted to
+//! 5. `backend/pty.rs` — `tty::Options::escape_args` (Windows-only) defaulted to
 //!    `false`, so a multi-word arg (an agent's initial prompt) reached the child
 //!    process with only its first word — the rest was unquoted and split on
 //!    whitespace by the shell. Now set to `true` on Windows.
-//! 6. `backend/mod.rs` — `open_link` panicked (`unwrap_or_else(|| panic!(..))`)
+//! 6. `backend/links.rs` — `open_link` panicked (`unwrap_or_else(|| panic!(..))`)
 //!    when `open::that` failed. It runs on the UI thread, so Ctrl+clicking a
 //!    `mailto:`/unknown-scheme link with no registered handler crashed the
 //!    whole app. The failure is now ignored (`let _ = open::that(url);`).
@@ -67,7 +71,7 @@
 //!    would make the next plain hover (no button held) silently extend the
 //!    selection, since `PointerMoved` fires on hover regardless of button
 //!    state.
-//! 9. `backend/mod.rs` — right-click menu primitives: `BackendCommand::SelectAll`
+//! 9. `backend/selection.rs` + `backend/grid.rs` — right-click menu primitives: `BackendCommand::SelectAll`
 //!    (sets `term.selection` to a `Selection` spanning the whole addressable
 //!    buffer, `topmost_line()`/`Column(0)` to `bottommost_line()`/`last_column()`,
 //!    mirroring `start_selection`'s `Selection::new` + `update` construction)
