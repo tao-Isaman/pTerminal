@@ -15,6 +15,8 @@ mod resume;
 mod shared_ctx;
 mod state;
 mod term;
+#[cfg(test)]
+mod test_support;
 mod update;
 mod ui;
 mod watch;

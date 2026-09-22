@@ -255,3 +255,186 @@ impl PtApp {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::ws_with_name;
+
+    // ---- Task 1: file editor tab (TDD RED, written before EditorTab /
+    // open_editor / save_editor / remove_editor exist) ----
+
+    /// `open_editor` on a real file: reads its contents into the buffer,
+    /// clears `missing`/`dirty`, appends the `EditorTab`, and points
+    /// `active_editor` at it.
+    #[test]
+    fn open_editor_reads_existing_file_and_activates_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("hello.txt");
+        std::fs::write(&file_path, "hello world").expect("write fixture file");
+        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
+
+        open_editor(&mut ws, 1, file_path.clone());
+
+        assert_eq!(ws.editors.len(), 1);
+        assert_eq!(ws.editors[0].id, 1);
+        assert_eq!(ws.editors[0].path, file_path);
+        assert_eq!(ws.editors[0].buffer, "hello world");
+        assert!(!ws.editors[0].dirty);
+        assert!(!ws.editors[0].missing);
+        assert_eq!(ws.active_editor, Some(0));
+    }
+
+    /// `open_editor` on a path that doesn't exist on disk: empty buffer,
+    /// `missing: true`, still pushed and activated (so the UI can show a
+    /// missing-file note rather than silently doing nothing).
+    #[test]
+    fn open_editor_on_nonexistent_path_flags_missing_with_empty_buffer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ghost = dir.path().join("does-not-exist.txt");
+        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
+
+        open_editor(&mut ws, 7, ghost.clone());
+
+        assert_eq!(ws.editors.len(), 1);
+        assert_eq!(ws.editors[0].path, ghost);
+        assert_eq!(ws.editors[0].buffer, "");
+        assert!(ws.editors[0].missing);
+        assert!(!ws.editors[0].dirty);
+        assert_eq!(ws.active_editor, Some(0));
+    }
+
+    /// Finding 2: a genuinely-absent path yields a "will create" note — never
+    /// an "overwrite" warning, since there's nothing on disk to lose.
+    #[test]
+    fn editor_note_for_missing_path_says_create_not_overwrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ghost = dir.path().join("does-not-exist.txt");
+        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
+
+        open_editor(&mut ws, 7, ghost);
+
+        assert!(ws.editors[0].missing, "a nonexistent path reads as missing");
+        let note = editor_note(&ws.editors[0]).expect("missing file must carry a note");
+        assert!(note.to_lowercase().contains("create"), "{note}");
+        assert!(!note.to_lowercase().contains("overwrite"), "{note}");
+    }
+
+    /// Finding 2: a path that EXISTS but can't be read (here, a directory —
+    /// `read_to_string` fails deterministically on every platform) must warn
+    /// that a save OVERWRITES it, not that it "creates" a file that isn't
+    /// there. This is the silent-data-loss case: `missing` is set (read
+    /// failed) yet `path.exists()` is true, so the note is computed from
+    /// `exists()`, not from the raw `missing` flag.
+    #[test]
+    fn editor_note_for_existing_but_unreadable_path_warns_overwrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_path_buf(); // a directory: exists() true, read_to_string fails
+        let mut ws = ws_with_name(dir_path.clone(), "test-ws");
+
+        open_editor(&mut ws, 9, dir_path.clone());
+
+        assert!(ws.editors[0].missing, "reading a directory fails, so `missing` is set");
+        assert!(dir_path.exists(), "the directory path exists on disk");
+        assert_eq!(ws.editors[0].buffer, "", "unreadable → empty buffer");
+        let note = editor_note(&ws.editors[0]).expect("unreadable file must carry a note");
+        assert!(note.to_lowercase().contains("overwrite"), "{note}");
+        assert!(!note.to_lowercase().contains("not found"), "{note}");
+    }
+
+    /// A cleanly-read file has no note at all.
+    #[test]
+    fn editor_note_for_readable_file_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("ok.txt");
+        std::fs::write(&file_path, "content").expect("write fixture");
+        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
+
+        open_editor(&mut ws, 3, file_path);
+
+        assert!(!ws.editors[0].missing);
+        assert!(editor_note(&ws.editors[0]).is_none());
+    }
+
+    /// `save_editor` writes the buffer to disk and clears both `dirty` and
+    /// `missing` (a save can recreate a file that was previously missing).
+    #[test]
+    fn save_editor_writes_buffer_and_clears_dirty_and_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("out.txt");
+        let mut ed = EditorTab {
+            id: 1,
+            path: file_path.clone(),
+            buffer: "new content".to_string(),
+            dirty: true,
+            missing: true,
+        };
+
+        let result = save_editor(&mut ed);
+
+        assert!(result.is_ok());
+        assert!(!ed.dirty);
+        assert!(!ed.missing);
+        let on_disk = std::fs::read_to_string(&file_path).expect("read saved file");
+        assert_eq!(on_disk, "new content");
+    }
+
+    /// End-to-end round trip: open a real file, mutate the in-memory
+    /// buffer, save, then re-read the file from disk independently of the
+    /// `EditorTab` — the two must agree.
+    #[test]
+    fn open_mutate_save_round_trip_persists_to_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("roundtrip.txt");
+        std::fs::write(&file_path, "original").expect("write fixture file");
+        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
+
+        open_editor(&mut ws, 1, file_path.clone());
+        ws.editors[0].buffer = "changed by the test".to_string();
+        ws.editors[0].dirty = true;
+        save_editor(&mut ws.editors[0]).expect("save_editor");
+
+        let on_disk = std::fs::read_to_string(&file_path).expect("re-read after save");
+        assert_eq!(on_disk, "changed by the test");
+        assert!(!ws.editors[0].dirty);
+        assert!(!ws.editors[0].missing);
+    }
+
+    /// `remove_editor` fixes up `active_editor` when the REMOVED editor was
+    /// the active one: nothing left to point at (the CentralPanel's
+    /// precedence rule falls through to the terminal/selected_child), so it
+    /// clears to `None` rather than guessing at a replacement.
+    #[test]
+    fn remove_editor_clears_active_when_the_active_editor_is_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
+        ws.editors.push(EditorTab { id: 1, path: dir.path().join("a.txt"), buffer: String::new(), dirty: false, missing: true });
+        ws.editors.push(EditorTab { id: 2, path: dir.path().join("b.txt"), buffer: String::new(), dirty: false, missing: true });
+        ws.active_editor = Some(1);
+
+        remove_editor(&mut ws, 2);
+
+        assert_eq!(ws.editors.len(), 1);
+        assert_eq!(ws.editors[0].id, 1);
+        assert_eq!(ws.active_editor, None);
+    }
+
+    /// `remove_editor` fixes up `active_editor` when an EARLIER editor is
+    /// removed out from under it: the active one is still the same editor,
+    /// so its index must shift down by one, not silently point at whatever
+    /// now sits at the old index.
+    #[test]
+    fn remove_editor_shifts_active_index_down_when_earlier_editor_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
+        ws.editors.push(EditorTab { id: 1, path: dir.path().join("a.txt"), buffer: String::new(), dirty: false, missing: true });
+        ws.editors.push(EditorTab { id: 2, path: dir.path().join("b.txt"), buffer: String::new(), dirty: false, missing: true });
+        ws.active_editor = Some(1); // pointing at id 2
+
+        remove_editor(&mut ws, 1); // remove id 1, the earlier one
+
+        assert_eq!(ws.editors.len(), 1);
+        assert_eq!(ws.editors[0].id, 2);
+        assert_eq!(ws.active_editor, Some(0), "must still point at id 2, now at index 0");
+    }
+}

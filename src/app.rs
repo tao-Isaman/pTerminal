@@ -1261,7 +1261,7 @@ impl PtApp {
     /// flush can `request_repaint_after(SUBMIT_DELAY)` while its queue is
     /// non-empty: without that, an Enter due 150 ms after a delivery would
     /// wait for `update`'s 500 ms heartbeat to come round.
-    fn drain_events(&mut self, ctx: &egui::Context) {
+    pub(crate) fn drain_events(&mut self, ctx: &egui::Context) {
         // Task P5, shutdown guarantee #1 of 3 (see `persist`'s docs) and the
         // only one that runs during normal operation: the trailing edge of
         // the persist debounce. A burst of `persist()` calls leaves the
@@ -2664,48 +2664,10 @@ impl eframe::App for PtApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor::{editor_note, remove_editor};
-    use crate::orchestrator::{pin_orchestrator_front, shared_excerpt_for};
-    use crate::resume::paths_match;
-
-    /// Guards every test that does real filesystem I/O (create/remove) on
-    /// the singleton, non-tempdir `shared_ctx::orchestrator_dir()` — unlike
-    /// every other fixture in this module, that path is the SAME real
-    /// directory across every test in the binary (`%APPDATA%\pterminal\
-    /// orchestrator`, not a per-test tempdir), and `cargo test` runs tests
-    /// in parallel by default. Without this lock, one test's
-    /// `remove_dir_all` (its own "clean slate" setup/teardown) can delete
-    /// the directory out from under another concurrently-running test's
-    /// spawn, mid-test, since both call sites do
-    /// `remove_dir_all(orchestrator_dir())` on the very same real path with
-    /// no ordering between them (confirmed live: intermittent "The
-    /// directory name is invalid" `TabTerm::spawn` failures during Task 3
-    /// TDD, cured entirely by adding this lock everywhere the real
-    /// directory is touched). Tests that only use `orchestrator_dir()` as a
-    /// plain path value (building a `state::Workspace`/`WsRt` in memory,
-    /// no `create_dir_all`/`remove_dir_all`/real spawn there) don't need
-    /// it — nothing on disk to race over. `unwrap_or_else(PoisonError::
-    /// into_inner)` rather than a bare `.unwrap()`: one test panicking
-    /// while holding the lock must not poison it for every test after it
-    /// in the same run.
-    static ORCHESTRATOR_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn lock_orchestrator_dir() -> std::sync::MutexGuard<'static, ()> {
-        ORCHESTRATOR_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// pTerminal is Windows-only and both Thai font candidates ship with the
-    /// OS, so resolution must succeed here. If this fails, Thai silently
-    /// regresses to boxes — nothing else in the suite would notice.
-    #[test]
-    fn thai_font_resolves_on_windows() {
-        let bytes = crate::ui::thai_font_bytes().expect("no Thai-capable system font found");
-        // sfnt magics (ttf/ttc/otf) — proves we read a real font file.
-        let magic = &bytes[..4];
-        assert!(
-            [&b"\x00\x01\x00\x00"[..], b"ttcf", b"true", b"OTTO"].contains(&magic),
-            "unrecognized font magic: {magic:?}"
-        );
-    }
+    use crate::test_support::{
+        agent_tab, app_with_tabs, bare_app, drain_to_exit, exit_and_drain, flush_pending_submit,
+        seed_message, seed_message_from, ws_with_name,
+    };
 
     /// Builds a `PtApp` with exactly one workspace/saved-tab and every other
     /// field set to the cheapest value that still type-checks —
@@ -2758,455 +2720,10 @@ mod tests {
             saved_editors: vec![],
             is_orchestrator: false,
         };
-        let (_tx, sampler_rx) = std::sync::mpsc::channel();
-        PtApp {
-            base,
-            workspaces: vec![WsRt { meta, tabs: vec![], active_tab: 0, editors: vec![], active_editor: None }],
-            active_ws: 0,
-            next_tab_id: 90_211,
-            sampler: sampler_rx,
-            sampler_control: SamplerControl::new(SAMPLE_FAST),
-            last_snap: vec![],
-            machine: MachineStats::default(),
-            watcher: None,
-            pending_claim: None,
-            pending_folder_pick: None,
-            pending_file_pick: None,
-            show_ctx_panel: false,
-            ctx_panel_text: String::new(),
-            ctx_panel_has_focus: false,
-            editor_has_focus: false,
-            ctx_panel_loaded_for: None,
-            error: None,
-            new_tab: None,
-            closing: None,
-            closing_ws: None,
-            closing_editor: None,
-            roster_written: HashMap::new(),
-            orchestrator_status_written: None,
-            shared_excerpt_cache: HashMap::new(),
-            partial_pending: HashSet::new(),
-            selected_child: None,
-            pending_submit: Vec::new(),
-            compose_text: String::new(),
-            input_bar_has_focus: false,
-            focus_input_bar: false,
-            input_bar_px: crate::ui::INPUT_BAR_PX_SEED,
-            // tests never talk to the network: no check, no notice, no download
-            update_check: None,
-            update_available: None,
-            update_download: None,
-            history: crate::history::History::in_memory(),
-            persist_dirty: false,
-            persist_last_write: None,
-            persist_writes: 0,
-            housekeeping_last: None,
-            own_mem: 0,
-        }
-    }
-
-    /// Polls `term` to completion (bounded) so a test never leaves an
-    /// orphaned child process behind.
-    ///
-    /// 60s, not 10s: the bound only exists to catch a genuinely hung child.
-    /// A healthy child exits in milliseconds locally, but on a loaded CI
-    /// runner (4 vCPUs, many tests cold-starting powershell.exe through
-    /// ConPTY in parallel) 10s produced real false-positive panics — four
-    /// tests died here on the v0.1.0 release run, and the same panic showed
-    /// up locally under full-suite parallel load.
-    fn drain_to_exit(term: &mut term::TabTerm) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while term.exited().is_none() && std::time::Instant::now() < deadline {
-            term.poll();
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(term.exited().is_some(), "test's own child failed to exit — would leak a process");
-    }
-
-    /// Sends a graceful `exit` and polls `term` to completion (bounded) so
-    /// the test doesn't leave an orphaned `powershell.exe` process behind —
-    /// same convention as `term::tests::write_input_reaches_pty`.
-    fn exit_and_drain(term: &mut term::TabTerm) {
-        term.write_input("exit\r");
-        drain_to_exit(term);
-    }
-
-    /// Flushes every currently-queued `pending_submit` Enter by waiting past
-    /// `SUBMIT_DELAY` and running one `drain_events` pass — same two-step
-    /// dance `delivery_queues_the_submit_enter_instead_of_writing_it_inline`
-    /// exercises directly. A delivery test that leaves a queued Enter
-    /// unflushed and then sends `exit_and_drain`'s own `"exit\r"` would
-    /// concatenate onto whatever delivered text is still unsubmitted on the
-    /// shell's input line, so the child never sees a recognizable `exit`
-    /// command and `drain_to_exit` times out — this must run first whenever
-    /// a test's own `deliver_messages` call queued a submit.
-    fn flush_pending_submit(app: &mut PtApp, ctx: &egui::Context) {
-        std::thread::sleep(SUBMIT_DELAY + std::time::Duration::from_millis(60));
-        app.drain_events(ctx);
-    }
-
-    /// A `PtApp` with one workspace rooted at `repo` holding `tabs` live, and
-    /// every other field at the cheapest value that type-checks — no sampler
-    /// thread, no watcher, no dialogs. Enough for `deliver_messages` and
-    /// `drain_events`, which is all the delivery tests below touch (a
-    /// disconnected sampler channel just makes `drain_events`' first `try_recv`
-    /// return `Disconnected` and fall straight through, and `watcher: None`
-    /// means it sees no changed paths).
-    fn app_with_tabs(base: PathBuf, repo: PathBuf, tabs: Vec<term::Tab>) -> PtApp {
-        let meta = state::Workspace {
-            name: "test-ws".to_string(),
-            repo_path: repo,
-            is_git: false,
-            default_isolate: false,
-            kept_worktrees: vec![],
-            saved_tabs: vec![],
-            active_tab: 0,
-            msg_offset: 0,
-            saved_editors: vec![],
-            is_orchestrator: false,
-        };
-        let (_tx, sampler_rx) = std::sync::mpsc::channel();
-        PtApp {
-            base,
-            workspaces: vec![WsRt { meta, tabs, active_tab: 0, editors: vec![], active_editor: None }],
-            active_ws: 0,
-            next_tab_id: 90_400,
-            sampler: sampler_rx,
-            sampler_control: SamplerControl::new(SAMPLE_FAST),
-            last_snap: vec![],
-            machine: MachineStats::default(),
-            watcher: None,
-            pending_claim: None,
-            pending_folder_pick: None,
-            pending_file_pick: None,
-            show_ctx_panel: false,
-            ctx_panel_text: String::new(),
-            ctx_panel_has_focus: false,
-            editor_has_focus: false,
-            ctx_panel_loaded_for: None,
-            error: None,
-            new_tab: None,
-            closing: None,
-            closing_ws: None,
-            closing_editor: None,
-            roster_written: HashMap::new(),
-            orchestrator_status_written: None,
-            shared_excerpt_cache: HashMap::new(),
-            partial_pending: HashSet::new(),
-            selected_child: None,
-            pending_submit: Vec::new(),
-            compose_text: String::new(),
-            input_bar_has_focus: false,
-            focus_input_bar: false,
-            input_bar_px: crate::ui::INPUT_BAR_PX_SEED,
-            // tests never talk to the network: no check, no notice, no download
-            update_check: None,
-            update_available: None,
-            update_download: None,
-            history: crate::history::History::in_memory(),
-            persist_dirty: false,
-            persist_last_write: None,
-            persist_writes: 0,
-            housekeeping_last: None,
-            own_mem: 0,
-        }
-    }
-
-    /// A `PtApp` with `workspaces` set verbatim and `active_ws` as given —
-    /// `app_with_tabs`'s single-hardcoded-workspace shape doesn't fit
-    /// `close_workspace` tests, which need more than one workspace to
-    /// exercise index re-pointing. Every other field is the same
-    /// cheapest-value-that-type-checks convention `app_with_tabs` uses.
-    fn app_with_workspaces(base: PathBuf, workspaces: Vec<WsRt>, active_ws: usize) -> PtApp {
-        let (_tx, sampler_rx) = std::sync::mpsc::channel();
-        PtApp {
-            base,
-            workspaces,
-            active_ws,
-            next_tab_id: 90_500,
-            sampler: sampler_rx,
-            sampler_control: SamplerControl::new(SAMPLE_FAST),
-            last_snap: vec![],
-            machine: MachineStats::default(),
-            watcher: None,
-            pending_claim: None,
-            pending_folder_pick: None,
-            pending_file_pick: None,
-            show_ctx_panel: false,
-            ctx_panel_text: String::new(),
-            ctx_panel_has_focus: false,
-            editor_has_focus: false,
-            ctx_panel_loaded_for: None,
-            error: None,
-            new_tab: None,
-            closing: None,
-            closing_ws: None,
-            closing_editor: None,
-            roster_written: HashMap::new(),
-            orchestrator_status_written: None,
-            shared_excerpt_cache: HashMap::new(),
-            partial_pending: HashSet::new(),
-            selected_child: None,
-            pending_submit: Vec::new(),
-            compose_text: String::new(),
-            input_bar_has_focus: false,
-            focus_input_bar: false,
-            input_bar_px: crate::ui::INPUT_BAR_PX_SEED,
-            // tests never talk to the network: no check, no notice, no download
-            update_check: None,
-            update_available: None,
-            update_download: None,
-            history: crate::history::History::in_memory(),
-            persist_dirty: false,
-            persist_last_write: None,
-            persist_writes: 0,
-            housekeeping_last: None,
-            own_mem: 0,
-        }
-    }
-
-    /// A bare, tab-less workspace named `name` rooted at `repo`, for
-    /// `close_workspace` tests that only care about workspace identity
-    /// (which one survived) and index bookkeeping, not tab contents.
-    fn ws_with_name(repo: PathBuf, name: &str) -> WsRt {
-        WsRt {
-            meta: state::Workspace {
-                name: name.to_string(),
-                repo_path: repo,
-                is_git: false,
-                default_isolate: false,
-                kept_worktrees: vec![],
-                saved_tabs: vec![],
-                active_tab: 0,
-                msg_offset: 0,
-                saved_editors: vec![],
-                is_orchestrator: false,
-            },
-            tabs: vec![],
-            active_tab: 0,
-            editors: vec![],
-            active_editor: None,
-        }
-    }
-
-    /// A bare `state::Workspace` (no `WsRt` wrapper, no tabs) named `name` —
-    /// for `pin_orchestrator_front` tests (Task 2: editor-orchestrator),
-    /// which operate on a plain `Vec<state::Workspace>` directly per that
-    /// function's pure-list-manipulation contract (no `WsRt`, no `PtApp`, no
-    /// egui).
-    fn plain_workspace(name: &str) -> state::Workspace {
-        state::Workspace {
-            name: name.to_string(),
-            repo_path: PathBuf::from(format!("D:\\{name}")),
-            is_git: false,
-            default_isolate: false,
-            kept_worktrees: vec![],
-            saved_tabs: vec![],
-            active_tab: 0,
-            msg_offset: 0,
-            saved_editors: vec![],
-            is_orchestrator: false,
-        }
-    }
-
-    // ---- Task 1: file editor tab (TDD RED, written before EditorTab /
-    // open_editor / save_editor / remove_editor exist) ----
-
-    /// `open_editor` on a real file: reads its contents into the buffer,
-    /// clears `missing`/`dirty`, appends the `EditorTab`, and points
-    /// `active_editor` at it.
-    #[test]
-    fn open_editor_reads_existing_file_and_activates_it() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file_path = dir.path().join("hello.txt");
-        std::fs::write(&file_path, "hello world").expect("write fixture file");
-        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
-
-        open_editor(&mut ws, 1, file_path.clone());
-
-        assert_eq!(ws.editors.len(), 1);
-        assert_eq!(ws.editors[0].id, 1);
-        assert_eq!(ws.editors[0].path, file_path);
-        assert_eq!(ws.editors[0].buffer, "hello world");
-        assert!(!ws.editors[0].dirty);
-        assert!(!ws.editors[0].missing);
-        assert_eq!(ws.active_editor, Some(0));
-    }
-
-    /// `open_editor` on a path that doesn't exist on disk: empty buffer,
-    /// `missing: true`, still pushed and activated (so the UI can show a
-    /// missing-file note rather than silently doing nothing).
-    #[test]
-    fn open_editor_on_nonexistent_path_flags_missing_with_empty_buffer() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let ghost = dir.path().join("does-not-exist.txt");
-        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
-
-        open_editor(&mut ws, 7, ghost.clone());
-
-        assert_eq!(ws.editors.len(), 1);
-        assert_eq!(ws.editors[0].path, ghost);
-        assert_eq!(ws.editors[0].buffer, "");
-        assert!(ws.editors[0].missing);
-        assert!(!ws.editors[0].dirty);
-        assert_eq!(ws.active_editor, Some(0));
-    }
-
-    /// Finding 2: a genuinely-absent path yields a "will create" note — never
-    /// an "overwrite" warning, since there's nothing on disk to lose.
-    #[test]
-    fn editor_note_for_missing_path_says_create_not_overwrite() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let ghost = dir.path().join("does-not-exist.txt");
-        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
-
-        open_editor(&mut ws, 7, ghost);
-
-        assert!(ws.editors[0].missing, "a nonexistent path reads as missing");
-        let note = editor_note(&ws.editors[0]).expect("missing file must carry a note");
-        assert!(note.to_lowercase().contains("create"), "{note}");
-        assert!(!note.to_lowercase().contains("overwrite"), "{note}");
-    }
-
-    /// Finding 2: a path that EXISTS but can't be read (here, a directory —
-    /// `read_to_string` fails deterministically on every platform) must warn
-    /// that a save OVERWRITES it, not that it "creates" a file that isn't
-    /// there. This is the silent-data-loss case: `missing` is set (read
-    /// failed) yet `path.exists()` is true, so the note is computed from
-    /// `exists()`, not from the raw `missing` flag.
-    #[test]
-    fn editor_note_for_existing_but_unreadable_path_warns_overwrite() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dir_path = dir.path().to_path_buf(); // a directory: exists() true, read_to_string fails
-        let mut ws = ws_with_name(dir_path.clone(), "test-ws");
-
-        open_editor(&mut ws, 9, dir_path.clone());
-
-        assert!(ws.editors[0].missing, "reading a directory fails, so `missing` is set");
-        assert!(dir_path.exists(), "the directory path exists on disk");
-        assert_eq!(ws.editors[0].buffer, "", "unreadable → empty buffer");
-        let note = editor_note(&ws.editors[0]).expect("unreadable file must carry a note");
-        assert!(note.to_lowercase().contains("overwrite"), "{note}");
-        assert!(!note.to_lowercase().contains("not found"), "{note}");
-    }
-
-    /// A cleanly-read file has no note at all.
-    #[test]
-    fn editor_note_for_readable_file_is_none() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file_path = dir.path().join("ok.txt");
-        std::fs::write(&file_path, "content").expect("write fixture");
-        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
-
-        open_editor(&mut ws, 3, file_path);
-
-        assert!(!ws.editors[0].missing);
-        assert!(editor_note(&ws.editors[0]).is_none());
-    }
-
-    /// `save_editor` writes the buffer to disk and clears both `dirty` and
-    /// `missing` (a save can recreate a file that was previously missing).
-    #[test]
-    fn save_editor_writes_buffer_and_clears_dirty_and_missing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file_path = dir.path().join("out.txt");
-        let mut ed = EditorTab {
-            id: 1,
-            path: file_path.clone(),
-            buffer: "new content".to_string(),
-            dirty: true,
-            missing: true,
-        };
-
-        let result = save_editor(&mut ed);
-
-        assert!(result.is_ok());
-        assert!(!ed.dirty);
-        assert!(!ed.missing);
-        let on_disk = std::fs::read_to_string(&file_path).expect("read saved file");
-        assert_eq!(on_disk, "new content");
-    }
-
-    /// End-to-end round trip: open a real file, mutate the in-memory
-    /// buffer, save, then re-read the file from disk independently of the
-    /// `EditorTab` — the two must agree.
-    #[test]
-    fn open_mutate_save_round_trip_persists_to_disk() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file_path = dir.path().join("roundtrip.txt");
-        std::fs::write(&file_path, "original").expect("write fixture file");
-        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
-
-        open_editor(&mut ws, 1, file_path.clone());
-        ws.editors[0].buffer = "changed by the test".to_string();
-        ws.editors[0].dirty = true;
-        save_editor(&mut ws.editors[0]).expect("save_editor");
-
-        let on_disk = std::fs::read_to_string(&file_path).expect("re-read after save");
-        assert_eq!(on_disk, "changed by the test");
-        assert!(!ws.editors[0].dirty);
-        assert!(!ws.editors[0].missing);
-    }
-
-    /// `remove_editor` fixes up `active_editor` when the REMOVED editor was
-    /// the active one: nothing left to point at (the CentralPanel's
-    /// precedence rule falls through to the terminal/selected_child), so it
-    /// clears to `None` rather than guessing at a replacement.
-    #[test]
-    fn remove_editor_clears_active_when_the_active_editor_is_removed() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
-        ws.editors.push(EditorTab { id: 1, path: dir.path().join("a.txt"), buffer: String::new(), dirty: false, missing: true });
-        ws.editors.push(EditorTab { id: 2, path: dir.path().join("b.txt"), buffer: String::new(), dirty: false, missing: true });
-        ws.active_editor = Some(1);
-
-        remove_editor(&mut ws, 2);
-
-        assert_eq!(ws.editors.len(), 1);
-        assert_eq!(ws.editors[0].id, 1);
-        assert_eq!(ws.active_editor, None);
-    }
-
-    /// `remove_editor` fixes up `active_editor` when an EARLIER editor is
-    /// removed out from under it: the active one is still the same editor,
-    /// so its index must shift down by one, not silently point at whatever
-    /// now sits at the old index.
-    #[test]
-    fn remove_editor_shifts_active_index_down_when_earlier_editor_removed() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut ws = ws_with_name(dir.path().to_path_buf(), "test-ws");
-        ws.editors.push(EditorTab { id: 1, path: dir.path().join("a.txt"), buffer: String::new(), dirty: false, missing: true });
-        ws.editors.push(EditorTab { id: 2, path: dir.path().join("b.txt"), buffer: String::new(), dirty: false, missing: true });
-        ws.active_editor = Some(1); // pointing at id 2
-
-        remove_editor(&mut ws, 1); // remove id 1, the earlier one
-
-        assert_eq!(ws.editors.len(), 1);
-        assert_eq!(ws.editors[0].id, 2);
-        assert_eq!(ws.active_editor, Some(0), "must still point at id 2, now at index 0");
-    }
-
-    /// Writes a one-line `messages.jsonl` under `repo` and returns `repo`.
-    fn seed_message(repo: &std::path::Path, to: &str) {
-        std::fs::create_dir_all(repo.join(".pterminal")).expect("mkdir .pterminal");
-        std::fs::write(
-            shared_ctx::messages_path(repo),
-            format!("{{\"to\":\"{to}\",\"from\":\"sender\",\"text\":\"ping\"}}\n"),
-        )
-        .expect("write messages.jsonl");
-    }
-
-    /// Like `seed_message`, but with `from`/`text` under the caller's
-    /// control — Task 4's cross-workspace routing tests need `from` to be a
-    /// specific sender (`"orchestrator"` or a real agent's own title), which
-    /// `seed_message`'s hardcoded `"sender"` can't express.
-    fn seed_message_from(repo: &std::path::Path, to: &str, from: &str, text: &str) {
-        std::fs::create_dir_all(repo.join(".pterminal")).expect("mkdir .pterminal");
-        std::fs::write(
-            shared_ctx::messages_path(repo),
-            format!("{{\"to\":\"{to}\",\"from\":\"{from}\",\"text\":\"{text}\"}}\n"),
-        )
-        .expect("write messages.jsonl");
+        let mut app =
+            bare_app(base, vec![WsRt { meta, tabs: vec![], active_tab: 0, editors: vec![], active_editor: None }], 0);
+        app.next_tab_id = 90_211;
+        app
     }
 
     /// FINAL-REVIEW FINDING 2 regression test. A dead placeholder tab keeps
@@ -3477,148 +2994,6 @@ mod tests {
         exit_and_drain(&mut app.workspaces[0].tabs[0].term);
     }
 
-    // ---- paths_match (Task 2's find-workspace comparison) ----
-    //
-    // Pure and disk-only-via-`canonicalize` (no process spawn, no
-    // `PtApp`/state), so these are the cheap end of Task 2's contract —
-    // the actual `handle_resume_command`/`drain_resume_commands` wiring
-    // that calls into `spawn_agent` is exercised live instead (see the
-    // task report), matching `resume_carries_saved_session_id_...`'s own
-    // note above about why a real `--resume` spawn isn't something this
-    // suite drives.
-
-    #[test]
-    fn paths_match_same_existing_dir_is_true() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        assert!(paths_match(dir.path(), dir.path()));
-    }
-
-    #[test]
-    fn paths_match_different_existing_dirs_is_false() {
-        let a = tempfile::tempdir().expect("tempdir");
-        let b = tempfile::tempdir().expect("tempdir");
-        assert!(!paths_match(a.path(), b.path()));
-    }
-
-    #[test]
-    fn paths_match_is_case_insensitive_via_canonicalize() {
-        // Windows' filesystem is case-insensitive, but `PathBuf`'s
-        // `PartialEq` compares components as plain (case-sensitive)
-        // `OsStr`s — exactly the gap `canonicalize` closes, since both
-        // sides exist on disk here and Windows resolves either casing to
-        // the identical file.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let lower = PathBuf::from(dir.path().to_string_lossy().to_lowercase());
-        let upper = PathBuf::from(dir.path().to_string_lossy().to_uppercase());
-        assert_ne!(lower, upper, "test assumption: raw PathBuf equality must be case-sensitive");
-        assert!(paths_match(&lower, &upper));
-    }
-
-    #[test]
-    fn paths_match_falls_back_to_raw_equality_for_the_same_missing_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let missing = dir.path().join("does-not-exist");
-        // Both sides fail to canonicalize (neither exists) — falls back to
-        // plain `PathBuf` equality, which holds since it's the same path.
-        assert!(paths_match(&missing, &missing.clone()));
-    }
-
-    #[test]
-    fn paths_match_falls_back_to_raw_equality_for_different_missing_paths() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let missing_a = dir.path().join("does-not-exist-a");
-        let missing_b = dir.path().join("does-not-exist-b");
-        assert!(!paths_match(&missing_a, &missing_b));
-    }
-
-    #[test]
-    fn paths_match_an_existing_dir_never_matches_a_missing_one() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let missing = dir.path().join("does-not-exist");
-        assert!(!paths_match(dir.path(), &missing));
-    }
-
-    // ---- handle_resume_command's up-front existence check ----
-    //
-    // This branch returns before touching `next_tab_id`/`spawn_agent`, so
-    // it's cheap to exercise directly with `app_with_tabs`'s zero-tabs
-    // form — no ConPTY child, no `claude`/`cmd.exe` process, just the
-    // banner + early-return behavior the live "bogus id" acceptance run
-    // documents separately for the full spawn path.
-
-    #[test]
-    fn resume_into_a_nonexistent_directory_banners_and_creates_no_workspace() {
-        let ctx = eframe::egui::Context::default();
-        let base = tempfile::tempdir().expect("tempdir");
-        let repo = tempfile::tempdir().expect("tempdir");
-        let mut app = app_with_tabs(base.path().to_path_buf(), repo.path().to_path_buf(), vec![]);
-        let missing = repo.path().join("does-not-exist-at-all");
-
-        app.handle_resume_command(
-            &ctx,
-            commands::ResumeCmd {
-        provider: crate::provider::AgentProvider::Claude, session_id: "abc12345".to_string(), dir: missing.clone() },
-        );
-
-        assert_eq!(app.workspaces.len(), 1, "must not create a workspace for a nonexistent --dir");
-        assert!(app.workspaces[0].tabs.is_empty(), "must not spawn a tab for a nonexistent --dir");
-        let err = app.error.expect("expected an error banner");
-        assert!(err.contains("resume: directory does not exist"), "unexpected banner text: {err}");
-        assert!(err.contains(&missing.display().to_string()), "banner should name the missing dir: {err}");
-    }
-
-    // ---- finish_resume_spawn (critical fix: transferred session id) ----
-    //
-    // Drives the exact code that was broken (`handle_resume_command`'s
-    // former `Ok` arm, now split into `finish_resume_spawn`) without going
-    // through a real `claude --resume <sid>` spawn: confirmed live (see
-    // `task-2-report.md`'s fix-report addendum) that `claude --resume`
-    // hangs indefinitely for ANY session id — valid, bogus, or otherwise —
-    // rather than exiting non-interactively, and `TabTerm` has no way to
-    // force-kill a child from outside. `spawn_shell` (`powershell.exe`)
-    // stands in for "a `Tab` a successful spawn produced" instead: fast,
-    // deterministic, and cleanly closeable via `exit_and_drain`, the same
-    // convention `resume_carries_saved_session_id_onto_the_tab_before_any_hook_fires`
-    // already established for the analogous `resume_saved_tabs` fix.
-
-    #[test]
-    fn finish_resume_spawn_carries_the_transferred_session_id_before_persist() {
-        let ctx = eframe::egui::Context::default();
-        let base = tempfile::tempdir().expect("tempdir");
-        let repo = tempfile::tempdir().expect("tempdir");
-        let mut app = app_with_tabs(base.path().to_path_buf(), repo.path().to_path_buf(), vec![]);
-
-        let tab = term::spawn_shell(&ctx, 999, repo.path()).expect("spawn_shell");
-        app.finish_resume_spawn(0, 999, HashSet::new(), tab, "transferred-session-abc");
-
-        assert_eq!(app.workspaces[0].tabs.len(), 1, "the tab must have been pushed");
-        assert_eq!(
-            app.workspaces[0].tabs[0].session_id,
-            Some("transferred-session-abc".to_string()),
-            "the transferred session id must be carried onto the tab immediately \
-             (before any SessionStart hook), not left at None",
-        );
-        assert_eq!(app.active_ws, 0, "the target workspace must become active");
-
-        // Recreates the exact failure mode the finding describes: an early
-        // persist() (already run inside `finish_resume_spawn` itself, mirroring
-        // `handle_resume_command`'s real call) must round-trip the SAME id
-        // through `state.json`, not null it.
-        assert_eq!(
-            app.workspaces[0].meta.saved_tabs[0].session_id,
-            Some("transferred-session-abc".to_string()),
-            "an early persist() must not null out the transferred session id",
-        );
-        let (reloaded, _) = state::load(&app.base);
-        assert_eq!(
-            reloaded.workspaces[0].saved_tabs[0].session_id,
-            Some("transferred-session-abc".to_string()),
-            "the id written to state.json on disk must survive the early persist too",
-        );
-
-        exit_and_drain(&mut app.workspaces[0].tabs[0].term);
-    }
-
     // ---- close_workspace (Task 1) ----
     //
     // `app_with_workspaces`/`ws_with_name` build multi-workspace `PtApp`s
@@ -3632,7 +3007,7 @@ mod tests {
         let ws0 = ws_with_name(base.path().join("ws0"), "ws0");
         let ws1 = ws_with_name(base.path().join("ws1"), "ws1");
         let ws2 = ws_with_name(base.path().join("ws2"), "ws2");
-        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws0, ws1, ws2], 2);
+        let mut app = bare_app(base.path().to_path_buf(), vec![ws0, ws1, ws2], 2);
 
         app.close_workspace(0);
 
@@ -3657,7 +3032,7 @@ mod tests {
         let ws0 = ws_with_name(base.path().join("ws0"), "ws0");
         let ws1 = ws_with_name(base.path().join("ws1"), "ws1");
         let ws2 = ws_with_name(base.path().join("ws2"), "ws2");
-        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws0, ws1, ws2], 2);
+        let mut app = bare_app(base.path().to_path_buf(), vec![ws0, ws1, ws2], 2);
         app.selected_child = Some((1, 0));
         app.pending_claim = Some(PendingClaim { ws_index: 2, tab_id: 1, before: HashSet::new() });
         app.new_tab = Some(NewTabDraft { provider: crate::provider::AgentProvider::Claude, ws_index: 2, prompt: String::new(), isolate: false, shell: false });
@@ -3688,7 +3063,7 @@ mod tests {
     fn workspace_still_named_drops_a_stale_index_name_pair() {
         let base = tempfile::tempdir().expect("tempdir");
         let ws0 = ws_with_name(base.path().join("ws0"), "ws0");
-        let app = app_with_workspaces(base.path().to_path_buf(), vec![ws0], 0);
+        let app = bare_app(base.path().to_path_buf(), vec![ws0], 0);
 
         assert!(
             app.workspace_still_named(0, "ws0"),
@@ -3708,7 +3083,7 @@ mod tests {
     fn close_workspace_out_of_range_is_a_no_op() {
         let base = tempfile::tempdir().expect("tempdir");
         let ws0 = ws_with_name(base.path().join("ws0"), "ws0");
-        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws0], 0);
+        let mut app = bare_app(base.path().to_path_buf(), vec![ws0], 0);
         app.new_tab = Some(NewTabDraft { provider: crate::provider::AgentProvider::Claude, ws_index: 0, prompt: "keep-me".to_string(), isolate: false, shell: false });
 
         app.close_workspace(5);
@@ -3731,7 +3106,7 @@ mod tests {
         let mut orch = ws_with_name(shared_ctx::orchestrator_dir(), "orchestrator");
         orch.meta.is_orchestrator = true;
         let ws0 = ws_with_name(base.path().join("real0"), "real0");
-        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![orch, ws0], 0);
+        let mut app = bare_app(base.path().to_path_buf(), vec![orch, ws0], 0);
         app.new_tab = Some(NewTabDraft { provider: crate::provider::AgentProvider::Claude, ws_index: 0, prompt: "keep-me".to_string(), isolate: false, shell: false });
 
         app.close_workspace(0);
@@ -3768,7 +3143,7 @@ mod tests {
         let mut ws1 = ws_with_name(dir_b.path().to_path_buf(), "ws1");
         ws1.tabs.push(tab_b);
 
-        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws0, ws1], 1);
+        let mut app = bare_app(base.path().to_path_buf(), vec![ws0, ws1], 1);
         let due = Instant::now() + Duration::from_millis(500);
         app.pending_submit = vec![(90_510, due), (90_511, due)];
 
@@ -3781,124 +3156,6 @@ mod tests {
         );
 
         exit_and_drain(&mut app.workspaces[0].tabs[0].term);
-    }
-
-    // ---- pin_orchestrator_front / ensure_orchestrator / orchestrator_index
-    // (Task 2: editor-orchestrator) ----
-    //
-    // `pin_orchestrator_front` is pure list manipulation on a plain
-    // `Vec<state::Workspace>` — no `WsRt`, no `PtApp`, no egui — so the
-    // create-or-pin algorithm itself is tested directly, without touching
-    // disk. `ensure_orchestrator` (the `PtApp` method wrapping it) is
-    // tested separately below, and IS allowed to touch the real
-    // `%APPDATA%\pterminal\orchestrator` directory `shared_ctx::orchestrator_dir()`
-    // names — that path is a fixed, non-parameterized singleton by design
-    // (same as `state::default_base()` itself), not a per-test tempdir —
-    // so that one test cleans up before and after itself to leave no
-    // residue.
-
-    #[test]
-    fn pin_orchestrator_front_creates_one_at_index_0_when_none_exists() {
-        let mut workspaces = vec![plain_workspace("real0"), plain_workspace("real1")];
-
-        let created = pin_orchestrator_front(&mut workspaces);
-
-        assert!(created, "no orchestrator existed — must report having created one");
-        assert_eq!(workspaces.len(), 3);
-        assert!(workspaces[0].is_orchestrator);
-        assert_eq!(workspaces[0].name, "orchestrator");
-        assert_eq!(workspaces[0].repo_path, shared_ctx::orchestrator_dir());
-        assert!(!workspaces[0].is_git);
-        assert_eq!(workspaces[0].saved_tabs.len(), 1, "one Agent saved tab titled \"orchestrator\"");
-        let tab = &workspaces[0].saved_tabs[0];
-        assert_eq!(tab.kind, state::SavedTabKind::Agent);
-        assert_eq!(tab.title, "orchestrator");
-        assert_eq!(tab.cwd, shared_ctx::orchestrator_dir());
-        assert_eq!(tab.session_id, None, "brief: session None — fresh first time");
-        // Real workspaces keep their relative order, shifted down by one.
-        assert_eq!(workspaces[1].name, "real0");
-        assert_eq!(workspaces[2].name, "real1");
-    }
-
-    #[test]
-    fn pin_orchestrator_front_moves_an_existing_one_to_0_preserving_others_order() {
-        let mut orch = plain_workspace("orchestrator");
-        orch.is_orchestrator = true;
-        let mut workspaces = vec![plain_workspace("real0"), plain_workspace("real1"), orch];
-
-        let created = pin_orchestrator_front(&mut workspaces);
-
-        assert!(!created, "an orchestrator already existed — must not create a second one");
-        assert_eq!(workspaces.len(), 3, "must still be exactly one orchestrator, not two");
-        assert!(workspaces[0].is_orchestrator);
-        assert_eq!(workspaces[1].name, "real0", "relative order of the others must survive the rotation");
-        assert_eq!(workspaces[2].name, "real1");
-    }
-
-    #[test]
-    fn pin_orchestrator_front_is_idempotent() {
-        let mut workspaces = vec![plain_workspace("real0")];
-
-        assert!(pin_orchestrator_front(&mut workspaces), "first call creates it");
-        assert!(!pin_orchestrator_front(&mut workspaces), "second call must be a no-op");
-        assert!(!pin_orchestrator_front(&mut workspaces), "third call too");
-
-        assert_eq!(workspaces.len(), 2, "still exactly one orchestrator + one real workspace");
-        assert_eq!(
-            workspaces.iter().filter(|w| w.is_orchestrator).count(),
-            1,
-            "calling repeatedly must never produce a second orchestrator"
-        );
-        assert!(workspaces[0].is_orchestrator);
-        assert_eq!(workspaces[1].name, "real0");
-    }
-
-    /// `PtApp::ensure_orchestrator`: the `&mut self` wrapper around
-    /// `pin_orchestrator_front` that also (on the create branch only) mints
-    /// a real `tab_id` from `next_tab_id` and creates the on-disk
-    /// directories. Touches the real, non-tempdir `orchestrator_dir()` —
-    /// cleaned up before (in case a previous run/crash left it) and after.
-    #[test]
-    fn ensure_orchestrator_creates_pins_bumps_next_tab_id_and_makes_dirs() {
-        let _guard = lock_orchestrator_dir();
-        let orch_dir = shared_ctx::orchestrator_dir();
-        let _ = std::fs::remove_dir_all(&orch_dir);
-        let base = tempfile::tempdir().expect("tempdir");
-        let ws0 = ws_with_name(base.path().join("real0"), "real0");
-        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws0], 0);
-        let next_id_before = app.next_tab_id;
-
-        app.ensure_orchestrator();
-
-        assert_eq!(app.workspaces.len(), 2);
-        assert!(app.workspaces[0].meta.is_orchestrator);
-        assert_eq!(app.workspaces[1].meta.name, "real0", "the real workspace survives, shifted to index 1");
-        assert_eq!(app.next_tab_id, next_id_before + 1, "the fresh saved tab consumes one id");
-        assert_eq!(app.workspaces[0].meta.saved_tabs[0].tab_id, next_id_before);
-        assert!(orch_dir.join(".pterminal").is_dir(), "ensure_orchestrator must create the .pterminal dir");
-        assert_eq!(app.orchestrator_index(), Some(0));
-
-        // Idempotent: a second call moves/creates nothing further.
-        let next_id_after_first = app.next_tab_id;
-        app.ensure_orchestrator();
-        assert_eq!(app.workspaces.len(), 2, "calling twice must not create a second orchestrator");
-        assert_eq!(app.next_tab_id, next_id_after_first, "no new tab id consumed on the idempotent call");
-
-        let _ = std::fs::remove_dir_all(&orch_dir); // leave no residue
-    }
-
-    #[test]
-    fn orchestrator_index_finds_the_pinned_workspace_or_none() {
-        let base = tempfile::tempdir().expect("tempdir");
-        let ws0 = ws_with_name(base.path().join("real0"), "real0");
-        let app_without = app_with_workspaces(base.path().to_path_buf(), vec![ws0], 0);
-        assert_eq!(app_without.orchestrator_index(), None);
-
-        let mut orch = ws_with_name(shared_ctx::orchestrator_dir(), "orchestrator");
-        orch.meta.is_orchestrator = true;
-        let ws1 = ws_with_name(base.path().join("real1"), "real1");
-        let app_with = app_with_workspaces(base.path().to_path_buf(), vec![orch, ws1], 0);
-        assert_eq!(app_with.orchestrator_index(), Some(0));
     }
 
     // ---- resolve_active_ws (Task 2: index-0 invariant across the
@@ -3976,168 +3233,6 @@ mod tests {
         assert_eq!(initial_msg_offset(dir.path()), 0);
     }
 
-    // ---- Task 2 (richer live status): shared_excerpt_for ----
-    //
-    // Pure(-ish) — one filesystem read, no egui/Tab/ctx — so the three
-    // outcomes the brief distinguishes (absent file, short/long content,
-    // genuine read failure) are each directly testable.
-
-    #[test]
-    fn shared_excerpt_for_missing_shared_md_is_empty_string() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut cache = HashMap::new();
-
-        assert_eq!(
-            shared_excerpt_for(dir.path(), &mut cache),
-            "",
-            "an absent shared.md must be the empty string, not the '(unavailable)' failure text"
-        );
-    }
-
-    #[test]
-    fn shared_excerpt_for_short_content_returns_full_flattened_trimmed_text() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = shared_ctx::shared_md_path(dir.path());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "line one\r\nline two\n").unwrap();
-        let mut cache = HashMap::new();
-
-        assert_eq!(shared_excerpt_for(dir.path(), &mut cache), "line one line two");
-    }
-
-    #[test]
-    fn shared_excerpt_for_long_content_returns_only_the_last_200_chars() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = shared_ctx::shared_md_path(dir.path());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // 50 'a's (to be dropped) followed by 200 distinct tail chars.
-        let head = "a".repeat(50);
-        let tail: String = (0..200).map(|i| char::from(b'0' + (i % 10) as u8)).collect();
-        std::fs::write(&path, format!("{head}{tail}")).unwrap();
-        let mut cache = HashMap::new();
-
-        let got = shared_excerpt_for(dir.path(), &mut cache);
-
-        assert_eq!(got, tail, "must keep only the last ~200 chars, dropping the older head");
-        assert_eq!(got.len(), 200);
-    }
-
-    /// A `shared.md` "file" that's actually a directory makes
-    /// `std::fs::read_to_string` fail with something other than
-    /// `NotFound` — the genuine read-failure branch, which renders the
-    /// literal `"(unavailable)"` rather than the empty string. `metadata`
-    /// succeeds on a directory (so the cache-lookup stat doesn't short-
-    /// circuit this), and the fall-through `read_to_string` is what actually
-    /// fails.
-    #[test]
-    fn shared_excerpt_for_unreadable_path_is_unavailable() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = shared_ctx::shared_md_path(dir.path());
-        std::fs::create_dir_all(&path).expect("create a directory AT the shared.md path");
-        let mut cache = HashMap::new();
-
-        assert_eq!(shared_excerpt_for(dir.path(), &mut cache), "(unavailable)");
-    }
-
-    // ---- Final-review finding: shared_excerpt_for's (len, mtime) cache ----
-    //
-    // These exercise the cache hit/miss/prune decision directly, by seeding
-    // `cache` by hand rather than relying on two real filesystem writes
-    // landing in different mtime ticks (which real writes in a fast test
-    // aren't guaranteed to do).
-
-    /// Seed the cache with a deliberately WRONG excerpt keyed at the file's
-    /// OWN real, current `(len, mtime)`. If a hit is used at all, this
-    /// poisoned value is what must come back — proving the match short-
-    /// circuits the read+flatten+truncate path entirely rather than merely
-    /// happening to agree with it.
-    #[test]
-    fn shared_excerpt_for_reuses_cached_excerpt_on_len_and_mtime_match() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = shared_ctx::shared_md_path(dir.path());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "on disk right now").unwrap();
-        let meta = std::fs::metadata(&path).unwrap();
-        let mut cache = HashMap::new();
-        cache.insert(path.clone(), (meta.len(), meta.modified().unwrap(), "STALE-FROM-CACHE".to_string()));
-
-        assert_eq!(
-            shared_excerpt_for(dir.path(), &mut cache),
-            "STALE-FROM-CACHE",
-            "a (len, mtime) match must return the cached excerpt without re-reading the file"
-        );
-    }
-
-    /// A cache entry for a `(len, mtime)` pair that does NOT match the
-    /// file's real current metadata is a miss: the real content must be
-    /// read, and the cache entry refreshed to the new `(len, mtime,
-    /// excerpt)` afterward.
-    #[test]
-    fn shared_excerpt_for_recomputes_and_updates_cache_on_len_or_mtime_mismatch() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = shared_ctx::shared_md_path(dir.path());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "fresh content").unwrap();
-        let mut cache = HashMap::new();
-        cache.insert(
-            path.clone(),
-            (u64::MAX, std::time::SystemTime::UNIX_EPOCH, "STALE".to_string()),
-        );
-
-        let got = shared_excerpt_for(dir.path(), &mut cache);
-
-        assert_eq!(got, "fresh content", "a stat mismatch must fall through to a real read");
-        let meta = std::fs::metadata(&path).unwrap();
-        let (cached_len, cached_mtime, cached_excerpt) =
-            cache.get(&path).expect("a miss must repopulate the cache entry");
-        assert_eq!(*cached_len, meta.len());
-        assert_eq!(*cached_mtime, meta.modified().unwrap());
-        assert_eq!(cached_excerpt, "fresh content");
-    }
-
-    /// A stale cache entry for a path whose file no longer exists must be
-    /// dropped, not left to rot — the `NotFound` branch prunes it.
-    #[test]
-    fn shared_excerpt_for_prunes_cache_entry_when_file_is_absent() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = shared_ctx::shared_md_path(dir.path());
-        let mut cache = HashMap::new();
-        cache.insert(path.clone(), (5, std::time::SystemTime::now(), "gone-but-cached".to_string()));
-
-        let got = shared_excerpt_for(dir.path(), &mut cache);
-
-        assert_eq!(got, "");
-        assert!(cache.get(&path).is_none(), "a NotFound stat must prune the now-stale cache entry");
-    }
-
-    // ---- Task 3 (editor-orchestrator): status.md generation, README
-    // auto-brief, and the F2 status view ----
-    //
-    // `agent_readme_for_spawn`/`ctx_panel_path_for` are pure(-ish) decision
-    // helpers extracted from `resume_saved_tabs`/`show_ctx_panel_ui` so the
-    // orchestrator-vs-normal-workspace branch is unit-testable without
-    // spawning a real `claude` process (documented elsewhere in this file
-    // as impossible to end deterministically) or driving a full egui
-    // `SidePanel` frame. `refresh_orchestrator_status` touches the real,
-    // non-tempdir `shared_ctx::orchestrator_dir()` — same convention as
-    // `ensure_orchestrator_creates_pins_bumps_next_tab_id_and_makes_dirs`
-    // above: cleaned up before (in case a previous run/crash left it) and
-    // after every test that writes there.
-
-    /// Spawns a real (but harmless) `powershell.exe` and relabels it as an
-    /// agent tab — the same "spawn_shell then flip kind/title" idiom
-    /// `delivery_queues_the_submit_enter_instead_of_writing_it_inline`
-    /// already uses, needed because `Tab::term` is a real `TabTerm`, not an
-    /// optional/mockable field. Callers must drain it (`exit_and_drain`)
-    /// before the test ends.
-    fn agent_tab(ctx: &egui::Context, id: u64, cwd: &Path, title: &str, status: AgentStatus) -> term::Tab {
-        let mut tab = term::spawn_shell(ctx, id, cwd).expect("spawn shell standing in for an agent tab");
-        tab.kind = TabKind::Agent;
-        tab.title = title.to_string();
-        tab.status = status;
-        tab
-    }
-
     #[test]
     fn agent_readme_for_spawn_orchestrator_uses_orchestrator_readme_regardless_of_is_git() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4179,7 +3274,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut ws = ws_with_name(dir.path().to_path_buf(), "ws");
         ws.tabs.push(agent_tab(&ctx, 91_001, dir.path(), "a", AgentStatus::Idle));
-        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws], 0);
+        let mut app = bare_app(base.path().to_path_buf(), vec![ws], 0);
 
         app.start_handoff();
         assert!(app.workspaces[0].tabs[0].handoff_armed.is_some());
@@ -4212,7 +3307,7 @@ mod tests {
         let _ = std::fs::remove_file(hooks::handoff_file(91_002));
         tab.handoff_armed = Some(std::time::SystemTime::now());
         ws.tabs.push(tab);
-        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws], 0);
+        let mut app = bare_app(base.path().to_path_buf(), vec![ws], 0);
 
         app.finish_handoff(&ctx, 91_002);
 
@@ -4225,208 +3320,6 @@ mod tests {
         );
 
         exit_and_drain(&mut app.workspaces[0].tabs[0].term);
-    }
-
-    #[test]
-    fn ctx_panel_path_for_orchestrator_workspace_is_status_md() {
-        let mut ws = plain_workspace("orchestrator");
-        ws.repo_path = shared_ctx::orchestrator_dir();
-        ws.is_orchestrator = true;
-
-        assert_eq!(PtApp::ctx_panel_path_for(&ws), shared_ctx::status_md_path(&shared_ctx::orchestrator_dir()));
-    }
-
-    #[test]
-    fn ctx_panel_path_for_normal_workspace_is_shared_md() {
-        let ws = plain_workspace("real0");
-        assert_eq!(PtApp::ctx_panel_path_for(&ws), shared_ctx::shared_md_path(&ws.repo_path));
-    }
-
-    #[test]
-    fn watcher_dirs_includes_orchestrators_own_root_for_status_md_live_reload() {
-        let base = tempfile::tempdir().expect("tempdir");
-        let mut orch = ws_with_name(shared_ctx::orchestrator_dir(), "orchestrator");
-        orch.meta.is_orchestrator = true;
-        let real0 = ws_with_name(base.path().join("real0"), "real0");
-        let workspaces = vec![orch, real0];
-
-        let dirs = PtApp::watcher_dirs(&workspaces);
-
-        assert!(
-            dirs.contains(&shared_ctx::orchestrator_dir()),
-            "status.md lives directly under the orchestrator's own root, a sibling of .pterminal, \
-             not inside it: {dirs:?}"
-        );
-        assert!(dirs.contains(&shared_ctx::orchestrator_dir().join(".pterminal")));
-        assert!(dirs.contains(&base.path().join("real0").join(".pterminal")));
-        assert!(
-            !dirs.contains(&base.path().join("real0")),
-            "a normal workspace's own root (as opposed to its .pterminal subdir) must not be \
-             watched: {dirs:?}"
-        );
-    }
-
-    #[test]
-    fn refresh_orchestrator_status_excludes_orchestrator_and_non_agent_tabs() {
-        let _guard = lock_orchestrator_dir();
-        let orch_dir = shared_ctx::orchestrator_dir();
-        let _ = std::fs::remove_dir_all(&orch_dir);
-        std::fs::create_dir_all(&orch_dir).expect("create orchestrator dir for the spawned shell's cwd");
-        let ctx = eframe::egui::Context::default();
-        let base = tempfile::tempdir().expect("tempdir");
-        let real_dir = tempfile::tempdir().expect("tempdir");
-
-        let mut orch_ws = ws_with_name(orch_dir.clone(), "orchestrator");
-        orch_ws.meta.is_orchestrator = true;
-        orch_ws.tabs.push(agent_tab(&ctx, 90_600, &orch_dir, "orchestrator", AgentStatus::Working));
-
-        let mut real_ws = ws_with_name(real_dir.path().to_path_buf(), "real0");
-        real_ws.tabs.push(agent_tab(&ctx, 90_601, real_dir.path(), "builder", AgentStatus::Working));
-        real_ws.tabs.push(term::spawn_shell(&ctx, 90_602, real_dir.path()).expect("spawn shell"));
-
-        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![orch_ws, real_ws], 0);
-
-        app.refresh_orchestrator_status();
-
-        let text = std::fs::read_to_string(shared_ctx::status_md_path(&orch_dir)).expect("status.md written");
-        assert!(text.contains("## real0"), "{text}");
-        assert!(
-            text.contains(&format!(
-                "real0/builder — working — cwd {} — 0 subagents — last active ",
-                real_dir.path().display()
-            )),
-            "{text}"
-        );
-        assert!(text.contains("shared.md: (empty)"), "no shared.md was ever written for real0: {text}");
-        assert!(!text.contains("## orchestrator"), "the orchestrator's own workspace must be excluded: {text}");
-        assert!(!text.contains("orchestrator/orchestrator"), "{text}");
-        assert!(!text.contains("real0/shell"), "a shell tab must never appear in status.md: {text}");
-
-        for ws in app.workspaces.iter_mut() {
-            for tab in ws.tabs.iter_mut() {
-                exit_and_drain(&mut tab.term);
-            }
-        }
-        let _ = std::fs::remove_dir_all(&orch_dir);
-    }
-
-    #[test]
-    fn refresh_orchestrator_status_skips_rewrite_when_unchanged_then_rewrites_on_change() {
-        let _guard = lock_orchestrator_dir();
-        let orch_dir = shared_ctx::orchestrator_dir();
-        let _ = std::fs::remove_dir_all(&orch_dir);
-        let ctx = eframe::egui::Context::default();
-        let base = tempfile::tempdir().expect("tempdir");
-        let real_dir = tempfile::tempdir().expect("tempdir");
-
-        let mut orch_ws = ws_with_name(orch_dir.clone(), "orchestrator");
-        orch_ws.meta.is_orchestrator = true;
-        let mut real_ws = ws_with_name(real_dir.path().to_path_buf(), "real0");
-        real_ws.tabs.push(agent_tab(&ctx, 90_610, real_dir.path(), "builder", AgentStatus::Working));
-
-        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![orch_ws, real_ws], 0);
-
-        app.refresh_orchestrator_status();
-        let status_path = shared_ctx::status_md_path(&orch_dir);
-        let first = std::fs::read_to_string(&status_path).expect("first write");
-        assert!(first.contains("working"), "{first}");
-
-        // Manually clobber the file; an unchanged next call must leave it alone.
-        std::fs::write(&status_path, "SENTINEL-UNCHANGED").unwrap();
-        app.refresh_orchestrator_status();
-        assert_eq!(
-            std::fs::read_to_string(&status_path).unwrap(),
-            "SENTINEL-UNCHANGED",
-            "unchanged computed content must not trigger a rewrite"
-        );
-
-        // Now really change a tab's status — this MUST overwrite the sentinel.
-        app.workspaces[1].tabs[0].status = AgentStatus::Idle;
-        app.refresh_orchestrator_status();
-        let after = std::fs::read_to_string(&status_path).unwrap();
-        assert_ne!(after, "SENTINEL-UNCHANGED");
-        assert!(after.contains("idle"), "{after}");
-
-        exit_and_drain(&mut app.workspaces[1].tabs[0].term);
-        let _ = std::fs::remove_dir_all(&orch_dir);
-    }
-
-    /// Task 2 (richer live status): `refresh_orchestrator_status` must
-    /// report a non-zero subagent count derived from `tab.children` (only
-    /// the still-running ones, i.e. `done_at.is_none()`), a `last active
-    /// HH:MM:SS` line, and the workspace's `shared.md` excerpt (truncated to
-    /// its last ~200 chars, flattened, trimmed) — the three new fields this
-    /// task adds on top of Task 3's baseline status.md.
-    #[test]
-    fn refresh_orchestrator_status_includes_subagent_count_last_active_and_shared_excerpt() {
-        let _guard = lock_orchestrator_dir();
-        let orch_dir = shared_ctx::orchestrator_dir();
-        let _ = std::fs::remove_dir_all(&orch_dir);
-        let ctx = eframe::egui::Context::default();
-        let base = tempfile::tempdir().expect("tempdir");
-        let real_dir = tempfile::tempdir().expect("tempdir");
-
-        // A shared.md long enough that only its TAIL should show up.
-        let head = "x".repeat(50);
-        let tail: String = (0..200).map(|i| char::from(b'A' + (i % 26) as u8)).collect();
-        let shared_path = shared_ctx::shared_md_path(real_dir.path());
-        std::fs::create_dir_all(shared_path.parent().unwrap()).unwrap();
-        std::fs::write(&shared_path, format!("{head}{tail}")).unwrap();
-
-        let mut orch_ws = ws_with_name(orch_dir.clone(), "orchestrator");
-        orch_ws.meta.is_orchestrator = true;
-
-        let mut real_ws = ws_with_name(real_dir.path().to_path_buf(), "real0");
-        let mut builder = agent_tab(&ctx, 90_650, real_dir.path(), "builder", AgentStatus::Working);
-        builder.children.push(term::SubTab {
-            desc: "finished task".into(),
-            started: std::time::Instant::now(),
-            done_at: Some(std::time::Instant::now()),
-        });
-        builder.children.push(term::SubTab {
-            desc: "still running".into(),
-            started: std::time::Instant::now(),
-            done_at: None,
-        });
-        real_ws.tabs.push(builder);
-
-        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![orch_ws, real_ws], 0);
-
-        app.refresh_orchestrator_status();
-
-        let text = std::fs::read_to_string(shared_ctx::status_md_path(&orch_dir)).expect("status.md written");
-        assert!(
-            text.contains("1 subagents"),
-            "only the still-running child (done_at: None) must count: {text}"
-        );
-        assert!(text.contains(&format!("shared.md: {tail}")), "{text}");
-
-        let marker = "last active ";
-        let idx = text.find(marker).expect("a last active field must be present");
-        let hms = &text[idx + marker.len()..idx + marker.len() + 8];
-        assert_eq!(hms.as_bytes()[2], b':', "expected HH:MM:SS, got {hms}");
-        assert_eq!(hms.as_bytes()[5], b':', "expected HH:MM:SS, got {hms}");
-
-        for ws in app.workspaces.iter_mut() {
-            for tab in ws.tabs.iter_mut() {
-                exit_and_drain(&mut tab.term);
-            }
-        }
-        let _ = std::fs::remove_dir_all(&orch_dir);
-    }
-
-    #[test]
-    fn refresh_orchestrator_status_without_an_orchestrator_workspace_is_a_noop() {
-        let base = tempfile::tempdir().expect("tempdir");
-        let ws0 = ws_with_name(base.path().join("real0"), "real0");
-        let mut app = app_with_workspaces(base.path().to_path_buf(), vec![ws0], 0);
-
-        app.refresh_orchestrator_status();
-
-        assert!(
-            app.orchestrator_status_written.is_none(),
-            "nothing to refresh without an orchestrator workspace present"
-        );
     }
 
     // ---- deliver_messages: cross-workspace routing (Task 4) ----
@@ -4457,7 +3350,7 @@ mod tests {
         let builder_id = builder.id;
         alpha_ws.tabs.push(builder);
 
-        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws], 0);
+        let mut app = bare_app(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws], 0);
 
         app.deliver_messages(0);
 
@@ -4488,7 +3381,7 @@ mod tests {
         let builder_id = builder.id;
         alpha_ws.tabs.push(builder);
 
-        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws], 0);
+        let mut app = bare_app(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws], 0);
 
         app.deliver_messages(0);
 
@@ -4520,7 +3413,7 @@ mod tests {
         let mut bravo_ws = ws_with_name(bravo_dir.path().to_path_buf(), "bravo");
         bravo_ws.tabs.push(agent_tab(&ctx, 90_711, bravo_dir.path(), "dup", AgentStatus::Working));
 
-        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws, bravo_ws], 0);
+        let mut app = bare_app(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws, bravo_ws], 0);
 
         app.deliver_messages(0);
 
@@ -4544,7 +3437,7 @@ mod tests {
         let mut orch_ws = ws_with_name(orch_dir.path().to_path_buf(), "orchestrator");
         orch_ws.meta.is_orchestrator = true;
 
-        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws], 0);
+        let mut app = bare_app(orch_dir.path().to_path_buf(), vec![orch_ws], 0);
 
         app.deliver_messages(0);
 
@@ -4572,7 +3465,7 @@ mod tests {
         alpha_ws.tabs.push(agent_tab(&ctx, 90_721, alpha_dir.path(), "builder", AgentStatus::Working));
         seed_message_from(alpha_dir.path(), "orchestrator", "builder", "reply up");
 
-        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws], 0);
+        let mut app = bare_app(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws], 0);
 
         app.deliver_messages(1); // alpha's own outbox, not the orchestrator's
 
@@ -4600,7 +3493,7 @@ mod tests {
         orch_ws.meta.is_orchestrator = true;
         orch_ws.tabs.push(agent_tab(&ctx, 90_730, orch_dir.path(), "orchestrator", AgentStatus::Working));
 
-        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws], 0);
+        let mut app = bare_app(orch_dir.path().to_path_buf(), vec![orch_ws], 0);
 
         app.deliver_messages(0);
 
@@ -4641,7 +3534,7 @@ mod tests {
         let solo_id = solo.id;
         bravo_ws.tabs.push(solo);
 
-        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws, bravo_ws], 0);
+        let mut app = bare_app(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws, bravo_ws], 0);
 
         app.deliver_messages(0);
 
@@ -4684,7 +3577,7 @@ mod tests {
         let solo = agent_tab(&ctx, 90_744, bravo_dir.path(), "solo", AgentStatus::Working);
         bravo_ws.tabs.push(solo);
 
-        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws, bravo_ws], 0);
+        let mut app = bare_app(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws, bravo_ws], 0);
 
         app.deliver_messages(1); // alpha's own outbox
 
@@ -4720,7 +3613,7 @@ mod tests {
         let mut bravo_ws = ws_with_name(bravo_dir.path().to_path_buf(), "bravo");
         bravo_ws.tabs.push(agent_tab(&ctx, 90_746, bravo_dir.path(), "solo", AgentStatus::Working));
 
-        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws, bravo_ws], 0);
+        let mut app = bare_app(orch_dir.path().to_path_buf(), vec![orch_ws, alpha_ws, bravo_ws], 0);
 
         app.deliver_messages(0);
 
@@ -4744,7 +3637,7 @@ mod tests {
         let mut orch_ws = ws_with_name(orch_dir.path().to_path_buf(), "orchestrator");
         orch_ws.meta.is_orchestrator = true;
 
-        let mut app = app_with_workspaces(orch_dir.path().to_path_buf(), vec![orch_ws], 0);
+        let mut app = bare_app(orch_dir.path().to_path_buf(), vec![orch_ws], 0);
 
         app.deliver_messages(0);
 
@@ -4770,7 +3663,7 @@ mod tests {
     fn app_for_persist(base: &Path) -> PtApp {
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).expect("repo dir");
-        app_with_workspaces(base.to_path_buf(), vec![ws_with_name(repo, "burst")], 0)
+        bare_app(base.to_path_buf(), vec![ws_with_name(repo, "burst")], 0)
     }
 
     /// The core of P5: N rapid `persist()` calls must not be N disk writes.
@@ -4900,7 +3793,7 @@ mod tests {
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).expect("repo dir");
         let mut app =
-            app_with_workspaces(blocker.join("state"), vec![ws_with_name(repo, "ws")], 0);
+            bare_app(blocker.join("state"), vec![ws_with_name(repo, "ws")], 0);
 
         app.workspaces[0].meta.msg_offset = 11;
         app.persist();
@@ -4931,7 +3824,7 @@ mod tests {
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).expect("repo dir");
         let mut app =
-            app_with_workspaces(dir.path().to_path_buf(), vec![ws_with_name(repo, "ws")], 0);
+            bare_app(dir.path().to_path_buf(), vec![ws_with_name(repo, "ws")], 0);
         let ctx = egui::Context::default();
 
         assert!(app.housekeeping_last.is_none(), "a fresh app has never swept");

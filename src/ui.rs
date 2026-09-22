@@ -1485,3 +1485,38 @@ mod input_bar_tests {
         assert_eq!(one, many, "bar height must not follow content: {one} vs {many}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::plain_workspace;
+
+    /// pTerminal is Windows-only and both Thai font candidates ship with the
+    /// OS, so resolution must succeed here. If this fails, Thai silently
+    /// regresses to boxes — nothing else in the suite would notice.
+    #[test]
+    fn thai_font_resolves_on_windows() {
+        let bytes = crate::ui::thai_font_bytes().expect("no Thai-capable system font found");
+        // sfnt magics (ttf/ttc/otf) — proves we read a real font file.
+        let magic = &bytes[..4];
+        assert!(
+            [&b"\x00\x01\x00\x00"[..], b"ttcf", b"true", b"OTTO"].contains(&magic),
+            "unrecognized font magic: {magic:?}"
+        );
+    }
+
+    #[test]
+    fn ctx_panel_path_for_orchestrator_workspace_is_status_md() {
+        let mut ws = plain_workspace("orchestrator");
+        ws.repo_path = shared_ctx::orchestrator_dir();
+        ws.is_orchestrator = true;
+
+        assert_eq!(PtApp::ctx_panel_path_for(&ws), shared_ctx::status_md_path(&shared_ctx::orchestrator_dir()));
+    }
+
+    #[test]
+    fn ctx_panel_path_for_normal_workspace_is_shared_md() {
+        let ws = plain_workspace("real0");
+        assert_eq!(PtApp::ctx_panel_path_for(&ws), shared_ctx::shared_md_path(&ws.repo_path));
+    }
+}

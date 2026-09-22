@@ -84,3 +84,34 @@ impl PtApp {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared_ctx;
+    use crate::test_support::ws_with_name;
+
+    #[test]
+    fn watcher_dirs_includes_orchestrators_own_root_for_status_md_live_reload() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut orch = ws_with_name(shared_ctx::orchestrator_dir(), "orchestrator");
+        orch.meta.is_orchestrator = true;
+        let real0 = ws_with_name(base.path().join("real0"), "real0");
+        let workspaces = vec![orch, real0];
+
+        let dirs = PtApp::watcher_dirs(&workspaces);
+
+        assert!(
+            dirs.contains(&shared_ctx::orchestrator_dir()),
+            "status.md lives directly under the orchestrator's own root, a sibling of .pterminal, \
+             not inside it: {dirs:?}"
+        );
+        assert!(dirs.contains(&shared_ctx::orchestrator_dir().join(".pterminal")));
+        assert!(dirs.contains(&base.path().join("real0").join(".pterminal")));
+        assert!(
+            !dirs.contains(&base.path().join("real0")),
+            "a normal workspace's own root (as opposed to its .pterminal subdir) must not be \
+             watched: {dirs:?}"
+        );
+    }
+}

@@ -263,3 +263,153 @@ impl PtApp {
         self.persist();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state;
+    use crate::test_support::{app_with_tabs, exit_and_drain};
+    use std::path::PathBuf;
+
+    // ---- paths_match (Task 2's find-workspace comparison) ----
+    //
+    // Pure and disk-only-via-`canonicalize` (no process spawn, no
+    // `PtApp`/state), so these are the cheap end of Task 2's contract —
+    // the actual `handle_resume_command`/`drain_resume_commands` wiring
+    // that calls into `spawn_agent` is exercised live instead (see the
+    // task report), matching `resume_carries_saved_session_id_...`'s own
+    // note above about why a real `--resume` spawn isn't something this
+    // suite drives.
+
+    #[test]
+    fn paths_match_same_existing_dir_is_true() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(paths_match(dir.path(), dir.path()));
+    }
+
+    #[test]
+    fn paths_match_different_existing_dirs_is_false() {
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
+        assert!(!paths_match(a.path(), b.path()));
+    }
+
+    #[test]
+    fn paths_match_is_case_insensitive_via_canonicalize() {
+        // Windows' filesystem is case-insensitive, but `PathBuf`'s
+        // `PartialEq` compares components as plain (case-sensitive)
+        // `OsStr`s — exactly the gap `canonicalize` closes, since both
+        // sides exist on disk here and Windows resolves either casing to
+        // the identical file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lower = PathBuf::from(dir.path().to_string_lossy().to_lowercase());
+        let upper = PathBuf::from(dir.path().to_string_lossy().to_uppercase());
+        assert_ne!(lower, upper, "test assumption: raw PathBuf equality must be case-sensitive");
+        assert!(paths_match(&lower, &upper));
+    }
+
+    #[test]
+    fn paths_match_falls_back_to_raw_equality_for_the_same_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist");
+        // Both sides fail to canonicalize (neither exists) — falls back to
+        // plain `PathBuf` equality, which holds since it's the same path.
+        assert!(paths_match(&missing, &missing.clone()));
+    }
+
+    #[test]
+    fn paths_match_falls_back_to_raw_equality_for_different_missing_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_a = dir.path().join("does-not-exist-a");
+        let missing_b = dir.path().join("does-not-exist-b");
+        assert!(!paths_match(&missing_a, &missing_b));
+    }
+
+    #[test]
+    fn paths_match_an_existing_dir_never_matches_a_missing_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist");
+        assert!(!paths_match(dir.path(), &missing));
+    }
+
+    // ---- handle_resume_command's up-front existence check ----
+    //
+    // This branch returns before touching `next_tab_id`/`spawn_agent`, so
+    // it's cheap to exercise directly with `app_with_tabs`'s zero-tabs
+    // form — no ConPTY child, no `claude`/`cmd.exe` process, just the
+    // banner + early-return behavior the live "bogus id" acceptance run
+    // documents separately for the full spawn path.
+
+    #[test]
+    fn resume_into_a_nonexistent_directory_banners_and_creates_no_workspace() {
+        let ctx = eframe::egui::Context::default();
+        let base = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_tabs(base.path().to_path_buf(), repo.path().to_path_buf(), vec![]);
+        let missing = repo.path().join("does-not-exist-at-all");
+
+        app.handle_resume_command(
+            &ctx,
+            commands::ResumeCmd {
+        provider: crate::provider::AgentProvider::Claude, session_id: "abc12345".to_string(), dir: missing.clone() },
+        );
+
+        assert_eq!(app.workspaces.len(), 1, "must not create a workspace for a nonexistent --dir");
+        assert!(app.workspaces[0].tabs.is_empty(), "must not spawn a tab for a nonexistent --dir");
+        let err = app.error.expect("expected an error banner");
+        assert!(err.contains("resume: directory does not exist"), "unexpected banner text: {err}");
+        assert!(err.contains(&missing.display().to_string()), "banner should name the missing dir: {err}");
+    }
+
+    // ---- finish_resume_spawn (critical fix: transferred session id) ----
+    //
+    // Drives the exact code that was broken (`handle_resume_command`'s
+    // former `Ok` arm, now split into `finish_resume_spawn`) without going
+    // through a real `claude --resume <sid>` spawn: confirmed live (see
+    // `task-2-report.md`'s fix-report addendum) that `claude --resume`
+    // hangs indefinitely for ANY session id — valid, bogus, or otherwise —
+    // rather than exiting non-interactively, and `TabTerm` has no way to
+    // force-kill a child from outside. `spawn_shell` (`powershell.exe`)
+    // stands in for "a `Tab` a successful spawn produced" instead: fast,
+    // deterministic, and cleanly closeable via `exit_and_drain`, the same
+    // convention `resume_carries_saved_session_id_onto_the_tab_before_any_hook_fires`
+    // already established for the analogous `resume_saved_tabs` fix.
+
+    #[test]
+    fn finish_resume_spawn_carries_the_transferred_session_id_before_persist() {
+        let ctx = eframe::egui::Context::default();
+        let base = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut app = app_with_tabs(base.path().to_path_buf(), repo.path().to_path_buf(), vec![]);
+
+        let tab = term::spawn_shell(&ctx, 999, repo.path()).expect("spawn_shell");
+        app.finish_resume_spawn(0, 999, HashSet::new(), tab, "transferred-session-abc");
+
+        assert_eq!(app.workspaces[0].tabs.len(), 1, "the tab must have been pushed");
+        assert_eq!(
+            app.workspaces[0].tabs[0].session_id,
+            Some("transferred-session-abc".to_string()),
+            "the transferred session id must be carried onto the tab immediately \
+             (before any SessionStart hook), not left at None",
+        );
+        assert_eq!(app.active_ws, 0, "the target workspace must become active");
+
+        // Recreates the exact failure mode the finding describes: an early
+        // persist() (already run inside `finish_resume_spawn` itself, mirroring
+        // `handle_resume_command`'s real call) must round-trip the SAME id
+        // through `state.json`, not null it.
+        assert_eq!(
+            app.workspaces[0].meta.saved_tabs[0].session_id,
+            Some("transferred-session-abc".to_string()),
+            "an early persist() must not null out the transferred session id",
+        );
+        let (reloaded, _) = state::load(&app.base);
+        assert_eq!(
+            reloaded.workspaces[0].saved_tabs[0].session_id,
+            Some("transferred-session-abc".to_string()),
+            "the id written to state.json on disk must survive the early persist too",
+        );
+
+        exit_and_drain(&mut app.workspaces[0].tabs[0].term);
+    }
+}
