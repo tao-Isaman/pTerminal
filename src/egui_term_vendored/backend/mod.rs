@@ -34,7 +34,7 @@ mod pty;
 mod selection;
 mod size;
 
-pub use grid::RenderableContent;
+pub use grid::{RenderableContent, VisibleCell};
 pub use links::LinkAction;
 pub use mouse::{MouseButton, MouseMode};
 pub use pty::EventProxy;
@@ -496,7 +496,7 @@ mod tests {
         let visible_only: String = {
             backend.mark_dirty(); // PTY output arrived outside process_command
             let content = backend.sync();
-            content.cells.iter().map(|(_, cell)| cell.c).collect()
+            content.cells().map(|cell| cell.c).collect()
         };
         assert!(
             !visible_only.contains("pterminal-oldest-line-marker"),

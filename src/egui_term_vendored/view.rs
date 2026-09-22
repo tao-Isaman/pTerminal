@@ -447,9 +447,12 @@ fn run_cell(
 /// the loop has just reached; `prev` is the run's current last cell.
 ///
 /// The adjacency test is `prev.column + 1`, not "the next entry in the
-/// iterator": `RenderableContent::cells` drops trailing blanks, so a row can
-/// have gaps, and a run must never bridge one (its glyphs are positioned by
-/// column arithmetic from the run's first cell).
+/// iterator": a run's glyphs are positioned by column arithmetic from its
+/// first cell, so it must never bridge a gap. (`RenderableContent::cells`
+/// is dense today — alacritty 0.25's `display_iter` yields every viewport
+/// cell, trailing blanks included — but the spacer-skip in the loop below
+/// already makes consecutive items non-adjacent, and keying on the column
+/// keeps this correct if the snapshot ever became sparse.)
 fn joins_run(prev: &RunCell, next: &RunCell) -> bool {
     prev.runnable
         && next.runnable
@@ -680,7 +683,11 @@ fn emit_grid_shapes(
     // pTerminal perf delta: iterates the synced viewport snapshot —
     // see `RenderableContent::cells`. Points are original buffer
     // coordinates, so the selection/hyperlink range checks are unchanged.
-    for (point, cell) in &content.cells {
+    // (P2: each item is a `VisibleCell` copied out of a compact row buffer,
+    // with the same `c`/`fg`/`bg`/`flags`/`zerowidth()` the `Cell` clone
+    // had — nothing below reads anything else.)
+    for cell in content.cells() {
+        let point = &cell.point;
         let flags = cell.flags;
         if flags.contains(cell::Flags::WIDE_CHAR_SPACER) {
             // A spacer paints nothing (upstream skipped it before emitting
@@ -2340,8 +2347,8 @@ mod thai_composer_probe {
             let content = backend.last_content();
             let line = content.cursor_point.line.0;
             let mut typed_row = String::new();
-            for (point, cell) in &content.cells {
-                if point.line.0 == line {
+            for cell in content.cells() {
+                if cell.point.line.0 == line {
                     typed_row.push(cell.c);
                     if let Some(z) = cell.zerowidth() {
                         typed_row.extend(z.iter());
@@ -2370,8 +2377,8 @@ mod thai_composer_probe {
             let content = backend.last_content();
             let line = content.cursor_point.line.0;
             let mut row = String::new();
-            for (point, cell) in &content.cells {
-                if point.line.0 == line {
+            for cell in content.cells() {
+                if cell.point.line.0 == line {
                     row.push(cell.c);
                     if let Some(z) = cell.zerowidth() {
                         row.extend(z.iter());
@@ -2443,8 +2450,8 @@ mod thai_composer_probe {
         let content = backend.last_content();
         // Dump every non-blank grid row, zero-width marks appended per cell.
         let mut rows: std::collections::BTreeMap<i32, String> = Default::default();
-        for (point, cell) in &content.cells {
-            let row = rows.entry(point.line.0).or_default();
+        for cell in content.cells() {
+            let row = rows.entry(cell.point.line.0).or_default();
             if cell.c != ' ' || cell.zerowidth().is_some() {
                 row.push(cell.c);
                 if let Some(z) = cell.zerowidth() {
@@ -2549,17 +2556,14 @@ mod run_coalescing_tests {
 
         let cursor = term.grid_mut().cursor_cell().clone();
         let grid = term.grid();
-        RenderableContent {
-            cells: grid
-                .display_iter()
-                .map(|i| (i.point, i.cell.clone()))
-                .collect(),
-            display_offset: grid.display_offset(),
-            cursor_point: grid.cursor.point,
-            cursor,
-            terminal_size,
-            ..Default::default()
-        }
+        let mut content = RenderableContent::default();
+        content.cursor_point = grid.cursor.point;
+        content.cursor = cursor;
+        content.terminal_size = terminal_size;
+        // P2: the same capture `GridSnapshot::refresh` uses (sets
+        // `display_offset` too), so this content is exactly the app's.
+        content.capture_cells(grid);
+        content
     }
 
     /// A dense screen of the shape this renderer actually spends its life

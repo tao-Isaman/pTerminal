@@ -10,28 +10,109 @@
 
 use super::size::TerminalSize;
 use alacritty_terminal::event::EventListener;
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::Point;
+use alacritty_terminal::grid::{Dimensions, Grid};
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::selection::SelectionRange;
-use alacritty_terminal::term::{cell::Cell, test::TermSize, Term, TermMode};
+use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::{test::TermSize, Term, TermMode};
 // pTerminal delta 9: `Handler` brings `Term::clear_screen` into scope (it's
 // a `vte::ansi::Handler` trait method, normally invoked by the escape-code
 // parser as the child prints `\x1b[2J` etc.) so `BackendCommand::ClearScreen`
 // can call it directly. `ClearMode` is its argument type.
-use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+use alacritty_terminal::vte::ansi::{ClearMode, Color, Handler};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
+/// pTerminal perf delta (P2): one visible cell as the painter reads it —
+/// the four fields `emit_grid_shapes` and `cursor_line_context` consume,
+/// plus a handle on the cell's zero-width chars. 20 bytes, `Copy`, no
+/// heap. Replaces `(Point, Cell)` (40 bytes, and an `Arc<CellExtra>`
+/// refcount bump per cell that carries combining marks, a hyperlink or an
+/// underline colour). The position is implicit: cells are stored row-major
+/// with exactly `columns` per row — see [`RenderableContent::cells`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapCell {
+    c: char,
+    fg: Color,
+    bg: Color,
+    flags: Flags,
+    /// Start of this cell's zero-width chars in
+    /// `RenderableContent::zerowidth`, or [`NO_EXTRA`] when the source cell
+    /// had no `CellExtra` at all. The distinction matters: alacritty's
+    /// `Cell::zerowidth()` is `Some(&[])` for a cell whose extra holds only
+    /// a hyperlink/underline colour, and the painter's `is_some()` test
+    /// routes such cells down the per-cell path. Preserved exactly.
+    zw_start: u32,
+    zw_len: u16,
+}
+
+const NO_EXTRA: u32 = u32::MAX;
+
+impl SnapCell {
+    /// Copies what the painter reads; appends any zero-width chars to
+    /// `pool` instead of sharing the source's `Arc`.
+    #[inline]
+    fn from_cell(cell: &Cell, pool: &mut Vec<char>) -> Self {
+        let (zw_start, zw_len) = match cell.zerowidth() {
+            None => (NO_EXTRA, 0),
+            Some(zw) => {
+                let start = pool.len() as u32;
+                pool.extend_from_slice(zw);
+                (start, zw.len() as u16)
+            },
+        };
+        Self {
+            c: cell.c,
+            fg: cell.fg,
+            bg: cell.bg,
+            flags: cell.flags,
+            zw_start,
+            zw_len,
+        }
+    }
+}
+
+/// A visible cell with its buffer-space position, as yielded by
+/// [`RenderableContent::cells`]. Field names match alacritty's `Cell` so
+/// the painter reads it exactly as it read the clone.
+#[derive(Clone, Copy, Debug)]
+pub struct VisibleCell<'a> {
+    pub point: Point,
+    pub c: char,
+    pub fg: Color,
+    pub bg: Color,
+    pub flags: Flags,
+    zerowidth: Option<&'a [char]>,
+}
+
+impl<'a> VisibleCell<'a> {
+    /// Same contract as `alacritty_terminal::term::cell::Cell::zerowidth`:
+    /// `None` when the cell has no extra storage, `Some` (possibly empty)
+    /// when it does.
+    #[inline]
+    pub fn zerowidth(&self) -> Option<&'a [char]> {
+        self.zerowidth
+    }
+}
+
 /// pTerminal perf delta: upstream held a full `Grid<Cell>` clone here
 /// (scrollback included). The renderer only reads the visible viewport, so
-/// this now carries exactly that: the visible cells (with their original
-/// buffer-space `Point`s, so selection/hyperlink range checks still work
-/// unchanged), plus the two grid scalars the renderer used to pull from the
-/// clone. The hovered link's URL text is captured at hover time
-/// (`hovered_url`) since there is no longer a full grid to walk at click
-/// time.
+/// this now carries exactly that: the visible cells, plus the two grid
+/// scalars the renderer used to pull from the clone. The hovered link's
+/// URL text is captured at hover time (`hovered_url`) since there is no
+/// longer a full grid to walk at click time.
+///
+/// pTerminal perf delta (P2): the cells are a dense, row-major
+/// `Vec<SnapCell>` — `lines` rows of exactly `columns` — whose buffer is
+/// reused across syncs, with the zero-width chars of every cell pooled in
+/// one `Vec<char>`. Positions are reconstructed by [`Self::cells`] (row 0
+/// is buffer line `-display_offset`, exactly what `display_iter` yields),
+/// so the selection/hyperlink range checks downstream are unchanged.
 pub struct RenderableContent {
-    pub cells: Vec<(Point, Cell)>,
+    cells: Vec<SnapCell>,
+    zerowidth: Vec<char>,
+    /// Cells per row of `cells`. 0 only before the first sync (no rows).
+    columns: usize,
     pub display_offset: usize,
     /// pTerminal delta (scrollbar): lines of scrollback above the viewport.
     /// 0 in the alternate screen (it has no history) — which is exactly when
@@ -50,10 +131,94 @@ pub struct RenderableContent {
     pub terminal_size: TerminalSize,
 }
 
+impl RenderableContent {
+    /// Every visible cell with its buffer-space `Point`, in the order
+    /// `Grid::display_iter` yields them: row by row from the top of the
+    /// viewport, every column of every row (alacritty 0.25's
+    /// `display_iter` walks the full viewport — it does NOT skip trailing
+    /// blanks, which is what makes the dense layout exact).
+    pub fn cells(&self) -> impl Iterator<Item = VisibleCell<'_>> + '_ {
+        let first_line = -(self.display_offset as i32);
+        let pool = &self.zerowidth;
+        self.cells
+            .chunks(self.columns.max(1))
+            .enumerate()
+            .flat_map(move |(row, cells)| {
+                let line = Line(first_line + row as i32);
+                cells.iter().enumerate().map(move |(col, cell)| VisibleCell {
+                    point: Point::new(line, Column(col)),
+                    c: cell.c,
+                    fg: cell.fg,
+                    bg: cell.bg,
+                    flags: cell.flags,
+                    zerowidth: (cell.zw_start != NO_EXTRA).then(|| {
+                        let s = cell.zw_start as usize;
+                        &pool[s..s + cell.zw_len as usize]
+                    }),
+                })
+            })
+    }
+
+    /// The row holding buffer line `line`, when it is inside the viewport.
+    fn viewport_row(&self, line: Line) -> Option<&[SnapCell]> {
+        if self.columns == 0 {
+            return None;
+        }
+        let row = usize::try_from(line.0 + self.display_offset as i32).ok()?;
+        self.cells.chunks(self.columns).nth(row)
+    }
+
+    /// Copies the viewport out of `grid` into the reused buffers. Also the
+    /// seam the headless render tests build their content through, so
+    /// they snapshot exactly the way the app does.
+    ///
+    /// Walks each row once via `Grid::index(Line)` (one ring-buffer index
+    /// computation per row) and then its cells as a plain slice — the same
+    /// cells, in the same order, as `display_iter`, which pays that index
+    /// computation per CELL because it addresses each one by `Point`.
+    /// Pinned by `snapshot_matches_display_iter` below.
+    pub fn capture_cells(&mut self, grid: &Grid<Cell>) {
+        let columns = grid.columns();
+        let lines = grid.screen_lines();
+        let display_offset = grid.display_offset();
+        self.columns = columns;
+        self.display_offset = display_offset;
+        self.cells.clear();
+        self.zerowidth.clear();
+        self.cells.reserve(columns * lines);
+        for row in 0..lines {
+            let line = Line(row as i32 - display_offset as i32);
+            let source = &grid[line];
+            // Every row has `columns` cells after a resize (alacritty
+            // reflows history rows too); the take/pad keeps the row-major
+            // layout exact even if that ever stopped being true.
+            let mut n = 0;
+            for cell in source.into_iter().take(columns) {
+                self.cells.push(SnapCell::from_cell(cell, &mut self.zerowidth));
+                n += 1;
+            }
+            debug_assert_eq!(n, columns, "grid row shorter than the grid");
+            for _ in n..columns {
+                self.cells
+                    .push(SnapCell::from_cell(&Cell::default(), &mut self.zerowidth));
+            }
+        }
+    }
+
+    /// For the perf harness: what the cell buffers hold, in bytes.
+    #[cfg(test)]
+    pub(crate) fn buffer_bytes(&self) -> usize {
+        self.cells.len() * std::mem::size_of::<SnapCell>()
+            + self.zerowidth.len() * std::mem::size_of::<char>()
+    }
+}
+
 impl Default for RenderableContent {
     fn default() -> Self {
         Self {
             cells: Vec::new(),
+            zerowidth: Vec::new(),
+            columns: 0,
             display_offset: 0,
             history_size: 0,
             cursor_point: Point::default(),
@@ -89,6 +254,8 @@ impl GridSnapshot {
             // snapshot renders identically (just the background fill), and
             // the first real `sync` (the backend starts `dirty`) fills it.
             cells: Vec::new(),
+            zerowidth: Vec::new(),
+            columns: 0,
             display_offset: 0,
             history_size: 0,
             cursor_point: term.grid().cursor.point,
@@ -131,9 +298,11 @@ impl GridSnapshot {
     /// 10k-line scrollback that was ~10k `Vec<Cell>` allocations and
     /// megabytes of memcpy per frame, all while holding the same
     /// `FairMutex<Term>` the PTY reader thread needs to apply new output.
-    /// The renderer only ever walks the visible viewport
-    /// (`display_iter()`), so only that is snapshotted now, into a reused
-    /// buffer — and only when [`Self::dirty`] says something changed.
+    /// The renderer only ever walks the visible viewport, so only that is
+    /// snapshotted now, into a reused buffer — and only when
+    /// [`Self::dirty`] says something changed. P2 then shrank what is
+    /// copied per cell to the fields the painter reads
+    /// (`RenderableContent::capture_cells`).
     pub(super) fn refresh<T>(&mut self, terminal: &mut Term<T>, size: TerminalSize) {
         self.dirty = false;
         let selectable_range = match &terminal.selection {
@@ -143,11 +312,8 @@ impl GridSnapshot {
 
         self.content.cursor = terminal.grid_mut().cursor_cell().clone();
         let grid = terminal.grid();
-        self.content.cells.clear();
-        self.content
-            .cells
-            .extend(grid.display_iter().map(|i| (i.point, i.cell.clone())));
-        self.content.display_offset = grid.display_offset();
+        // sets `display_offset` too
+        self.content.capture_cells(grid);
         self.content.history_size = grid.history_size();
         self.content.cursor_point = grid.cursor.point;
         self.content.selectable_range = selectable_range;
@@ -165,11 +331,11 @@ impl GridSnapshot {
         let c = &self.content;
         let mut left = String::new();
         let mut has_right = false;
-        for (point, cell) in &c.cells {
-            if point.line != c.cursor_point.line {
-                continue;
-            }
-            if point.column < c.cursor_point.column {
+        // A cursor row outside the viewport (scrolled back) yields no
+        // cells, exactly as the whole-snapshot walk this replaced did.
+        let row = c.viewport_row(c.cursor_point.line).unwrap_or(&[]);
+        for (column, cell) in row.iter().enumerate() {
+            if Column(column) < c.cursor_point.column {
                 left.push(cell.c);
             } else if cell.c != ' ' && cell.c != '\t' {
                 has_right = true;
@@ -292,6 +458,120 @@ pub(super) mod fixtures {
     }
 }
 
+/// pTerminal perf delta (P2): the snapshot must be indistinguishable from
+/// the `(Point, Cell)` clone it replaced, for every field the painter and
+/// `cursor_line_context` read — including `zerowidth()`'s three-way
+/// `None` / `Some(&[])` / `Some(marks)` contract, which decides whether a
+/// cell may join a glyph run.
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
+    use alacritty_terminal::grid::Scroll;
+
+    fn assert_matches_display_iter(term: &Term<Noop>, what: &str) {
+        let mut content = RenderableContent::default();
+        content.capture_cells(term.grid());
+        let expected: Vec<_> = term.grid().display_iter().collect();
+        let got: Vec<_> = content.cells().collect();
+        assert_eq!(got.len(), expected.len(), "{what}: cell count");
+        for (g, e) in got.iter().zip(&expected) {
+            assert_eq!(g.point, e.point, "{what}: point");
+            assert_eq!(g.c, e.cell.c, "{what}: char at {:?}", e.point);
+            assert_eq!(g.fg, e.cell.fg, "{what}: fg at {:?}", e.point);
+            assert_eq!(g.bg, e.cell.bg, "{what}: bg at {:?}", e.point);
+            assert_eq!(g.flags, e.cell.flags, "{what}: flags at {:?}", e.point);
+            assert_eq!(
+                g.zerowidth(),
+                e.cell.zerowidth(),
+                "{what}: zerowidth at {:?}",
+                e.point
+            );
+        }
+        assert_eq!(content.display_offset, term.grid().display_offset());
+    }
+
+    #[test]
+    fn snapshot_matches_display_iter() {
+        assert_matches_display_iter(&term_with(COLS, LINES, 100, &dense_ansi()), "dense");
+        assert_matches_display_iter(&term_with(COLS, LINES, 100, &thai_ansi()), "thai");
+        // wide chars + their spacers, and a smaller odd-sized grid
+        assert_matches_display_iter(
+            &term_with(13, 7, 100, "ab \u{4e2d}\u{6587} cd\r\nsecond row\r\n"),
+            "wide",
+        );
+        // scrolled back: viewport rows have negative buffer lines
+        let mut scrolled = term_with(COLS, LINES, 1000, &scrolled_ansi());
+        scrolled.scroll_display(Scroll::Delta(40));
+        assert_ne!(scrolled.grid().display_offset(), 0, "premise: scrolled");
+        assert_matches_display_iter(&scrolled, "scrolled");
+    }
+
+    /// The subtle case: OSC 8 hyperlink text has `CellExtra` but no marks,
+    /// so `zerowidth()` is `Some(&[])`, not `None`. The painter's
+    /// `is_some()` routes it to the per-cell path; the snapshot must not
+    /// quietly turn it into `None` and make it runnable.
+    #[test]
+    fn hyperlink_only_extra_stays_some_empty() {
+        let term = term_with(
+            40,
+            3,
+            0,
+            "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ plain",
+        );
+        let mut content = RenderableContent::default();
+        content.capture_cells(term.grid());
+        let cells: Vec<_> = content.cells().take(6).collect();
+        assert_eq!(cells[0].c, 'l');
+        assert_eq!(cells[0].zerowidth(), Some(&[][..]), "hyperlink cell");
+        assert_eq!(cells[5].c, 'p'); // "link " then "plain"
+        assert_eq!(cells[5].zerowidth(), None, "plain cell");
+        assert_matches_display_iter(&term, "hyperlink");
+    }
+
+    /// Reused buffers must not leak the previous frame: a second capture
+    /// of a smaller, mark-free grid has exactly that grid's cells and no
+    /// stale zero-width pool.
+    #[test]
+    fn recapture_replaces_rather_than_appends() {
+        let mut content = RenderableContent::default();
+        content.capture_cells(term_with(COLS, LINES, 0, &thai_ansi()).grid());
+        assert!(content.buffer_bytes() > COLS * LINES * 20, "premise: pool used");
+        let small = term_with(10, 2, 0, "hi");
+        content.capture_cells(small.grid());
+        assert_eq!(content.cells().count(), 20);
+        assert_eq!(content.buffer_bytes(), 20 * std::mem::size_of::<SnapCell>());
+        assert_matches_display_iter(&small, "small");
+    }
+
+    #[test]
+    fn cursor_line_context_reads_the_cursor_row_only() {
+        let mut size = TerminalSize::default();
+        size.cell_width = 8;
+        size.cell_height = 17;
+        let mut term = term_with(20, 4, 100, "first\r\nC:\\> echo hi");
+        let mut snap = GridSnapshot::new(&mut term, size);
+        snap.refresh(&mut term, size);
+        assert_eq!(snap.cursor_line_context(), ("C:\\> echo hi".to_string(), false));
+        // text right of the cursor flips the flag
+        let mut term = term_with(20, 4, 100, "abc\x1b[2D");
+        let mut snap = GridSnapshot::new(&mut term, size);
+        snap.refresh(&mut term, size);
+        assert_eq!(snap.cursor_line_context(), ("a".to_string(), true));
+        // cursor row scrolled out of the viewport: nothing, as before
+        let mut term = term_with(20, 4, 100, &scrolled_ansi());
+        term.scroll_display(Scroll::Delta(10));
+        let mut snap = GridSnapshot::new(&mut term, size);
+        snap.refresh(&mut term, size);
+        assert_eq!(snap.cursor_line_context(), (String::new(), false));
+    }
+
+    #[test]
+    fn snap_cell_is_twenty_bytes() {
+        assert_eq!(std::mem::size_of::<SnapCell>(), 20);
+    }
+}
+
 /// pTerminal perf delta (P2 measurement): how much a dirty `sync` costs
 /// for a full 200x50 viewport. Not an assertion — the printed figures are
 /// the deliverable; run in release, where the numbers mean something:
@@ -299,10 +579,11 @@ pub(super) mod fixtures {
 ///   cargo test --release --bin pterminal measure_sync -- --ignored --nocapture
 ///
 /// Reports per screen: median/p95/min microseconds over 2,000 refreshes of
-/// an always-dirty snapshot, the bytes the cell buffer holds, and how many
-/// cells carried an `Arc<CellExtra>` (each one an atomic refcount bump on
-/// copy). The Thai screen is the Arc-heavy case; the dense screen is the
-/// everyday one.
+/// an always-dirty snapshot, the bytes the cell buffers hold, and how many
+/// source cells carry an `Arc<CellExtra>` (each one an atomic refcount
+/// bump per refresh under the pre-P2 `(Point, Cell)` copy; none under the
+/// pooled snapshot). The Thai screen is the Arc-heavy case; the dense
+/// screen is the everyday one.
 #[cfg(test)]
 mod perf {
     use super::fixtures::*;
@@ -330,15 +611,15 @@ mod perf {
         samples.sort();
         let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize];
         let content = snapshot.content();
-        let cells = content.cells.len();
-        let bytes = cells * std::mem::size_of::<(Point, Cell)>();
-        let arcs = content
-            .cells
-            .iter()
-            .filter(|(_, c)| c.extra.is_some())
+        let cells = content.cells().count();
+        let bytes = content.buffer_bytes();
+        let arcs = term
+            .grid()
+            .display_iter()
+            .filter(|i| i.cell.extra.is_some())
             .count();
         println!(
-            "{name}: cells={cells} buffer={bytes}B arc_clones/refresh={arcs} \
+            "{name}: cells={cells} buffer={bytes}B source_arc_cells={arcs} \
              median={:.1}us p95={:.1}us min={:.1}us (n={iters})",
             at(0.5).as_secs_f64() * 1e6,
             at(0.95).as_secs_f64() * 1e6,
