@@ -18,7 +18,7 @@ use crate::editor::{CloseEditorDraft, EditorTab, open_editor, save_editor};
 use crate::git;
 use crate::hooks::{self, AgentStatus};
 use crate::messages;
-use crate::resources::{MachineStats, ProcSample};
+use crate::resources::{MachineStats, ProcSample, SamplerControl, SAMPLE_FAST, SAMPLE_SLOW};
 use crate::shared_ctx;
 use crate::state;
 use crate::term::{self, Tab, TabKind};
@@ -223,6 +223,12 @@ pub struct PtApp {
     pub active_ws: usize,
     pub next_tab_id: u64,
     pub sampler: Receiver<(Vec<ProcSample>, MachineStats)>,
+    /// Cadence handle for the sampler thread behind `sampler` (wave 2).
+    /// `drain_events` retunes it every frame from tab activity — see the
+    /// policy at the end of that function — and `arm_claim` pokes it so a
+    /// fresh spawn's PID claim gets its snapshot in ~250 ms instead of at
+    /// the next scheduled sweep.
+    pub sampler_control: std::sync::Arc<SamplerControl>,
     pub last_snap: Vec<ProcSample>,
     pub machine: MachineStats,
     pub watcher: Option<(RecommendedWatcher, Receiver<PathBuf>)>,
@@ -555,12 +561,17 @@ impl PtApp {
         };
         // Before the struct literal: `base` is moved into it below.
         let history = crate::history::History::load(&base);
+        // Start fast: `resume_saved_tabs` is about to spawn every saved tab,
+        // and each spawn's PID claim wants prompt snapshots. `drain_events`
+        // relaxes the cadence on the first quiet frame.
+        let sampler_control = SamplerControl::new(SAMPLE_FAST);
         let mut app = PtApp {
             base,
             workspaces,
             active_ws: 0,
             next_tab_id: st.next_tab_id,
-            sampler: crate::resources::spawn_sampler(),
+            sampler: crate::resources::spawn_sampler(std::sync::Arc::clone(&sampler_control)),
+            sampler_control,
             last_snap: vec![],
             machine: MachineStats::default(),
             watcher,
@@ -1205,12 +1216,41 @@ impl PtApp {
     /// Snapshot of our direct child PIDs from the last sampler snapshot,
     /// taken before a spawn so the new child can be identified (via
     /// `PendingClaim` / `drain_events`).
+    ///
+    /// Only as fresh as `last_snap`, which since the wave-2 cadence backoff
+    /// can be up to `SAMPLE_SLOW` (10 s) old when the app has been idle —
+    /// it was up to 2 s old before. The exposure is the same in kind: a
+    /// direct child of ours that appeared after that snapshot and is still
+    /// alive at claim time gets attributed to the new tab. Our direct
+    /// children are ConPTY roots (one per tab, each of which arms its own
+    /// claim and so refreshes the snapshot within ~250 ms) and the
+    /// short-lived launchers behind `open::that`; neither has been seen to
+    /// straddle the window in practice, so this is documented rather than
+    /// closed with a synchronous sweep on the UI thread.
     pub(crate) fn own_child_pids(&self) -> HashSet<u32> {
         self.last_snap
             .iter()
             .filter(|p| p.parent == Some(std::process::id()))
             .map(|p| p.pid)
             .collect()
+    }
+
+    /// Arms the PID claim for a tab that was just spawned or respawned —
+    /// the one way every spawn site records a claim — and pokes the sampler
+    /// so the snapshot the claim needs arrives within ~250 ms. Before wave 2
+    /// a spawn waited up to one full 2 s sweep for its first usable
+    /// snapshot; with the idle cadence now 10 s, waiting for the *scheduled*
+    /// sweep would blow straight through `claim_pids`' 5 s window, so the
+    /// poke is load-bearing, not a nicety. (`drain_events` separately holds
+    /// the cadence at `SAMPLE_FAST` for as long as a claim stays pending, so
+    /// the retries after the first snapshot are prompt too.)
+    ///
+    /// Not used for the *re-arm* inside `drain_events` when a claim is put
+    /// back still pending: that one is already inside the fast cadence and
+    /// a poke per frame would turn 2 s into a 250 ms sweep loop.
+    pub(crate) fn arm_claim(&mut self, claim: PendingClaim) {
+        self.pending_claim = Some(claim);
+        self.sampler_control.poke();
     }
 
     /// Opens a plain shell tab rooted at a worktree the user previously
@@ -1235,7 +1275,7 @@ impl PtApp {
                 ws.active_tab = ws.tabs.len() - 1;
                 ws.meta.kept_worktrees.retain(|w| w != &wt);
                 self.active_ws = ws_idx;
-                self.pending_claim = Some(PendingClaim { ws_index: ws_idx, tab_id: id, before });
+                self.arm_claim(PendingClaim { ws_index: ws_idx, tab_id: id, before });
                 self.persist();
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -1721,6 +1761,23 @@ impl PtApp {
                 // a finished run stays readable between turns.
             }
         }
+        // Wave-2 sampler cadence. The ~31 ms sysinfo sweep exists to feed
+        // the sidebar's per-tab CPU/mem columns, the worker-process rows
+        // and the PID claim; the status-bar machine row rides along. When
+        // no tab can be changing those numbers, sweeping every 2 s is pure
+        // background cost — this app sits open all day with agents idle
+        // between turns — so drop to `SAMPLE_SLOW` (never stop: the machine
+        // row and `own_mem` still refresh, just less often). Re-derived
+        // every frame from this frame's `exited()`/`status`/PTY-event
+        // state, which the loop above has just brought up to date;
+        // `set_interval` is an atomic store unless the value shortens, in
+        // which case it wakes the sampler so a tab that just started
+        // talking gets its first fast sweep now, not up to 10 s from now.
+        // A pending claim pins the fast cadence outright: `claim_pids` has
+        // a 5 s window and needs successive snapshots inside it.
+        let busy = self.pending_claim.is_some()
+            || self.workspaces.iter().flat_map(|ws| ws.tabs.iter()).any(term::Tab::is_busy);
+        self.sampler_control.set_interval(if busy { SAMPLE_FAST } else { SAMPLE_SLOW });
         // FINAL-REVIEW FINDING 1: flush deferred submit Enters for messages
         // whose text was typed into a tab's PTY `SUBMIT_DELAY` ago (see
         // `pending_submit`'s docs for why the `\r` cannot ride along with the
@@ -2269,7 +2326,7 @@ impl PtApp {
         let tab_id = tab.id;
         match tab.respawn(ctx) {
             Ok(()) => {
-                self.pending_claim = Some(PendingClaim { ws_index, tab_id, before });
+                self.arm_claim(PendingClaim { ws_index, tab_id, before });
                 if self.selected_child.is_some_and(|(pid, _)| pid == tab_id) {
                     self.selected_child = None;
                 }
@@ -2334,7 +2391,7 @@ impl PtApp {
             Ok(new_tab) => {
                 let ws = &mut self.workspaces[ws_index];
                 ws.tabs[tab_idx] = new_tab;
-                self.pending_claim = Some(PendingClaim { ws_index, tab_id: id, before });
+                self.arm_claim(PendingClaim { ws_index, tab_id: id, before });
                 if self.selected_child.is_some_and(|(pid, _)| pid == id) {
                     self.selected_child = None;
                 }
@@ -2406,7 +2463,7 @@ impl PtApp {
                 ws.active_tab = 0;
                 self.active_ws = ws_index;
                 self.selected_child = None;
-                self.pending_claim = Some(PendingClaim { ws_index, tab_id: id, before });
+                self.arm_claim(PendingClaim { ws_index, tab_id: id, before });
                 self.persist();
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -2484,7 +2541,7 @@ impl PtApp {
                 self.pending_submit.retain(|(tid, _)| *tid != tab_id);
                 let ws = &mut self.workspaces[ws_index];
                 ws.tabs[tab_idx] = new_tab;
-                self.pending_claim = Some(PendingClaim { ws_index, tab_id, before });
+                self.arm_claim(PendingClaim { ws_index, tab_id, before });
                 if self.selected_child.is_some_and(|(pid, _)| pid == tab_id) {
                     self.selected_child = None;
                 }
@@ -2737,6 +2794,7 @@ mod tests {
             active_ws: 0,
             next_tab_id: 90_211,
             sampler: sampler_rx,
+            sampler_control: SamplerControl::new(SAMPLE_FAST),
             last_snap: vec![],
             machine: MachineStats::default(),
             watcher: None,
@@ -2843,6 +2901,7 @@ mod tests {
             active_ws: 0,
             next_tab_id: 90_400,
             sampler: sampler_rx,
+            sampler_control: SamplerControl::new(SAMPLE_FAST),
             last_snap: vec![],
             machine: MachineStats::default(),
             watcher: None,
@@ -2895,6 +2954,7 @@ mod tests {
             active_ws,
             next_tab_id: 90_500,
             sampler: sampler_rx,
+            sampler_control: SamplerControl::new(SAMPLE_FAST),
             last_snap: vec![],
             machine: MachineStats::default(),
             watcher: None,
@@ -4909,4 +4969,51 @@ mod tests {
              otherwise this test proves nothing"
         );
     }
+    // --- wave 2: sampler cadence policy --------------------------------------
+
+    /// The cadence policy end to end through `drain_events`: no tabs →
+    /// slow; a tab that just wrote output → fast; that same tab once its
+    /// child has exited → slow again, however recent its last output; and
+    /// a pending PID claim → fast regardless of tab activity, because
+    /// `claim_pids` needs snapshots inside its 5 s window.
+    #[test]
+    fn sampler_cadence_follows_tab_activity() {
+        let ctx = egui::Context::default();
+        let base = tempfile::tempdir().expect("tempdir");
+        let repo = base.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut app = app_with_tabs(base.path().to_path_buf(), repo.clone(), vec![]);
+
+        app.drain_events(&ctx);
+        assert_eq!(app.sampler_control.interval(), SAMPLE_SLOW, "no tabs: nothing to sample for");
+
+        let tab = term::spawn_shell(&ctx, 1, &repo).expect("spawn shell");
+        app.workspaces[0].tabs.push(tab);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.drain_events(&ctx);
+            if app.workspaces[0].tabs[0].term.output_within(std::time::Duration::from_secs(60)) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "shell banner never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(app.sampler_control.interval(), SAMPLE_FAST, "recent PTY output must select the fast cadence");
+
+        exit_and_drain(&mut app.workspaces[0].tabs[0].term);
+        app.drain_events(&ctx);
+        assert_eq!(
+            app.sampler_control.interval(), SAMPLE_SLOW,
+            "an exited tab is never busy, however recent its last output"
+        );
+
+        // `spawned_at` fresh and `last_snap` empty: the claim cannot resolve
+        // and stays pending across this frame.
+        app.workspaces[0].tabs[0].spawned_at = std::time::Instant::now();
+        app.arm_claim(PendingClaim { ws_index: 0, tab_id: 1, before: HashSet::new() });
+        app.drain_events(&ctx);
+        assert!(app.pending_claim.is_some(), "claim against an empty snapshot must stay pending");
+        assert_eq!(app.sampler_control.interval(), SAMPLE_FAST, "a pending PID claim pins the fast cadence");
+    }
+
 }

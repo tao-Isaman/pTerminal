@@ -1,4 +1,7 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct ProcSample {
@@ -73,6 +76,138 @@ pub fn new_children(before: &HashSet<u32>, procs: &[ProcSample], parent: u32) ->
         .collect()
 }
 
+/// Sweep interval while something on screen can change quickly: a tab has
+/// written output within [`ACTIVITY_WINDOW`], an agent tab reports `Working`,
+/// or a freshly spawned tab is still waiting to claim its PIDs. This is the
+/// cadence the sampler has always run at; it is what the sidebar's CPU/mem
+/// columns, the `4x python` worker rows and the PID claim were designed
+/// around.
+pub const SAMPLE_FAST: Duration = Duration::from_secs(2);
+
+/// Sweep interval while nothing is happening: every tab quiet, no agent
+/// working, no claim pending. Slower, never stopped — the status bar's
+/// machine row, `own_mem`, and every tab's CPU/mem column (shell tabs
+/// included) are drawn from the snapshot even with zero agent tabs, so a
+/// sampler that stopped would freeze those at their last value. The first
+/// thing that happens (output, a spawn) snaps the cadence back to
+/// [`SAMPLE_FAST`] *immediately* via [`SamplerControl::set_interval`], not
+/// on the next slow tick — see `wait_until_due`.
+///
+/// Measured (`measure_sampler_cpu_by_interval`, debug build, ~515
+/// processes, one interval per process, 30s window in which the sampler
+/// thread is the only work): 2s cadence = 14 sweeps, 672ms CPU, **2.24% of
+/// one core**; 10s cadence = 2 sweeps, 156ms CPU, **0.52%**. A 4.3× cut in
+/// the app's idle background CPU, which is the state it spends most of the
+/// day in. The per-sweep CPU here (~48ms) is above the 31ms wall-clock
+/// median quoted on `proc_refresh_kind` because this counts kernel time in
+/// the toolhelp/`GetProcessTimes` calls, not just the thread's wall time.
+pub const SAMPLE_SLOW: Duration = Duration::from_secs(10);
+
+/// How long after a tab's last PTY event it still counts as active. Long
+/// enough that the gaps inside a normal stream of output (a build step, an
+/// agent between tool calls) never drop the cadence, short enough that a
+/// tab which has gone genuinely quiet gets the app to [`SAMPLE_SLOW`]
+/// within a few seconds.
+///
+/// Measured before choosing PTY output as the signal (60s ConPTY probes,
+/// events per 5s bucket): an idle Claude Code REPL emitted 18 events during
+/// startup, one stray at ~12s, then nothing for the remaining 45s; an idle
+/// Codex TUI 47 then nothing; an idle PowerShell prompt 5 then nothing. None
+/// of the three redraws on a timer while idle, so "recent output" really
+/// does mean "something is happening" for every tab kind we spawn.
+pub const ACTIVITY_WINDOW: Duration = Duration::from_secs(5);
+
+/// Floor between two sweeps whatever the reason for the second one. Must
+/// stay above sysinfo's `MINIMUM_CPU_UPDATE_INTERVAL` (200ms on Windows):
+/// `compute_cpu_usage` skips a process whose last update is younger than
+/// that, and a sweep inside the window would hand back the previous
+/// cycle's CPU figures under a fresh timestamp.
+const SAMPLE_MIN_GAP: Duration = Duration::from_millis(250);
+
+/// The app's handle on the sampler thread's cadence. [`spawn_sampler`]
+/// takes one and the thread blocks on it between sweeps, so the app can
+/// change the interval and, separately, demand a sweep *now*.
+///
+/// Two entry points because they answer different questions:
+///
+/// * [`set_interval`](Self::set_interval) is a *policy*: "while things look
+///   like this, sweep every N seconds." `drain_events` re-derives it every
+///   frame from tab state and calls this every frame — it is one atomic
+///   store, plus a condvar notify only when the interval got shorter (a
+///   longer one just lets the current wait run out; nothing is waiting on a
+///   slowdown).
+/// * [`poke`](Self::poke) is an *event*: "a tab was just spawned; the PID
+///   claim needs a snapshot that contains the new child, and it needs it
+///   before the 5s claim window closes." Under the old fixed 2s cadence a
+///   spawn waited up to 2s for its first usable snapshot; a poke makes it
+///   [`SAMPLE_MIN_GAP`] at most.
+///
+/// Waiting is `Condvar::wait_timeout` on the `poked` flag, re-checked in a
+/// loop against the *current* interval: shortening the interval while the
+/// thread is mid-way through a 10s wait ends that wait as soon as the 2s
+/// mark is already past, rather than after the remaining 8s.
+pub struct SamplerControl {
+    interval_ms: AtomicU64,
+    poked: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl SamplerControl {
+    pub fn new(interval: Duration) -> Arc<Self> {
+        Arc::new(SamplerControl {
+            interval_ms: AtomicU64::new(interval.as_millis() as u64),
+            poked: Mutex::new(false),
+            cv: Condvar::new(),
+        })
+    }
+
+    pub fn interval(&self) -> Duration {
+        Duration::from_millis(self.interval_ms.load(Ordering::Relaxed))
+    }
+
+    /// Sets the steady-state interval. Wakes the sampler only if the new
+    /// interval is shorter than the old one — that is the only direction in
+    /// which the wait currently in progress could be too long.
+    pub fn set_interval(&self, interval: Duration) {
+        let new_ms = interval.as_millis() as u64;
+        let old_ms = self.interval_ms.swap(new_ms, Ordering::Relaxed);
+        if new_ms < old_ms {
+            // Taking the mutex (not just notifying) is what makes this
+            // race-free: the waiter reads the interval *under* the lock
+            // before it blocks, so a store+notify that lands between its
+            // check and its `wait_timeout` cannot be missed.
+            let _g = self.poked.lock().unwrap();
+            self.cv.notify_all();
+        }
+    }
+
+    /// Asks for a sweep as soon as [`SAMPLE_MIN_GAP`] allows. Sticky: a poke
+    /// that lands while a sweep is in progress is honoured by the next wait,
+    /// so a child that appeared during the sweep is still picked up promptly.
+    pub fn poke(&self) {
+        *self.poked.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+
+    /// Blocks the sampler thread until the next sweep is due, measured from
+    /// `last` (the end of the previous sweep). Consumes a pending poke.
+    fn wait_until_due(&self, last: Instant) {
+        let mut poked = self.poked.lock().unwrap();
+        loop {
+            let due = if *poked { SAMPLE_MIN_GAP } else { self.interval().max(SAMPLE_MIN_GAP) };
+            let elapsed = last.elapsed();
+            if elapsed >= due {
+                *poked = false;
+                return;
+            }
+            // Spurious wakeups and interval changes both just come back
+            // round to the re-check above.
+            let (g, _) = self.cv.wait_timeout(poked, due - elapsed).unwrap();
+            poked = g;
+        }
+    }
+}
+
 /// Exactly the per-process facts [`ProcSample`] carries, and nothing else.
 ///
 /// The obvious call, `System::refresh_processes(All, true)`, is *not* free: it
@@ -122,7 +257,10 @@ fn proc_refresh_kind() -> sysinfo::ProcessRefreshKind {
         .without_tasks()
 }
 
-pub fn spawn_sampler() -> std::sync::mpsc::Receiver<(Vec<ProcSample>, MachineStats)> {
+/// Starts the background sysinfo sweep. `control` is the app's cadence handle
+/// (see [`SamplerControl`]); the thread reads its interval before every wait,
+/// so the caller can retune it at any time without restarting anything.
+pub fn spawn_sampler(control: Arc<SamplerControl>) -> std::sync::mpsc::Receiver<(Vec<ProcSample>, MachineStats)> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut sys = sysinfo::System::new();
@@ -178,17 +316,13 @@ pub fn spawn_sampler() -> std::sync::mpsc::Receiver<(Vec<ProcSample>, MachineSta
                 cpu_pct: sys.global_cpu_usage(),
             };
             if tx.send((snap, machine)).is_err() { return; } // app gone, thread exits
-            // ponytail: a fixed 2s cadence, deliberately. Backing off when no
-            // agent tab is running would save far more than trimming the
-            // refresh kind does (the whole ~31ms sweep instead of ~3.7ms of it),
-            // but this thread has no idea what tabs exist — `spawn_sampler`
-            // takes no arguments and hands back only a `Receiver`, so telling
-            // it would mean changing the signature and threading a shared flag
-            // out of `App`. Left alone on purpose to keep this change confined
-            // to resources.rs. Note also that the machine-stats row and the
-            // per-tab memory column are drawn from this snapshot even with
-            // zero agent tabs, so any backoff must keep sampling, just slower.
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            // Wave-2 cadence backoff: the wait is no longer a fixed 2s sleep.
+            // The app tells us (through `control`) whether anything on
+            // screen is changing — see `PtApp::drain_events` for the policy
+            // and `SamplerControl` for the mechanics. Measured from the END
+            // of the sweep, so the interval is the idle gap between sweeps
+            // rather than a period the ~31ms sweep itself eats into.
+            control.wait_until_due(Instant::now());
         }
     });
     rx
@@ -313,7 +447,7 @@ mod tests {
     /// boundary, so its usage figures may still be the warm-up baseline of 0.
     #[test]
     fn sampler_produces_snapshots() {
-        let rx = spawn_sampler();
+        let rx = spawn_sampler(SamplerControl::new(SAMPLE_FAST));
         let me = std::process::id();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut saw_cpu = false;
@@ -345,4 +479,147 @@ mod tests {
         }
         assert!(saw_cpu, "ProcSample::cpu is zero for every process on the machine");
     }
+    // --- wave 2: sampler cadence control -------------------------------------
+
+    /// Runs `wait_until_due(last)` on a helper thread and reports how long it
+    /// blocked. `last` is expressed as "this long ago" so a test can start a
+    /// wait that is already partway through its interval.
+    fn timed_wait(ctl: &Arc<SamplerControl>, last_ago: Duration) -> std::thread::JoinHandle<Duration> {
+        let ctl = Arc::clone(ctl);
+        std::thread::spawn(move || {
+            let last = Instant::now() - last_ago;
+            let t0 = Instant::now();
+            ctl.wait_until_due(last);
+            t0.elapsed()
+        })
+    }
+
+    /// The steady state: with nothing poked and nothing retuned, a wait runs
+    /// for the configured interval and no less. The regression this guards
+    /// is a `wait_timeout` spurious wakeup being mistaken for "due".
+    #[test]
+    fn wait_runs_for_the_full_interval_when_undisturbed() {
+        let ctl = SamplerControl::new(Duration::from_millis(400));
+        let waited = timed_wait(&ctl, Duration::ZERO).join().unwrap();
+        assert!(waited >= Duration::from_millis(400), "returned early: {waited:?}");
+        assert!(waited < Duration::from_secs(5), "overslept: {waited:?}");
+    }
+
+    /// A poke ends a slow wait within `SAMPLE_MIN_GAP`, not at the interval —
+    /// this is what turns a fresh spawn's PID claim from "up to one interval"
+    /// into "~250ms". Lower bound too: a poke must not produce a sweep
+    /// inside sysinfo's minimum CPU-update window.
+    #[test]
+    fn poke_ends_a_slow_wait_after_min_gap() {
+        let ctl = SamplerControl::new(SAMPLE_SLOW);
+        let h = timed_wait(&ctl, Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(50));
+        ctl.poke();
+        let waited = h.join().unwrap();
+        assert!(waited >= SAMPLE_MIN_GAP, "swept inside the CPU-update window: {waited:?}");
+        assert!(waited < Duration::from_secs(3), "poke did not wake the wait: {waited:?}");
+        assert!(!*ctl.poked.lock().unwrap(), "poke must be consumed by the wait it ended");
+    }
+
+    /// Shortening the interval mid-wait is re-evaluated against time already
+    /// elapsed: a wait 3s into a 10s interval that is retuned to 2s is
+    /// already overdue and must return at once, not after the remaining 7s.
+    #[test]
+    fn shortening_the_interval_ends_a_wait_already_past_the_new_mark() {
+        let ctl = SamplerControl::new(SAMPLE_SLOW);
+        let h = timed_wait(&ctl, Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(50));
+        ctl.set_interval(SAMPLE_FAST);
+        let waited = h.join().unwrap();
+        assert!(waited < Duration::from_secs(2), "retune did not wake the wait: {waited:?}");
+    }
+
+    /// Lengthening the interval is never a wake-up — nothing waiting could be
+    /// too *short* — and the wait then honours the longer value it reads on
+    /// its next check rather than the one it started with.
+    #[test]
+    fn lengthening_the_interval_extends_a_wait_in_progress() {
+        let ctl = SamplerControl::new(Duration::from_millis(300));
+        let h = timed_wait(&ctl, Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(50));
+        ctl.set_interval(Duration::from_millis(900));
+        // `set_interval` deliberately does not notify on a slowdown, so the
+        // waiter only learns the new value when its 300ms timeout fires; it
+        // then re-arms for the remainder up to 900ms.
+        let waited = h.join().unwrap();
+        assert!(waited >= Duration::from_millis(900), "wait ended at the old interval: {waited:?}");
+        assert!(waited < Duration::from_secs(5), "overslept: {waited:?}");
+    }
+
+    /// A poke that lands while no wait is in progress (i.e. during a sweep)
+    /// is not lost: the next wait sees it and returns after the minimum gap.
+    #[test]
+    fn poke_is_sticky_across_a_sweep() {
+        let ctl = SamplerControl::new(SAMPLE_SLOW);
+        ctl.poke();
+        let waited = timed_wait(&ctl, Duration::ZERO).join().unwrap();
+        assert!(waited >= SAMPLE_MIN_GAP && waited < Duration::from_secs(3), "{waited:?}");
+    }
+
+    /// End to end through the real thread: at `SAMPLE_SLOW` the second
+    /// snapshot does not arrive on the old 2s schedule; retuning to
+    /// `SAMPLE_FAST` brings the next one within the fast interval. (The
+    /// first snapshot always arrives right after the 200ms warm-up.)
+    #[test]
+    fn sampler_thread_follows_control() {
+        let ctl = SamplerControl::new(SAMPLE_SLOW);
+        let rx = spawn_sampler(Arc::clone(&ctl));
+        rx.recv_timeout(Duration::from_secs(10)).expect("first snapshot after warm-up");
+        assert!(
+            rx.recv_timeout(Duration::from_secs(4)).is_err(),
+            "a second snapshot arrived within 4s while the interval was {SAMPLE_SLOW:?}"
+        );
+        // ~4s into a 10s wait; retuning to 2s makes it overdue immediately.
+        ctl.set_interval(SAMPLE_FAST);
+        rx.recv_timeout(Duration::from_secs(3))
+            .expect("retuning to SAMPLE_FAST did not produce a prompt snapshot");
+    }
+
+    /// Cost measurement for the cadence backoff, run one interval per
+    /// process so a lingering sampler thread from one arm cannot pollute the
+    /// other: `SAMPLER_INTERVAL_MS=2000` vs `=10000`. Reports this process's
+    /// accumulated CPU time (kernel+user, from `GetProcessTimes` via
+    /// sysinfo) consumed across a 30s window in which the sampler thread is
+    /// the only thing doing work, and that as a percentage of one core. Not
+    /// a pass/fail test; the numbers go in the commit message and the doc
+    /// comment on `SAMPLE_SLOW`.
+    ///
+    /// Uses `accumulated_cpu_time` rather than `cpu_usage()` on purpose: the
+    /// latter is scaled by the meter's CPU count, which is zero on a
+    /// `System::new()` that never refreshed its CPU list — the first cut of
+    /// this test reported a flat 0.000% for both arms that way.
+    #[test]
+    #[ignore = "30s measurement; run with SAMPLER_INTERVAL_MS set and --nocapture"]
+    fn measure_sampler_cpu_by_interval() {
+        let ms: u64 = std::env::var("SAMPLER_INTERVAL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
+        let ctl = SamplerControl::new(Duration::from_millis(ms));
+        let rx = spawn_sampler(Arc::clone(&ctl));
+        rx.recv_timeout(Duration::from_secs(10)).expect("warm-up snapshot");
+        let me = sysinfo::Pid::from_u32(std::process::id());
+        let mut meter = sysinfo::System::new();
+        let kind = sysinfo::ProcessRefreshKind::nothing().with_cpu();
+        meter.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[me]), true, kind);
+        let cpu_ms_before = meter.process(me).map(|p| p.accumulated_cpu_time()).expect("own process");
+        let t0 = Instant::now();
+        let window = Duration::from_secs(30);
+        let mut snapshots = 0usize;
+        while t0.elapsed() < window {
+            if rx.recv_timeout(window - t0.elapsed()).is_ok() { snapshots += 1; }
+        }
+        meter.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[me]), true, kind);
+        let cpu_ms = meter.process(me).map(|p| p.accumulated_cpu_time()).expect("own process") - cpu_ms_before;
+        let wall = t0.elapsed();
+        let pct = cpu_ms as f64 / wall.as_millis() as f64 * 100.0;
+        eprintln!(
+            "MEASURE interval={ms}ms window={wall:?} snapshots={snapshots} cpu_time={cpu_ms}ms \
+             ({:.1}ms/sweep) = {pct:.3}% of one core",
+            cpu_ms as f64 / snapshots.max(1) as f64
+        );
+    }
+
 }

@@ -56,6 +56,11 @@ pub struct TabTerm {
     /// Shared with the backend's PTY forwarding thread; see [`TabTerm::set_visible`].
     visible: Arc<AtomicBool>,
     exited: Option<i32>,
+    /// When the child last produced a PTY event (any kind — every variant
+    /// alacritty's event loop emits is a consequence of the child writing
+    /// something). `None` until the first `poll` that sees one. Read by
+    /// [`TabTerm::output_within`], the resource sampler's activity signal.
+    last_output: Option<std::time::Instant>,
 }
 
 impl TabTerm {
@@ -86,6 +91,7 @@ impl TabTerm {
             pty_rx,
             visible,
             exited: None,
+            last_output: None,
         })
     }
 
@@ -118,6 +124,7 @@ impl TabTerm {
         // (while clean, `sync` serves the cached copy; see `mark_dirty`).
         if saw_event {
             self.backend.mark_dirty();
+            self.last_output = Some(std::time::Instant::now());
         }
     }
 
@@ -267,6 +274,18 @@ impl TabTerm {
     /// `Some(code)` once the child process has exited.
     pub fn exited(&self) -> Option<i32> {
         self.exited
+    }
+
+    /// True if the child has produced a PTY event within `window` of now.
+    /// This is the provider-agnostic "something is happening in this tab"
+    /// signal behind [`Tab::is_busy`]: it needs no hook, no notify config
+    /// and no knowledge of what program the tab runs, and — measured, see
+    /// `resources::ACTIVITY_WINDOW` — none of Claude Code, Codex or
+    /// PowerShell redraws on a timer while idle, so a quiet tab really does
+    /// go quiet here. Only as fresh as the last `poll`; every tab is polled
+    /// every frame by `PtApp::drain_events`, so in practice that is now.
+    pub fn output_within(&self, window: std::time::Duration) -> bool {
+        self.last_output.is_some_and(|t| t.elapsed() < window)
     }
 
     /// Whether there's an active selection — greys out the context menu's
@@ -966,6 +985,28 @@ impl Tab {
     pub fn has_input_bar(&self) -> bool {
         self.kind == TabKind::Agent && self.provider == crate::provider::AgentProvider::Claude
             && self.missing_dir.is_none() && self.term.exited().is_none()
+    }
+
+    /// True while this tab could be changing the numbers the resource
+    /// sampler feeds the sidebar (its CPU/mem column, its worker-process
+    /// rows). `PtApp::drain_events` runs the sampler at `SAMPLE_FAST` while
+    /// any tab says so and `SAMPLE_SLOW` otherwise — see `resources.rs`.
+    ///
+    /// Two signals, OR-ed, for every tab kind alike:
+    ///
+    /// * recent PTY output ([`TabTerm::output_within`]) — a shell running a
+    ///   build, a Codex turn, a Claude turn; the one that needs no provider
+    ///   knowledge and therefore the one that still works when hook status
+    ///   routing is broken (the `degrade_direct_mode_peers` situation);
+    /// * hook status `Working` — belt and braces for a Claude tab sitting in
+    ///   a long silent API wait between two bursts of output.
+    ///
+    /// A tab whose child has exited is never busy, whatever its status
+    /// field still says.
+    pub fn is_busy(&self) -> bool {
+        self.term.exited().is_none()
+            && (self.status == AgentStatus::Working
+                || self.term.output_within(crate::resources::ACTIVITY_WINDOW))
     }
 
     pub fn respawn(&mut self, ctx: &eframe::egui::Context) -> anyhow::Result<()> {
@@ -1701,4 +1742,75 @@ mod tests {
         assert_eq!(content.terminal_size.columns(), 100);
         assert_eq!(content.terminal_size.screen_lines(), 20);
     }
+    // --- wave 2: sampler cadence — the per-tab activity signal ---------------
+
+    /// `output_within` is the sampler's provider-agnostic activity signal.
+    /// Before the first PTY event it must say "quiet" (not "busy by
+    /// default"), and once the child has written anything it must say
+    /// "busy" for the window and only the window.
+    #[test]
+    fn output_within_follows_pty_events() {
+        let ctx = eframe::egui::Context::default();
+        let mut term = TabTerm::spawn(&ctx, 90_601, "cmd.exe",
+            &["/c".to_string(), "echo".to_string(), "sampler-probe".to_string()],
+            &std::env::current_dir().unwrap()).unwrap();
+        // Nothing polled yet: no event has been observed, so not busy.
+        assert!(!term.output_within(Duration::from_secs(60)));
+        assert!(wait_for(|| { term.poll(); term.exited().is_some() }));
+        assert!(term.output_within(Duration::from_secs(60)), "events were drained but not stamped");
+        // A window that has already elapsed reads as quiet again.
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!term.output_within(Duration::from_millis(1)));
+    }
+
+    /// `Tab::is_busy` must be false for an exited child even though its
+    /// last output was moments ago and `status` may still read `Working`
+    /// (the events file is only reconciled to `Exited` by `drain_events`,
+    /// a frame later). Otherwise every dead tab would pin the sampler at
+    /// `SAMPLE_FAST` forever.
+    #[test]
+    fn exited_tab_is_never_busy() {
+        let ctx = eframe::egui::Context::default();
+        let mut tab = spawn_shell(&ctx, 90_602, &std::env::current_dir().unwrap()).unwrap();
+        tab.term.write_input("exit\r");
+        assert!(wait_for(|| { tab.term.poll(); tab.term.exited().is_some() }));
+        assert!(tab.term.output_within(Duration::from_secs(60)), "shell banner never arrived");
+        tab.status = AgentStatus::Working;
+        assert!(!tab.is_busy());
+    }
+
+    /// The hook-status arm: a live tab with no recent output is busy iff
+    /// its status is `Working`.
+    #[test]
+    fn live_tab_is_busy_on_working_status_alone() {
+        let ctx = eframe::egui::Context::default();
+        let mut tab = spawn_shell(&ctx, 90_603, &std::env::current_dir().unwrap()).unwrap();
+        // Let the banner land, then wait for the tab to go quiet for a
+        // full activity window so the output arm is false and only the
+        // status arm can decide. "Wait until quiet" rather than "sleep one
+        // window and assert quiet": under the full suite's load PowerShell
+        // can take well over 5s from first banner byte to its prompt (the
+        // profile loads in between), so a fixed wait straddled that and
+        // failed on the very first run. The probe-established fact that an
+        // idle prompt is timer-silent is documented on `ACTIVITY_WINDOW`;
+        // this test only relies on it eventually being true.
+        assert!(wait_for(|| { tab.term.poll(); tab.term.output_within(Duration::from_secs(60)) }));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while tab.term.output_within(crate::resources::ACTIVITY_WINDOW) {
+            assert!(
+                Instant::now() < deadline,
+                "PowerShell kept emitting PTY events for 30s — the activity signal would never drop"
+            );
+            tab.term.poll();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for s in [AgentStatus::Unknown, AgentStatus::Idle, AgentStatus::NeedsYou] {
+            tab.status = s;
+            assert!(!tab.is_busy(), "{s:?} must not count as busy");
+        }
+        tab.status = AgentStatus::Working;
+        assert!(tab.is_busy());
+        tab.term.write_input("exit\r");
+    }
+
 }
