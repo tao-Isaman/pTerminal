@@ -145,7 +145,7 @@ pub(crate) fn app_with_tabs(base: PathBuf, repo: PathBuf, tabs: Vec<term::Tab>) 
 /// ConPTY in parallel) 10s produced real false-positive panics — four
 /// tests died here on the v0.1.0 release run, and the same panic showed
 /// up locally under full-suite parallel load.
-pub(crate) fn drain_to_exit(term: &mut term::TabTerm) {
+pub(crate) fn drain_to_exit(term: &mut pterminal_term::TabTerm) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while term.exited().is_none() && std::time::Instant::now() < deadline {
         term.poll();
@@ -157,7 +157,7 @@ pub(crate) fn drain_to_exit(term: &mut term::TabTerm) {
 /// Sends a graceful `exit` and polls `term` to completion (bounded) so
 /// the test doesn't leave an orphaned `powershell.exe` process behind —
 /// same convention as `term::tests::write_input_reaches_pty`.
-pub(crate) fn exit_and_drain(term: &mut term::TabTerm) {
+pub(crate) fn exit_and_drain(term: &mut pterminal_term::TabTerm) {
     term.write_input("exit\r");
     drain_to_exit(term);
 }

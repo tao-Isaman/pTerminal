@@ -2609,14 +2609,12 @@ name = "pterminal"
 version = "0.1.25"
 dependencies = [
  "ab_glyph",
- "alacritty_terminal",
  "anyhow",
- "arboard",
  "eframe",
  "egui",
  "notify",
- "open",
  "pterminal-core",
+ "pterminal-term",
  "rfd",
  "serde_json",
  "tempfile",
@@ -2633,6 +2631,19 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
+]
+
+[[package]]
+name = "pterminal-term"
+version = "0.0.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "arboard",
+ "egui",
+ "open",
+ "pterminal-core",
  "tempfile",
 ]
 

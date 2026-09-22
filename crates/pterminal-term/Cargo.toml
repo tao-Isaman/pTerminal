@@ -1,0 +1,27 @@
+[package]
+name = "pterminal-term"
+# Placeholder — the app's real version lives only in the root `pterminal`
+# package (see the root Cargo.toml and `pterminal-core`'s manifest).
+version = "0.0.0"
+edition = "2024"
+publish = false
+# `LICENSE` at this crate's root is egui_term's MIT licence; the vendored
+# copy and every pTerminal delta to it are indexed in `src/lib.rs`.
+
+[dependencies]
+# The vendored egui_term is written against egui 0.31 — the workspace pin
+# (root Cargo.toml) is what keeps this and eframe on one egui version.
+egui.workspace = true
+alacritty_terminal.workspace = true
+anyhow.workspace = true
+# Right-click terminal menu's "Paste" reads the OS clipboard directly
+# (keyboard Ctrl+V does not — it uses egui's built-in `Event::Paste`).
+arboard.workspace = true
+# Ctrl+click on a URL/path in the terminal (`backend/links.rs`).
+open.workspace = true
+# Shell-history ghost suggestions in the view (`pterminal_core::history`) —
+# the one edge from this crate into core; see the crate doc.
+pterminal-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

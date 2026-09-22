@@ -8,7 +8,7 @@
 //! translates between pTerminal's `Size` (f32 points) and alacritty's
 //! integer cell grid (`WindowSize`/`Dimensions`).
 
-use crate::egui_term_vendored::types::Size;
+use crate::types::Size;
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};

@@ -1,7 +1,30 @@
+//! `pterminal-term`: the embedded terminal — one ConPTY child per tab and the
+//! egui widget that renders its alacritty grid.
+//!
+//! The crate owns two things: the vendored `egui_term` (everything below
+//! this paragraph and every module except `tab_term`), and [`TabTerm`], the
+//! thin per-tab wrapper the app drives (`spawn`/`poll`/`ui`/`write_input`).
+//! It knows nothing about agents, providers, hooks or workspaces — that is
+//! the root binary's `term.rs` (`Tab`, `spawn_agent`, …), which wraps a
+//! `TabTerm`.
+//!
+//! **Dependency direction.** This crate depends on `egui` (never `eframe`),
+//! `alacritty_terminal`, and on `pterminal-core` for exactly one thing:
+//! `pterminal_core::history` (shell-history ghost suggestions, used by
+//! `TerminalView::with_history` and threaded through `TabTerm::ui`). Core
+//! never depends back on this crate. The root `pterminal` binary depends on
+//! both.
+//!
+//! The `#![allow(dead_code, unused_imports)]` below covers the whole crate:
+//! the vendored source is kept as close to upstream as possible, and not
+//! every item it exports is used by pTerminal.
+//!
+//! ---
+//!
 //! Vendored copy of `egui_term` 0.1.0 — <https://github.com/Harzu/egui_term>
 //!
 //! MIT License, Copyright (c) 2024 Ilia Shvyrialkin. Full text in `LICENSE`
-//! next to this file.
+//! at this crate's root.
 //!
 //! Every pTerminal change to the upstream source is marked with a
 //! `pTerminal delta:` comment so a future rebase onto a new upstream release
@@ -127,9 +150,13 @@
 mod backend;
 mod bindings;
 mod font;
+// pTerminal's own per-tab wrapper (not upstream code) — see the crate doc.
+mod tab_term;
 mod theme;
 mod types;
 mod view;
+
+pub use tab_term::{SCROLLBACK_LINES, TabTerm};
 
 pub use backend::settings::BackendSettings;
 pub use backend::{BackendCommand, PtyEvent, TerminalBackend, TerminalMode};

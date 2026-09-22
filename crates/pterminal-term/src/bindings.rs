@@ -1,4 +1,4 @@
-use crate::egui_term_vendored::TerminalMode;
+use crate::TerminalMode;
 use egui::{Key, Modifiers, PointerButton};
 
 #[derive(Clone, Hash, Debug, PartialEq, Eq)]
@@ -347,8 +347,8 @@ fn mouse_default_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
 #[cfg(test)]
 mod tests {
     use super::{BindingAction, BindingsLayout, InputKind, KeyboardBinding};
-    use crate::egui_term_vendored::bindings::MouseBinding;
-    use crate::egui_term_vendored::TerminalMode;
+    use crate::bindings::MouseBinding;
+    use crate::TerminalMode;
     use egui::{Key, Modifiers, PointerButton};
 
     #[test]

@@ -12,19 +12,21 @@ default-run = "pterminal"
 # stays per-package here. The `version` line above must stay the FIRST
 # `version = "..."` in this file: `.github/workflows/release.yml` greps it to
 # check the release tag, and the in-app update check compares against it.
+#
+# Layout (A6): `crates/pterminal-core` is the egui-free logic,
+# `crates/pterminal-term` the embedded terminal (vendored egui_term +
+# `TabTerm`), and this package the egui/eframe app on top of both.
 [workspace]
-members = ["crates/pterminal-core"]
+members = ["crates/pterminal-core", "crates/pterminal-term"]
 
 # Every third-party version is pinned exactly once, here; the member crates
 # say `.workspace = true`. egui is pinned to 0.31.x because
-# `src/egui_term_vendored` is a patched copy of egui_term 0.1.0 written
+# `crates/pterminal-term` is a patched copy of egui_term 0.1.0 written
 # against egui 0.31, and eframe below is pinned to match — `cargo tree -i
 # egui` must keep showing exactly one egui version.
 [workspace.dependencies]
 alacritty_terminal = "0.25.1"
 anyhow = "1.0.104"
-# Right-click terminal menu's "Paste" reads the OS clipboard directly
-# (keyboard Ctrl+V does not — it uses egui's built-in `Event::Paste`).
 arboard = "3.6.1"
 dirs = "6.0.0"
 egui = "0.31.1"
@@ -35,16 +37,15 @@ serde_json = "1.0.151"
 sysinfo = "0.38.4"
 tempfile = "3.27.0"
 pterminal-core = { path = "crates/pterminal-core" }
+pterminal-term = { path = "crates/pterminal-term" }
 
 [dependencies]
 pterminal-core.workspace = true
-alacritty_terminal.workspace = true
+pterminal-term.workspace = true
 anyhow.workspace = true
-arboard.workspace = true
 eframe = "0.31.1"
 egui.workspace = true
 notify.workspace = true
-open.workspace = true
 rfd = "0.17.2"
 serde_json.workspace = true
 

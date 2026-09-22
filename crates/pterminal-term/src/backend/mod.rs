@@ -41,7 +41,7 @@ pub use pty::EventProxy;
 pub use selection::SelectionType;
 pub use size::{grid_spec, TerminalSize};
 
-use crate::egui_term_vendored::types::Size;
+use crate::types::Size;
 use alacritty_terminal::event::Event;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::Point;

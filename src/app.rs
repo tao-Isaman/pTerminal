@@ -2,10 +2,10 @@
 //! the per-frame event pump that keeps every tab's terminal draining and its
 //! resource numbers current.
 //!
-//! **Perf-critical invariant.** [`term::TabTerm::poll`] must run once per
+//! **Perf-critical invariant.** `TabTerm::poll` must run once per
 //! frame for *every* tab of *every* workspace, not just the active one — a
 //! background terminal's PTY channel is unbounded and only `poll` drains it.
-//! [`term::TabTerm::set_visible`] must likewise be kept in sync every frame
+//! `TabTerm::set_visible` must likewise be kept in sync every frame
 //! (true only for the active tab of the active workspace) so background tabs
 //! only request lazy repaints. Both happen together in [`PtApp::drain_events`]
 //! (the per-frame pump, now in `events.rs`).

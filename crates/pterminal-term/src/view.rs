@@ -12,14 +12,14 @@ use egui::Widget;
 use egui::{Align2, Painter, Pos2, Rect, Response, Stroke, Vec2};
 use egui::{Id, PointerButton};
 
-use crate::egui_term_vendored::backend::BackendCommand;
-use crate::egui_term_vendored::backend::RenderableContent;
-use crate::egui_term_vendored::backend::TerminalBackend;
-use crate::egui_term_vendored::backend::{LinkAction, MouseButton, SelectionType};
-use crate::egui_term_vendored::bindings::{BindingAction, BindingsLayout, InputKind};
-use crate::egui_term_vendored::font::TerminalFont;
-use crate::egui_term_vendored::theme::TerminalTheme;
-use crate::egui_term_vendored::types::Size;
+use crate::backend::BackendCommand;
+use crate::backend::RenderableContent;
+use crate::backend::TerminalBackend;
+use crate::backend::{LinkAction, MouseButton, SelectionType};
+use crate::bindings::{BindingAction, BindingsLayout, InputKind};
+use crate::font::TerminalFont;
+use crate::theme::TerminalTheme;
+use crate::types::Size;
 
 const EGUI_TERM_WIDGET_ID_PREFIX: &str = "egui_term::instance::";
 
@@ -916,7 +916,7 @@ pub struct TerminalView<'a> {
     bindings_layout: &'static BindingsLayout,
     /// pTerminal delta (ghost suggestions): present only for shell tabs
     /// (`TabTerm::ui` decides); `None` = the feature doesn't exist here.
-    history: Option<&'a mut crate::history::History>,
+    history: Option<&'a mut pterminal_core::history::History>,
     /// pTerminal delta (Shift+Enter newline): what Shift+Enter writes to the
     /// PTY instead of `\r` — the tab-appropriate line-continuation sequence
     /// (`TabTerm::ui` decides: `\`+CR for Claude tabs, backtick+CR for
@@ -985,7 +985,7 @@ impl<'a> TerminalView<'a> {
     #[inline]
     pub fn with_history(
         mut self,
-        history: &'a mut crate::history::History,
+        history: &'a mut pterminal_core::history::History,
     ) -> Self {
         self.history = Some(history);
         self
@@ -1005,7 +1005,7 @@ impl<'a> TerminalView<'a> {
         if has_right {
             return None;
         }
-        let prefix = crate::history::typed_prefix(&left)?;
+        let prefix = pterminal_core::history::typed_prefix(&left)?;
         if prefix != state.ghost_last_prefix {
             state.ghost_last_prefix = prefix.to_string();
             state.ghost_suppressed = false;
@@ -1014,7 +1014,7 @@ impl<'a> TerminalView<'a> {
             return None;
         }
         let suggestion = history.suggest(prefix)?;
-        let suffix = crate::history::ghost_suffix(suggestion, prefix);
+        let suffix = pterminal_core::history::ghost_suffix(suggestion, prefix);
         if suffix.is_empty() {
             None
         } else {
@@ -1069,7 +1069,7 @@ impl<'a> TerminalView<'a> {
             // the size holds still — see `debounce_resize`/`RESIZE_DEBOUNCE`.
             let (pending, apply) = debounce_resize(
                 state.pending_resize,
-                crate::egui_term_vendored::backend::grid_spec(layout_size, font_size),
+                crate::backend::grid_spec(layout_size, font_size),
                 std::time::Instant::now(),
                 !state.resized_once,
             );
@@ -1256,7 +1256,7 @@ impl<'a> TerminalView<'a> {
                         // be missed; accepted (rare at human typing speed).
                         Key::Enter if modifiers.is_none() => {
                             let (left, _) = self.backend.cursor_line_context();
-                            if let Some(line) = crate::history::typed_prefix(&left) {
+                            if let Some(line) = pterminal_core::history::typed_prefix(&left) {
                                 let line = line.to_string();
                                 if let Some(h) = self.history.as_deref_mut() {
                                     h.commit(&line);
@@ -2170,7 +2170,7 @@ fn dropped_paths_payload(paths: &[std::path::PathBuf]) -> String {
 #[cfg(test)]
 mod shift_enter_event_path_tests {
     use super::*;
-    use crate::egui_term_vendored::backend::settings::BackendSettings;
+    use crate::backend::settings::BackendSettings;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -2183,7 +2183,7 @@ mod shift_enter_event_path_tests {
     /// line must NOT execute (no plain `\r` may slip through).
     fn drive_frame(
         ctx: &egui::Context,
-        backend: &mut crate::egui_term_vendored::backend::TerminalBackend,
+        backend: &mut crate::backend::TerminalBackend,
         events: Vec<egui::Event>,
     ) {
         let input = egui::RawInput {
@@ -2205,7 +2205,7 @@ mod shift_enter_event_path_tests {
     }
 
     fn wait_for_echo(
-        backend: &mut crate::egui_term_vendored::backend::TerminalBackend,
+        backend: &mut crate::backend::TerminalBackend,
         needle: &str,
         secs: u64,
     ) -> bool {
@@ -2228,7 +2228,7 @@ mod shift_enter_event_path_tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let dir = std::env::temp_dir().join("pt-shift-enter-repro");
         let _ = std::fs::create_dir_all(&dir);
-        let mut backend = crate::egui_term_vendored::backend::TerminalBackend::new(
+        let mut backend = crate::backend::TerminalBackend::new(
             955,
             ctx.clone(),
             tx,
@@ -2284,8 +2284,8 @@ mod shift_enter_event_path_tests {
 
 #[cfg(test)]
 mod thai_composer_probe {
-    use crate::egui_term_vendored::backend::{BackendCommand, TerminalBackend};
-    use crate::egui_term_vendored::backend::settings::BackendSettings;
+    use crate::backend::{BackendCommand, TerminalBackend};
+    use crate::backend::settings::BackendSettings;
     use std::time::Duration;
 
     /// EXPLORATORY PROBE, `#[ignore]`d — launches a real interactive
@@ -2550,7 +2550,7 @@ mod run_coalescing_tests {
         // the column/line fields are the backend's private business and the
         // grid's real geometry comes from `Dim` above.
         let mut terminal_size =
-            crate::egui_term_vendored::backend::TerminalSize::default();
+            crate::backend::TerminalSize::default();
         terminal_size.cell_width = CELL_W;
         terminal_size.cell_height = CELL_H;
 
@@ -3395,7 +3395,7 @@ mod thai_mark_stack_tests {
 #[cfg(test)]
 mod resize_debounce_tests {
     use super::{debounce_resize, GridSpec, RESIZE_DEBOUNCE, Size};
-    use crate::egui_term_vendored::backend::grid_spec;
+    use crate::backend::grid_spec;
     use std::time::{Duration, Instant};
 
     const A: GridSpec = (95, 35, 8, 17);

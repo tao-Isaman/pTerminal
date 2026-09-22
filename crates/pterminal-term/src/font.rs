@@ -1,6 +1,6 @@
 use egui::{Context, FontId};
 
-use crate::egui_term_vendored::types::Size;
+use crate::types::Size;
 
 #[derive(Debug, Clone)]
 pub struct FontSettings {

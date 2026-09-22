@@ -3,7 +3,6 @@ mod app;
 mod editor;
 mod delivery;
 mod dialogs;
-mod egui_term_vendored;
 mod events;
 mod handoff;
 mod orchestrator;
