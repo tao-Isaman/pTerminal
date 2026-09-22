@@ -75,8 +75,8 @@ pub struct PendingClaim {
 /// `egui::Window` is not modal either, so the sidebar's workspace rows stay
 /// clickable while it is open. Reading `self.active_ws` at Open-click time
 /// meant a mid-dialog workspace switch redirected the whole spawn — worktree
-/// creation, `.claude/settings.local.json` hook routing, `shared.md`, and the
-/// auto-added `.gitignore` entry — into a repo the user never chose. The
+/// creation, `shared.md`, the per-agent README and the auto-added
+/// `.gitignore` entry — into a repo the user never chose. The
 /// dialog body and `open_tab` both resolve the workspace by this index and
 /// drop the draft if it no longer resolves, rather than guessing.
 pub struct NewTabDraft {
@@ -187,28 +187,6 @@ pub(crate) fn agent_readme_for_spawn(is_orchestrator: bool, is_git: bool, repo_r
         shared_ctx::write_agent_readme(repo_root).ok()
     } else {
         None
-    }
-}
-
-/// Direct-mode hook takeover (CARRIED FINDING, documented on
-/// `term::spawn_agent`): a direct (isolate=false) agent spawn overwrites
-/// `.claude/settings.local.json` at `repo` unconditionally, so it silently
-/// steals hook routing from any other live direct-mode agent tab already
-/// running there. Degrade that older tab's status now, at the moment of
-/// takeover, rather than leaving it stuck showing a status that will never
-/// update again.
-pub(crate) fn degrade_direct_mode_peers(ws: &mut WsRt, repo: &Path) {
-    for other in ws.tabs.iter_mut() {
-        // Only a provider that routes status through the per-checkout hook
-        // file can have had its routing stolen (A3: `uses_direct_mode_hooks`
-        // — Codex's notify command is argv, nothing on disk to overwrite).
-        if other.provider.uses_direct_mode_hooks() && other.kind == TabKind::Agent
-            && other.worktree.is_none()
-            && other.cwd == repo
-            && other.status != AgentStatus::Exited
-        {
-            other.status = AgentStatus::Unknown;
-        }
     }
 }
 
@@ -648,8 +626,8 @@ impl PtApp {
         // this launch (the CLI's own fallback-to-GUI-launch path, and any
         // command file left over from a launch that crashed before it got a
         // chance to drain). Deliberately AFTER `resume_saved_tabs` (so a
-        // transferred tab doesn't collide with `next_tab_id`/hook-takeover
-        // bookkeeping still mid-setup) and BEFORE the startup
+        // transferred tab doesn't collide with `next_tab_id` bookkeeping
+        // still mid-setup) and BEFORE the startup
         // `deliver_messages` pass below, so a same-launch transferred tab is
         // already a real, addressable agent tab by the time queued messages
         // get delivered.
@@ -685,14 +663,10 @@ impl PtApp {
     /// dropped on the floor, so a transient failure can no longer erase the
     /// saved session id / worktree reference on the next `persist()`.
     ///
-    /// Direct-mode hook takeover (documented on `spawn_agent`) applies here
-    /// too: if two saved direct-mode (no-worktree) agent tabs in the same
-    /// workspace share a `cwd`, the second one resumed silently takes over
-    /// the first's hook routing exactly as a live second `open_tab` spawn
-    /// would — degrade the earlier one's status to `Unknown` the moment
-    /// that happens, same rule `dialogs::open_tab` already enforces, so it
-    /// doesn't sit there forever showing a status that can never update
-    /// again.
+    /// Two saved direct-mode (no-worktree) agent tabs sharing a `cwd` resume
+    /// independently: each launch names its own per-tab hook file (A4,
+    /// `AgentProvider::launch`), so neither can take over the other's status
+    /// routing and nothing needs degrading here.
     ///
     /// **PID-claim limitation (documented, not fixed here).** A single
     /// `PendingClaim` slot can only track one in-flight spawn, and resume
@@ -789,15 +763,7 @@ impl PtApp {
                         // path symmetric with it, so both start from the saved
                         // value rather than one starting from `None`.
                         tab.session_id = saved.session_id.clone();
-                        let ws = &mut self.workspaces[ws_idx];
-                        // Direct-mode hook takeover (see this fn's docs):
-                        // this resumed tab just overwrote hook routing for
-                        // any other live direct-mode agent tab already
-                        // sitting at the same cwd.
-                        if tab.provider.uses_direct_mode_hooks() && tab.kind == TabKind::Agent && tab.worktree.is_none() {
-                            degrade_direct_mode_peers(ws, &tab.cwd);
-                        }
-                        ws.tabs.push(tab);
+                        self.workspaces[ws_idx].tabs.push(tab);
                     }
                     Err(e) => {
                         // FINAL-REVIEW FINDING 3 fix. This arm used to set
@@ -2295,22 +2261,20 @@ impl PtApp {
     ///
     /// **Final-review finding 4: never `Tab::respawn` a dead placeholder.**
     /// A placeholder (`missing_dir.is_some()`, `term::spawn_dead_tab`) never
-    /// went through `spawn_agent`, so no `.claude/settings.local.json` was
-    /// ever written for its tab id — and its `cwd` is the workspace's MAIN
-    /// checkout, not the saved directory. `respawn` on one would launch a
-    /// real `cmd /c claude` there under whatever hook settings already exist
-    /// in that checkout: status capture is dead at best, and if another live
-    /// direct-mode tab owns those settings, the restarted session's hooks
-    /// append to THAT tab's events file — where `drain_events` reads them
-    /// back and overwrites the other tab's `session_id`, corrupting what a
-    /// later `--resume` would reattach to.
+    /// went through `spawn_agent`: its `cwd` is the workspace's MAIN
+    /// checkout, not the saved directory, and it carries no `agent_ctx`.
+    /// `respawn` on one would launch a real `cmd /c claude` in the wrong
+    /// directory with no shared-context inject. (Before A4 it was worse —
+    /// hook routing was per checkout, so the restarted session could report
+    /// into ANOTHER live tab's events file and corrupt that tab's
+    /// `session_id`; per-tab routing closed that hole, the rest stands.)
     ///
     /// **Chosen fix (both halves).** Primary: the exit banner simply does not
     /// render a Restart button for a placeholder tab, leaving the missing-dir
     /// banner's own `[Respawn in main checkout]` / `[Close]` as the only
     /// actions — that button already does the right thing (a genuine
-    /// `spawn_agent`, hook settings and all, via `respawn_missing_dir_tab`),
-    /// so a second, subtly-broken restart path was never anything but a trap.
+    /// `spawn_agent` via `respawn_missing_dir_tab`), so a second,
+    /// subtly-broken restart path was never anything but a trap.
     /// Secondary (this guard): should any future caller reach this function
     /// with a placeholder active anyway, route it to that same correct path
     /// rather than let it fall through to `respawn`. Cheap, and it keeps the
@@ -3357,17 +3321,30 @@ mod tests {
     /// reference included).
     ///
     /// The failure is forced deterministically and without launching real
-    /// `claude`: `spawn_agent` calls `hooks::write_settings` FIRST, which
-    /// starts with `create_dir_all(work_dir.join(".claude"))` — so a plain
-    /// FILE named `.claude` in the workspace root makes that call, and with it
-    /// the whole spawn, fail before `TabTerm::spawn` is ever reached.
+    /// `claude`: a Claude `AgentProvider::launch` FIRST reads the checkout's
+    /// `.claude/settings.local.json` to strip pre-A4 hook entries
+    /// (`hooks::forget_checkout_hooks`), and an I/O error there other than
+    /// "missing" fails the launch — so holding that file open with no share
+    /// mode (a sharing violation for every other opener, the "locked
+    /// settings file" case named above) makes the spawn fail before
+    /// `TabTerm::spawn` is ever reached. (Before A4 the same test used a
+    /// plain FILE named `.claude`, which made the old writer's
+    /// `create_dir_all` fail; the new code treats that as "nothing to
+    /// strip" and would spawn fine.)
     #[test]
     fn a_failed_resume_spawn_keeps_the_saved_tab_as_a_placeholder() {
+        use std::os::windows::fs::OpenOptionsExt;
         let ctx = eframe::egui::Context::default();
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().to_path_buf();
-        // A file, not a directory: `write_settings`' create_dir_all fails.
-        std::fs::write(repo.join(".claude"), "not a directory").expect("write .claude file");
+        std::fs::create_dir_all(repo.join(".claude")).expect("mkdir .claude");
+        let _lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(0)
+            .open(repo.join(".claude").join("settings.local.json"))
+            .expect("open settings.local.json exclusively");
 
         let wt = state::WorktreeInfo { path: PathBuf::from("D:\\wt\\gone"), branch: "pt/gone".into() };
         let saved = state::SavedTab {

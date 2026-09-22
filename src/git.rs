@@ -78,9 +78,12 @@ pub fn is_git_repo(dir: &Path) -> bool {
             .map(|s| s.trim() == "true").unwrap_or(false)
 }
 
-/// The one file pTerminal writes into a worktree itself (see
-/// `term::spawn_agent`): the per-worktree hook routing Claude Code reads.
-/// It is pTerminal's own bookkeeping, never the user's work.
+/// The one file that can appear in a worktree without the user having done
+/// anything: before A4 pTerminal itself wrote it (the per-worktree hook
+/// routing Claude Code reads — worktrees created by an older build still
+/// carry it, and `hooks::forget_checkout_hooks` leaves the emptied file in
+/// place), and Claude Code writes it for permission grants made inside the
+/// session. Either way it is bookkeeping, never the user's work.
 const OUR_SETTINGS: &str = ".claude/settings.local.json";
 
 /// Extracts the path a `git status --porcelain` (v1) line refers to:
@@ -98,14 +101,17 @@ fn porcelain_path(line: &str) -> Option<&str> {
 
 /// Whether `dir` has anything the user would call uncommitted work.
 ///
-/// **pTerminal's own `.claude/settings.local.json` does not count.**
-/// `term::spawn_agent` writes that file into every isolated worktree to route
-/// Claude Code's hooks back to us; Claude Code normally adds it to
-/// `.git/info/exclude` itself, but that hasn't necessarily happened by the
-/// time we look (and never happens for a worktree Claude never opened). Left
-/// unfiltered, our own file made every fresh worktree permanently "dirty":
-/// merges refused with "worktree has uncommitted changes", and Discard always
-/// demanded the double-confirm meant for real unsaved work.
+/// **`.claude/settings.local.json` does not count.** Before A4
+/// `term::spawn_agent` wrote that file into every isolated worktree to route
+/// Claude Code's hooks back to us (hooks now travel in a per-tab file under
+/// `%TEMP%`, but worktrees from older builds still have the old file, and
+/// Claude Code itself writes the same file for in-session permission
+/// grants); Claude Code normally adds it to `.git/info/exclude` itself, but
+/// that hasn't necessarily happened by the time we look (and never happens
+/// for a worktree Claude never opened). Left unfiltered, that file made
+/// every fresh worktree permanently "dirty": merges refused with "worktree
+/// has uncommitted changes", and Discard always demanded the double-confirm
+/// meant for real unsaved work.
 ///
 /// `--untracked-files=all` is deliberate: with git's default the untracked
 /// `.claude/` directory collapses into a single `?? .claude/` line, which

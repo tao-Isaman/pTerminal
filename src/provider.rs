@@ -38,12 +38,13 @@ pub enum AgentProvider {
 /// The two coordination paths every agent tab carries so its provider can
 /// rebuild the launch command line later (`Tab::respawn`) without the app
 /// re-deriving them from the workspace. Provider-neutral on purpose: Claude
-/// receives these through `.claude/settings.local.json` (`HookSetup`) rather
-/// than argv, but the tab keeps them regardless of provider so the field
-/// never has to change shape when a tab's provider does. `Default` (both
-/// `None`) for shells and dead placeholders. Not persisted — `state::SavedTab`
-/// never carried them, and a resumed tab recomputes them at spawn time
-/// exactly like a fresh one (`dialogs::open_tab` / `PtApp::resume_saved_tabs`).
+/// receives these through its per-tab settings file (`HookSetup`, named in
+/// argv as `--settings`) rather than as bare arguments, but the tab keeps
+/// them regardless of provider so the field never has to change shape when
+/// a tab's provider does. `Default` (both `None`) for shells and dead
+/// placeholders. Not persisted — `state::SavedTab` never carried them, and
+/// a resumed tab recomputes them at spawn time exactly like a fresh one
+/// (`dialogs::open_tab` / `PtApp::resume_saved_tabs`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentContext {
     /// The main checkout's `.pterminal/shared.md` (`shared_ctx::ensure_shared_md`),
@@ -70,9 +71,14 @@ pub struct LaunchSpec<'a> {
     pub resume_session: Option<&'a str>,
     pub context: &'a AgentContext,
     /// `hooks::pterm_hook_exe()` — `None` means the helper isn't beside the
-    /// running executable. Only Codex reads it (its `notify` command);
-    /// Claude's hook commands are chosen inside `hooks::write_settings`.
+    /// running executable. Both providers name it in their status-capture
+    /// command: Codex in its `notify` argv, Claude in every hook command of
+    /// its per-tab settings file (`hooks::HookSetup::hook_helper`).
     pub hook_helper: Option<&'a Path>,
+    /// The directory the child will run in. Not part of any argv — it is
+    /// where [`AgentProvider::launch`] looks for the pre-A4 per-checkout hook
+    /// entries to strip (`hooks::forget_checkout_hooks`).
+    pub cwd: &'a Path,
 }
 
 /// A resolved launch: what `TabTerm::spawn` runs.
@@ -106,58 +112,75 @@ impl AgentProvider {
         }
     }
 
-    /// Provider-side status-capture setup, run by `term::spawn_agent`
-    /// BEFORE the child is spawned. Claude reports status through hooks, so
-    /// it needs `.claude/settings.local.json` at `cwd` rewritten to point at
-    /// this tab's events file (`hooks::write_settings`). Codex is told its
-    /// `notify` command on the command line ([`Self::launch`]) and touches
-    /// nothing on disk. The events-file truncation that both share stays in
-    /// `spawn_agent` — it is about the tab id, not the provider.
+    /// The launch for a fresh spawn, a resume, or a restart: writes whatever
+    /// per-tab file the provider's status capture needs, then returns the
+    /// program and argv `TabTerm::spawn` runs. **A launch plan has the same
+    /// shape for every provider (A4):** anything the child must be told is
+    /// in argv, and anything argv points at is a per-tab file under
+    /// `hooks::events_dir()` written here, first. Codex has always worked
+    /// this way — its `notify` command rides in `-c notify=[...]` and names
+    /// the tab's events file. Claude now does too: its hooks live in
+    /// `hooks::tab_settings_file(tab_id)` (`hooks::write_tab_settings`),
+    /// which [`Self::launch_args`] hands to Claude Code as
+    /// `--settings <path>`. Nothing is written into the checkout any more;
+    /// the old per-checkout `.claude/settings.local.json` routing is gone
+    /// (its two failure modes are on `write_tab_settings`' doc comment),
+    /// and the entries an older pTerminal left in `cwd`'s file are stripped
+    /// on the way past (`hooks::forget_checkout_hooks`).
     ///
-    /// Not called by `Tab::respawn`: a restart keeps the same tab id, events
-    /// file and shared.md, so the settings written at first spawn are still
-    /// correct (see `respawn`'s doc comment).
-    pub fn prepare_status_capture(self, cwd: &Path, setup: &HookSetup) -> anyhow::Result<()> {
-        match self {
-            Self::Claude => hooks::write_settings(cwd, setup),
-            Self::Codex => Ok(()),
-        }
-    }
-
-    /// The program and argv for a fresh spawn or a resume. Fallible only
-    /// for Codex, whose executable has to be found on PATH; Claude's
-    /// `cmd.exe` is always there. Argv construction itself is the pure
-    /// [`Self::launch_args`], so tests can pin it without a Codex install.
+    /// Split as "side effects here, argv in the pure [`Self::launch_args`]"
+    /// rather than one method returning extra args from the write, so the
+    /// argv tests can pin the exact command line without touching disk and
+    /// `spawn_agent` has one call to make instead of a prepare-then-launch
+    /// pair it could get out of order. Fallible for Codex because its
+    /// executable has to be found on PATH; for Claude because of the two
+    /// file operations (`cmd.exe` itself is always there).
     pub fn launch(self, spec: &LaunchSpec) -> anyhow::Result<Launch> {
         let program = match self {
-            Self::Claude => "cmd.exe".to_string(),
+            Self::Claude => {
+                hooks::forget_checkout_hooks(spec.cwd)?;
+                hooks::write_tab_settings(&HookSetup {
+                    tab_id: spec.tab_id,
+                    shared_md: spec.context.shared_md.as_deref(),
+                    agent_readme: spec.context.agent_readme.as_deref(),
+                    agent_name: spec.title,
+                    hook_helper: spec.hook_helper,
+                })?;
+                "cmd.exe".to_string()
+            }
             Self::Codex => codex_executable()?.to_string_lossy().into_owned(),
         };
         Ok(Launch { program, args: self.launch_args(spec) })
     }
 
     /// The "Restart" launch (`Tab::respawn`): the same provider, tab id,
-    /// title and coordination paths, but **no prompt and no `--resume`** —
-    /// a restart is "bring the session back", not a re-run of whatever the
+    /// title, coordination paths and cwd, but **no prompt and no `--resume`**
+    /// — a restart is "bring the session back", not a re-run of whatever the
     /// tab originally opened with, and `respawn` documents why it
     /// deliberately doesn't resume the known `session_id` either. Expressed
     /// as an empty-prompt, no-resume [`Self::launch`] because that is exactly
     /// what both inline branches built before A3: `cmd /c claude` for Claude
-    /// and `codex_args(.., "", None, ..)` for Codex.
+    /// and `codex_args(.., "", None, ..)` for Codex. Going through `launch`
+    /// also rewrites Claude's per-tab settings file — same content as at
+    /// first spawn (same id, title and paths), so that is a no-op in effect,
+    /// and it means a restart never depends on a `%TEMP%` file surviving.
     pub fn relaunch(
         self,
         tab_id: u64,
         title: &str,
         context: &AgentContext,
         hook_helper: Option<&Path>,
+        cwd: &Path,
     ) -> anyhow::Result<Launch> {
-        self.launch(&LaunchSpec { tab_id, title, prompt: "", resume_session: None, context, hook_helper })
+        self.launch(&LaunchSpec { tab_id, title, prompt: "", resume_session: None, context, hook_helper, cwd })
     }
 
-    /// Pure argv half of [`Self::launch`].
+    /// Pure argv half of [`Self::launch`]: no disk access, only path
+    /// arithmetic (`hooks::tab_settings_file`, `hooks::events_file` are
+    /// functions of the tab id).
     pub fn launch_args(self, spec: &LaunchSpec) -> Vec<String> {
         match self {
-            Self::Claude => claude_args(spec.prompt, spec.resume_session),
+            Self::Claude => claude_args(&hooks::tab_settings_file(spec.tab_id), spec.prompt, spec.resume_session),
             Self::Codex => codex_args(
                 spec.tab_id,
                 spec.title,
@@ -167,22 +190,6 @@ impl AgentProvider {
                 spec.resume_session,
                 spec.hook_helper,
             ),
-        }
-    }
-
-    /// True when a direct-mode (non-worktree) tab of this provider reports
-    /// status through a per-checkout hook settings file and therefore
-    /// **steals hook routing** from any other such tab in the same cwd
-    /// (`app::degrade_direct_mode_peers`, the tab strip's shared-dir
-    /// warning). Claude: `.claude/settings.local.json` is one file per
-    /// checkout, last writer wins. Codex: its notify command travels in
-    /// argv, so two Codex tabs in one directory never interfere — and a
-    /// Codex spawn never overwrites a Claude tab's settings either, which is
-    /// why the takeover callers gate on the SPAWNING tab's provider.
-    pub fn uses_direct_mode_hooks(self) -> bool {
-        match self {
-            Self::Claude => true,
-            Self::Codex => false,
         }
     }
 
@@ -249,11 +256,19 @@ impl AgentProvider {
 }
 
 /// Claude's argv, run through `cmd.exe` (it is an npm shim on Windows and
-/// cannot be exec'd directly). Moved from `term::agent_args` in A3,
-/// unchanged: `--resume <sid>` when resuming, else the prompt as one
-/// argument with `"` stripped (cmd's quoting would otherwise split it).
-pub fn claude_args(prompt: &str, resume: Option<&str>) -> Vec<String> {
-    let mut args: Vec<String> = vec!["/c".into(), "claude".into()];
+/// cannot be exec'd directly). Moved from `term::agent_args` in A3;
+/// A4 added `--settings <settings>` (the tab's hook file, see
+/// `hooks::write_tab_settings`) right after the program name, ahead of the
+/// positional prompt. The rest is unchanged: `--resume <sid>` when
+/// resuming, else the prompt as one argument with `"` stripped (cmd's
+/// quoting would otherwise split it).
+pub fn claude_args(settings: &Path, prompt: &str, resume: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "/c".into(),
+        "claude".into(),
+        "--settings".into(),
+        settings.to_string_lossy().into_owned(),
+    ];
     match resume {
         Some(sid) => {
             args.push("--resume".into());
@@ -418,23 +433,29 @@ mod tests {
     }
 
     // --- Task 3 (relocated from term.rs in A3): the Claude argv -----------
+    //
+    // A4: every Claude argv gained `--settings <per-tab file>` right after
+    // `claude`. `SETTINGS` stands in for that path so the rest of each
+    // expectation still reads as the literal capture it was.
+
+    const SETTINGS: &str = "C:\\t\\pterminal\\tab-7.settings.json";
 
     #[test]
     fn claude_args_prompt_path_strips_quotes_unchanged() {
-        let args = claude_args("say \"hi\" now", None);
-        assert_eq!(args, vec!["/c", "claude", "say hi now"]);
+        let args = claude_args(Path::new(SETTINGS), "say \"hi\" now", None);
+        assert_eq!(args, vec!["/c", "claude", "--settings", SETTINGS, "say hi now"]);
     }
 
     #[test]
     fn claude_args_empty_prompt_omits_trailing_arg() {
-        let args = claude_args("", None);
-        assert_eq!(args, vec!["/c", "claude"]);
+        let args = claude_args(Path::new(SETTINGS), "", None);
+        assert_eq!(args, vec!["/c", "claude", "--settings", SETTINGS]);
     }
 
     #[test]
     fn claude_args_resume_ignores_prompt() {
-        let args = claude_args("ignored prompt entirely", Some("sess-123"));
-        assert_eq!(args, vec!["/c", "claude", "--resume", "sess-123"]);
+        let args = claude_args(Path::new(SETTINGS), "ignored prompt entirely", Some("sess-123"));
+        assert_eq!(args, vec!["/c", "claude", "--settings", SETTINGS, "--resume", "sess-123"]);
     }
 
     // --- A3: the abstraction ------------------------------------------------
@@ -444,6 +465,10 @@ mod tests {
     // same inputs, printed from the old code before it was moved. They pin
     // the refactor as byte-for-byte behaviour-preserving; if one of these
     // ever needs to change, that is a launch-behaviour change, not a tidy-up.
+    //
+    // A4 was such a change, made deliberately: the Claude expectations gained
+    // `--settings <hooks::tab_settings_file(7)>` and nothing else. Codex's
+    // are untouched.
 
     fn ctx() -> AgentContext {
         AgentContext {
@@ -453,6 +478,21 @@ mod tests {
     }
 
     const HELPER: &str = "C:\\Program Files\\pTerminal\\pterm_hook.exe";
+
+    /// A `LaunchSpec` for tab 7 with every field the argv tests vary
+    /// defaulted; `cwd` is a fresh temp dir so a Claude `launch` (which
+    /// strips old hook entries there) never looks at a real checkout.
+    fn spec7<'a>(context: &'a AgentContext, prompt: &'a str, resume: Option<&'a str>, cwd: &'a Path) -> LaunchSpec<'a> {
+        LaunchSpec {
+            tab_id: 7,
+            title: "fix \"login\"",
+            prompt,
+            resume_session: resume,
+            context,
+            hook_helper: Some(Path::new(HELPER)),
+            cwd,
+        }
+    }
 
     /// The Codex `notify` override, exactly as the old code serialised it:
     /// a JSON array with backslashes doubled. The events-file half depends
@@ -464,64 +504,69 @@ mod tests {
         format!("notify=[\"C:\\\\Program Files\\\\pTerminal\\\\pterm_hook.exe\",\"CodexNotify\",\"{events}\"]")
     }
 
+    /// The `--settings` value for tab 7: the machine's temp dir plus the
+    /// fixed `pterminal\tab-7.settings.json` tail, checked here so the argv
+    /// tests below can use `hooks::tab_settings_file` without re-deriving
+    /// the value under test with the code under test.
+    fn expected_settings(id: u64) -> String {
+        let path = hooks::tab_settings_file(id).to_string_lossy().into_owned();
+        let tail = format!("\\pterminal\\tab-{id}.settings.json");
+        assert!(path.ends_with(&tail), "{path}");
+        assert!(path.starts_with(&std::env::temp_dir().to_string_lossy().into_owned()), "{path}");
+        path
+    }
+
     const CODEX_DEV_INSTRUCTIONS: &str = "developer_instructions=\"You are the pTerminal agent named fix \\\"login\\\".\\nRead D:\\\\repo\\\\.pterminal\\\\shared.md for shared context and coordination instructions.\\nRead D:\\\\repo\\\\.pterminal\\\\README-agents.md for shared context and coordination instructions.\\n\"";
 
     #[test]
     fn claude_launch_fresh_with_prompt_matches_old_spawn_agent() {
+        let dir = tempfile::tempdir().unwrap();
         let context = ctx();
-        let spec = LaunchSpec {
-            tab_id: 7,
-            title: "fix \"login\"",
-            prompt: "do the thing \"quoted\"",
-            resume_session: None,
-            context: &context,
-            hook_helper: Some(Path::new(HELPER)),
-        };
-        let launch = AgentProvider::Claude.launch(&spec).unwrap();
+        let launch = AgentProvider::Claude
+            .launch(&spec7(&context, "do the thing \"quoted\"", None, dir.path()))
+            .unwrap();
         assert_eq!(launch.program, "cmd.exe");
-        assert_eq!(launch.args, vec!["/c", "claude", "do the thing quoted"]);
+        assert_eq!(
+            launch.args,
+            vec!["/c".to_string(), "claude".into(), "--settings".into(), expected_settings(7), "do the thing quoted".into()]
+        );
     }
 
     #[test]
     fn claude_launch_resume_matches_old_spawn_agent() {
+        let dir = tempfile::tempdir().unwrap();
         let context = ctx();
-        let spec = LaunchSpec {
-            tab_id: 7,
-            title: "fix \"login\"",
-            prompt: "ignored",
-            resume_session: Some("sess-abc"),
-            context: &context,
-            hook_helper: Some(Path::new(HELPER)),
-        };
-        let launch = AgentProvider::Claude.launch(&spec).unwrap();
-        assert_eq!(launch.program, "cmd.exe");
-        assert_eq!(launch.args, vec!["/c", "claude", "--resume", "sess-abc"]);
-    }
-
-    /// Respawn is the bare `cmd /c claude` the old `Tab::respawn` hard-coded:
-    /// no prompt, no `--resume`, whatever the tab knows.
-    #[test]
-    fn claude_relaunch_matches_old_respawn() {
         let launch = AgentProvider::Claude
-            .relaunch(7, "fix \"login\"", &ctx(), Some(Path::new(HELPER)))
+            .launch(&spec7(&context, "ignored", Some("sess-abc"), dir.path()))
             .unwrap();
         assert_eq!(launch.program, "cmd.exe");
-        assert_eq!(launch.args, vec!["/c", "claude"]);
+        assert_eq!(
+            launch.args,
+            vec!["/c".to_string(), "claude".into(), "--settings".into(), expected_settings(7), "--resume".into(), "sess-abc".into()]
+        );
+    }
+
+    /// Respawn is the bare `cmd /c claude` the old `Tab::respawn` hard-coded
+    /// (plus A4's `--settings`): no prompt, no `--resume`, whatever the tab
+    /// knows.
+    #[test]
+    fn claude_relaunch_matches_old_respawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch = AgentProvider::Claude
+            .relaunch(7, "fix \"login\"", &ctx(), Some(Path::new(HELPER)), dir.path())
+            .unwrap();
+        assert_eq!(launch.program, "cmd.exe");
+        assert_eq!(
+            launch.args,
+            vec!["/c".to_string(), "claude".into(), "--settings".into(), expected_settings(7)]
+        );
     }
 
     #[test]
     fn codex_launch_fresh_with_prompt_matches_old_spawn_agent() {
         let context = ctx();
-        let spec = LaunchSpec {
-            tab_id: 7,
-            title: "fix \"login\"",
-            prompt: "do the thing \"quoted\"",
-            resume_session: None,
-            context: &context,
-            hook_helper: Some(Path::new(HELPER)),
-        };
         assert_eq!(
-            AgentProvider::Codex.launch_args(&spec),
+            AgentProvider::Codex.launch_args(&spec7(&context, "do the thing \"quoted\"", None, Path::new("D:\\repo"))),
             vec![
                 "--no-alt-screen".to_string(),
                 "--add-dir".into(),
@@ -539,16 +584,8 @@ mod tests {
     #[test]
     fn codex_launch_resume_matches_old_spawn_agent() {
         let context = ctx();
-        let spec = LaunchSpec {
-            tab_id: 7,
-            title: "fix \"login\"",
-            prompt: "ignored",
-            resume_session: Some("sess-abc"),
-            context: &context,
-            hook_helper: Some(Path::new(HELPER)),
-        };
         assert_eq!(
-            AgentProvider::Codex.launch_args(&spec),
+            AgentProvider::Codex.launch_args(&spec7(&context, "ignored", Some("sess-abc"), Path::new("D:\\repo"))),
             vec![
                 "--no-alt-screen".to_string(),
                 "--add-dir".into(),
@@ -569,16 +606,8 @@ mod tests {
     #[test]
     fn codex_relaunch_args_match_old_respawn() {
         let context = ctx();
-        let spec = LaunchSpec {
-            tab_id: 7,
-            title: "fix \"login\"",
-            prompt: "",
-            resume_session: None,
-            context: &context,
-            hook_helper: Some(Path::new(HELPER)),
-        };
         assert_eq!(
-            AgentProvider::Codex.launch_args(&spec),
+            AgentProvider::Codex.launch_args(&spec7(&context, "", None, Path::new("D:\\repo"))),
             vec![
                 "--no-alt-screen".to_string(),
                 "--add-dir".into(),
@@ -604,6 +633,7 @@ mod tests {
             resume_session: None,
             context: &context,
             hook_helper: None,
+            cwd: Path::new("D:\\repo"),
         };
         assert_eq!(
             AgentProvider::Codex.launch_args(&spec),
@@ -619,18 +649,12 @@ mod tests {
     /// for both providers, so the two can never drift apart again.
     #[test]
     fn relaunch_is_launch_with_no_prompt_and_no_resume() {
+        let dir = tempfile::tempdir().unwrap();
         let context = ctx();
         for provider in AgentProvider::ALL {
-            let spec = LaunchSpec {
-                tab_id: 7,
-                title: "fix \"login\"",
-                prompt: "",
-                resume_session: None,
-                context: &context,
-                hook_helper: Some(Path::new(HELPER)),
-            };
+            let spec = spec7(&context, "", None, dir.path());
             assert_eq!(
-                provider.relaunch(7, "fix \"login\"", &context, Some(Path::new(HELPER))).unwrap().args,
+                provider.relaunch(7, "fix \"login\"", &context, Some(Path::new(HELPER)), dir.path()).unwrap().args,
                 provider.launch_args(&spec),
                 "{provider:?}"
             );
@@ -641,7 +665,6 @@ mod tests {
     fn capabilities_per_provider() {
         let c = AgentProvider::Claude;
         let x = AgentProvider::Codex;
-        assert!(c.uses_direct_mode_hooks() && !x.uses_direct_mode_hooks());
         assert!(c.supports_input_bar() && !x.supports_input_bar());
         assert!(c.supports_handoff() && !x.supports_handoff());
         assert!(c.supports_context_readout() && !x.supports_context_readout());
@@ -654,19 +677,139 @@ mod tests {
         );
     }
 
-    /// Claude writes the hook settings file; Codex leaves the directory
-    /// untouched (its notify command is argv). Same `HookSetup` for both so
-    /// the only variable is the provider.
+    // --- A4: per-tab status capture -----------------------------------------
+
+    /// A Claude launch writes the tab's settings file (the one argv names)
+    /// with the launch's own title/paths/helper, and leaves the checkout
+    /// alone: no `.claude/` appears in `cwd`.
     #[test]
-    fn prepare_status_capture_writes_settings_only_for_claude() {
+    fn claude_launch_writes_the_per_tab_settings_it_names_and_not_the_checkout() {
         let dir = tempfile::tempdir().unwrap();
-        let setup = HookSetup { tab_id: 42, shared_md: None, agent_readme: None, agent_name: "agent" };
-        AgentProvider::Codex.prepare_status_capture(dir.path(), &setup).unwrap();
-        assert!(!dir.path().join(".claude").exists(), "Codex must not touch .claude/");
-        AgentProvider::Claude.prepare_status_capture(dir.path(), &setup).unwrap();
-        let settings = dir.path().join(".claude/settings.local.json");
-        assert!(settings.is_file());
-        assert!(std::fs::read_to_string(&settings).unwrap().contains("hooks"));
+        let context = ctx();
+        let id = 990_107;
+        let spec = LaunchSpec { tab_id: id, ..spec7(&context, "go", None, dir.path()) };
+        let launch = AgentProvider::Claude.launch(&spec).unwrap();
+        let named = PathBuf::from(&launch.args[3]);
+        assert_eq!(named, hooks::tab_settings_file(id));
+        let text = std::fs::read_to_string(&named).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let inject = v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert_eq!(
+            inject,
+            "cmd /c type \"D:\\repo\\.pterminal\\shared.md\" & echo. & type \"D:\\repo\\.pterminal\\README-agents.md\" & echo. & echo You are agent \"fix \"login\"\"."
+        );
+        let stop = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert_eq!(stop, format!("\"{HELPER}\" Stop \"{}\"", hooks::events_file(id).display()));
+        assert!(!dir.path().join(".claude").exists(), "a launch must not write into the checkout");
+        let _ = std::fs::remove_file(named);
+    }
+
+    /// The migration runs on every Claude launch: an older pTerminal's
+    /// entries in `cwd`'s `settings.local.json` are gone afterwards, the
+    /// user's own settings are not. Codex never opens the file (a Codex
+    /// launch needs the executable, so only `launch_args` is exercised —
+    /// which touches no file at all).
+    #[test]
+    fn claude_launch_strips_stale_checkout_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let stale = format!(
+            "{{\"hooks\":{{\"Stop\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":{}}}]}}]}},\"permissions\":{{\"allow\":[\"Bash(npm:*)\"]}}}}",
+            serde_json::to_string(&format!("\"{HELPER}\" Stop \"{}\"", hooks::events_file(3).display())).unwrap()
+        );
+        std::fs::write(claude.join("settings.local.json"), &stale).unwrap();
+        let context = ctx();
+        let id = 990_108;
+        AgentProvider::Claude.launch(&LaunchSpec { tab_id: id, ..spec7(&context, "", None, dir.path()) }).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.local.json")).unwrap(),
+            "{\"permissions\":{\"allow\":[\"Bash(npm:*)\"]}}"
+        );
+        let _ = std::fs::remove_file(hooks::tab_settings_file(id));
+    }
+
+    /// The live proof that A4's mechanism works, run by hand before the rest
+    /// of the wave was built on it (`cargo test --bin pterminal -- --ignored
+    /// installed_claude_fires_hooks_from_settings_flag --nocapture`):
+    /// `cmd /c claude --settings <per-tab file>` in a Claude-trusted
+    /// directory with NO `.claude/settings.local.json` of its own, through
+    /// the same `TabTerm::spawn` the app uses, must produce a `SessionStart`
+    /// record in the tab's events file — i.e. Claude Code honours hooks from
+    /// `--settings`. The child is then told `/exit`; the test fails rather
+    /// than leaks if it doesn't go.
+    ///
+    /// Observed on Claude Code 2.1.278 (2026-09-22): see the A4 commit
+    /// message for the captured events file.
+    #[test]
+    #[ignore = "spawns the installed Claude Code in D:\\claude101 (trusted, no settings.local.json)"]
+    fn installed_claude_fires_hooks_from_settings_flag() {
+        let cwd = Path::new("D:\\claude101");
+        assert!(cwd.is_dir(), "the trusted scratch directory must exist");
+        assert!(!cwd.join(".claude").join("settings.local.json").exists(), "must have no checkout hooks of its own");
+        // The real helper from this build, not the `cmd /c echo` fallback:
+        // `target/debug/deps/<test>.exe` -> `target/debug/pterm_hook.exe`.
+        let helper = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("pterm_hook.exe");
+        assert!(helper.is_file(), "run `cargo build` first: {}", helper.display());
+
+        let id = 990_999;
+        let events = hooks::events_file(id);
+        std::fs::create_dir_all(hooks::events_dir()).unwrap();
+        let _ = std::fs::write(&events, "");
+        let context = AgentContext::default();
+        let launch = AgentProvider::Claude
+            .launch(&LaunchSpec {
+                tab_id: id,
+                title: "a4-verify",
+                prompt: "",
+                resume_session: None,
+                context: &context,
+                hook_helper: Some(&helper),
+                cwd,
+            })
+            .unwrap();
+        eprintln!("launch: {} {:?}", launch.program, launch.args);
+
+        let ctx = eframe::egui::Context::default();
+        let mut term = crate::term::TabTerm::spawn(&ctx, id, &launch.program, &launch.args, cwd).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut saw_session_start = false;
+        while std::time::Instant::now() < deadline {
+            term.poll();
+            let text = std::fs::read_to_string(&events).unwrap_or_default();
+            if hooks::parse_events(&text).iter().any(|r| r.event == "SessionStart") {
+                saw_session_start = true;
+                break;
+            }
+            assert!(term.exited().is_none(), "claude exited early with {:?}", term.exited());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // Leave the child running as briefly as possible whatever the
+        // outcome: ask it to quit, then wait for the exit.
+        term.write_input("/exit\r");
+        let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < exit_deadline && term.exited().is_none() {
+            term.poll();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if term.exited().is_none() {
+            // A second nudge in case the first Enter landed on a prompt.
+            term.write_input("/exit\r");
+            let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < exit_deadline && term.exited().is_none() {
+                term.poll();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        let contents = std::fs::read_to_string(&events).unwrap_or_default();
+        eprintln!("--- events file ({}) ---\n{contents}--- end ---", events.display());
+        let exited = term.exited();
+        drop(term);
+        let _ = std::fs::remove_file(&events);
+        let _ = std::fs::remove_file(hooks::tab_settings_file(id));
+        assert!(saw_session_start, "no SessionStart record within 30 s; events file:\n{contents}");
+        assert!(exited.is_some(), "claude did not exit after /exit — check for a leaked process");
+        assert!(!cwd.join(".claude").join("settings.local.json").exists(), "the launch must not create checkout hooks");
     }
 
     #[test]

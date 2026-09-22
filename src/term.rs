@@ -378,7 +378,7 @@ pub enum TabKind { Agent, Shell }
 /// `isolate` entirely — a resumed session must land back in the exact cwd it
 /// last ran in, never a fresh isolated worktree. `title`, when `Some`,
 /// overrides the slugged-prompt title (used as-is for both the tab title and
-/// `HookSetup::agent_name`); Task 5 pre-computes it with [`unique_title`] so
+/// `hooks::HookSetup::agent_name`); Task 5 pre-computes it with [`unique_title`] so
 /// a resumed or duplicate-prompt tab never collides with a live one.
 pub struct SpawnSpec {
     pub provider: crate::provider::AgentProvider,
@@ -608,32 +608,27 @@ pub fn unique_title(base: &str, taken: &[String]) -> String {
     }
 }
 
-/// Spawns an agent tab: optionally creates an isolated worktree, runs the
-/// provider's status-capture setup (`AgentProvider::prepare_status_capture`
-/// — for Claude, the hook settings that report status back through
-/// `hooks::events_file`), truncates any stale event file from a previous run
-/// of this tab id, then launches whatever `AgentProvider::launch` says (for
-/// Claude, `claude` inside `cmd.exe` — it is an npm shim on Windows and
-/// cannot be exec'd directly — with the prompt as an argument; for Codex,
-/// `codex.exe` with its notify command in argv). Everything
-/// provider-specific lives in `provider.rs`; this function is the same for
-/// every provider.
+/// Spawns an agent tab: optionally creates an isolated worktree, truncates
+/// any stale event file from a previous run of this tab id, then launches
+/// whatever `AgentProvider::launch` says (for Claude, `claude` inside
+/// `cmd.exe` — it is an npm shim on Windows and cannot be exec'd directly —
+/// with `--settings <this tab's hook file>` and the prompt as arguments;
+/// for Codex, `codex.exe` with its notify command in argv). The per-tab
+/// file each provider's status capture needs is written by `launch` itself
+/// (A4), so there is no separate "prepare" step to keep in order here.
+/// Everything provider-specific lives in `provider.rs`; this function is
+/// the same for every provider.
 ///
-/// **Direct-mode (`isolate: false`) hook takeover.** `hooks::write_settings`
-/// overwrites `.claude/settings.local.json` at `cwd` unconditionally. When
-/// two direct (non-isolated) agent tabs share the same checkout, the second
-/// `spawn_agent` call repoints all four hook entries at ITS
-/// `hooks::events_file` — last writer wins, and the older tab's events stop
-/// arriving. This function has no way to detect or prevent that (it only
-/// sees its own call). The app-level rule, enforced by the caller
-/// (Task 10/11), is: when a direct-mode spawn targets a `cwd` where another
-/// live direct-mode agent tab is already running, the app must degrade that
-/// older tab's `status` to `AgentStatus::Unknown` at the moment of the new
-/// spawn, since its hook routing has just been silently taken over.
+/// Status routing is per tab and per launch for every provider (A4): two
+/// direct-mode (`isolate: false`) agent tabs in the same checkout each
+/// report to their own events file, and nothing is written into the
+/// checkout — the "direct-mode hook takeover" that the per-checkout
+/// `.claude/settings.local.json` used to cause (and the app-level status
+/// degrade that papered over it) is gone; see `hooks::write_tab_settings`.
 ///
 /// **Partial-failure rollback.** When THIS call creates a worktree (the
 /// fresh, non-resume `isolate: true` path via `git::worktree_add`), a later
-/// failure (`hooks::write_settings` or `TabTerm::spawn`) does not leak it:
+/// failure (`AgentProvider::launch`'s file writes or `TabTerm::spawn`) does not leak it:
 /// the worktree and its `pt/<slug>` branch are removed best-effort before the
 /// error is returned, and the error explains whether that rollback succeeded
 /// — if it didn't, it names the path that needs manual cleanup. Direct-mode
@@ -669,25 +664,17 @@ pub fn spawn_agent(
     // on disk. Run it as a unit so any error can trigger rollback below
     // instead of leaking the worktree + branch via a bare `?`.
     let build: anyhow::Result<Tab> = (|| {
-        let hook_setup = hooks::HookSetup {
-            tab_id: id,
-            shared_md: spec.main_repo_shared_md.as_deref(),
-            agent_readme: spec.agent_readme.as_deref(),
-            agent_name: &title,
-        };
-        // Provider-specific status capture first (Claude: the hook settings
-        // file; Codex: nothing — its notify command is argv, below), then
-        // the provider-neutral part: the events file is per tab id, and a
-        // stale one from a previous run of this id must not feed
-        // `status_from_events` a leftover status.
-        spec.provider.prepare_status_capture(&cwd, &hook_setup)?;
+        // The provider-neutral part of status capture: the events file is
+        // per tab id, and a stale one from a previous run of this id must
+        // not feed `status_from_events` a leftover status.
         std::fs::create_dir_all(hooks::events_dir())?;
         // truncate any stale event file from a previous run of this id
         let _ = std::fs::write(hooks::events_file(id), "");
 
         // A3: one launch path for every provider. The program/argv split
         // (cmd.exe shim for Claude, codex.exe found on PATH for Codex) is
-        // the provider's business, not this function's.
+        // the provider's business, not this function's — and so (A4) is the
+        // per-tab file the argv points at, written inside `launch`.
         let agent_ctx = crate::provider::AgentContext {
             shared_md: spec.main_repo_shared_md.clone(),
             agent_readme: spec.agent_readme.clone(),
@@ -699,6 +686,7 @@ pub fn spawn_agent(
             resume_session: spec.resume_session.as_deref(),
             context: &agent_ctx,
             hook_helper: hooks::pterm_hook_exe().as_deref(),
+            cwd: &cwd,
         })?;
         let term = TabTerm::spawn(ctx, id, &launch.program, &launch.args, &cwd)?;
         Ok(Tab {
@@ -942,11 +930,11 @@ impl Tab {
     /// the events file is truncated the same way `spawn_agent` does on
     /// first spawn (a fresh child means a fresh event history — leaving
     /// stale events in place could make `status_from_events` report a
-    /// leftover status from the dead process). Hook settings in
-    /// `.claude/settings.local.json` are left untouched: `spawn_agent`
-    /// already wrote them once and nothing about them changes on restart
-    /// (same tab id, same events file path, same shared.md). Shell tabs
-    /// just rerun `powershell.exe`.
+    /// leftover status from the dead process). The provider's per-tab
+    /// status-capture file (Claude's `--settings` hook file) is rewritten
+    /// by `relaunch` with the same content the first spawn used — same tab
+    /// id, same events file path, same shared.md — so nothing about the
+    /// routing changes on restart. Shell tabs just rerun `powershell.exe`.
     ///
     /// Also resets `root_pids` and `spawned_at` so the resource-rollup PID
     /// claim runs again for the new child. This does NOT arm a fresh PID
@@ -968,17 +956,16 @@ impl Tab {
     ///
     /// **Never call this on a dead placeholder** (`missing_dir.is_some()`,
     /// see [`spawn_dead_tab`]) — final-review finding 4. A placeholder never
-    /// went through `spawn_agent`, so `.claude/settings.local.json` in
-    /// `self.cwd` (the workspace's MAIN checkout) was never written for this
-    /// tab id. Respawning an agent placeholder in place would launch a real
-    /// `claude` under whatever hook settings happen to be sitting in that
-    /// checkout: at best status capture is dead, at worst those settings
-    /// belong to a DIFFERENT live direct-mode tab, and this session's events
-    /// would append to that tab's events file — where `drain_events` would
-    /// read them back and overwrite the other tab's `session_id`. `app.rs`
-    /// routes placeholders to `respawn_missing_dir_tab` (a genuine
-    /// `spawn_agent`, hook settings and all) instead, and hides the Restart
-    /// button for them so the path isn't reachable from the UI at all.
+    /// went through `spawn_agent`: its `cwd` is the workspace's MAIN
+    /// checkout rather than the saved directory, it has no `agent_ctx`, and
+    /// its `provider`/`title` bookkeeping was never exercised by a real
+    /// launch. (Before A4 there was a sharper reason — its hook settings
+    /// were never written into that checkout, so a respawn there could run
+    /// under ANOTHER live tab's per-checkout hooks and corrupt that tab's
+    /// `session_id`; per-tab routing removed that hazard, not the rest.)
+    /// `app.rs` routes placeholders to `respawn_missing_dir_tab` (a genuine
+    /// `spawn_agent`) instead, and hides the Restart button for them so the
+    /// path isn't reachable from the UI at all.
     /// True when this tab renders the bottom input bar (`ui::input_bar`):
     /// a live agent tab whose provider wants one — not a shell, not a dead
     /// placeholder, not exited, and not Codex (`supports_input_bar`: it has
@@ -1000,7 +987,8 @@ impl Tab {
     /// * recent PTY output ([`TabTerm::output_within`]) — a shell running a
     ///   build, a Codex turn, a Claude turn; the one that needs no provider
     ///   knowledge and therefore the one that still works when hook status
-    ///   routing is broken (the `degrade_direct_mode_peers` situation);
+    ///   routing is degraded (a helper-less `cmd /c echo` fallback, a tab
+    ///   whose events file hasn't received anything yet);
     /// * hook status `Working` — belt and braces for a Claude tab sitting in
     ///   a long silent API wait between two bursts of output.
     ///
@@ -1024,6 +1012,7 @@ impl Tab {
                     &self.title,
                     &self.agent_ctx,
                     hooks::pterm_hook_exe().as_deref(),
+                    &self.cwd,
                 )?;
                 TabTerm::spawn(ctx, self.id, &launch.program, &launch.args, &self.cwd)?
             }
