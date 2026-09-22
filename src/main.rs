@@ -1,32 +1,31 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-mod provider;
 mod app;
 mod editor;
-mod commands;
 mod delivery;
 mod dialogs;
 mod egui_term_vendored;
 mod events;
-mod git;
 mod handoff;
-mod history;
-mod hooks;
-mod messages;
 mod orchestrator;
 mod persist;
-mod resources;
 mod resume;
-mod shared_ctx;
-mod state;
 mod tabs;
 mod term;
 #[cfg(test)]
 mod test_support;
-mod update;
 mod ui;
 mod watch;
-mod watcher;
 mod workspace;
+
+// A6: the egui-free modules live in the `pterminal-core` library crate (see
+// its crate doc for what it owns). They are imported at this crate's root
+// under their old names so every `crate::hooks::…` / `crate::state::…` path
+// in the app modules resolves exactly as it did when they were `mod`s here —
+// the module tree the app sees is unchanged, only where it is compiled moved.
+use pterminal_core::{
+    commands, git, history, hooks, messages, provider, resources, shared_ctx, state, update,
+    watcher,
+};
 
 fn main() -> eframe::Result<()> {
     let argv: Vec<String> = std::env::args().collect();

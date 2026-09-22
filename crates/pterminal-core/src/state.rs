@@ -129,7 +129,7 @@ pub fn load(base: &Path) -> (AppState, Option<String>) {
 /// both point the same direction. The debounce means each surviving write
 /// now carries a whole burst's worth of accumulated change rather than one
 /// message's, so a torn write destroys more; and the guaranteed shutdown
-/// flush ([`crate::app::PtApp::flush_persist`], called from `on_exit`) puts
+/// flush (`PtApp::flush_persist`, called from `on_exit`) puts
 /// a write *exactly* at the moment the process is being torn down, which is
 /// the worst possible moment to be mid-truncate. Debouncing a write that can
 /// tear would have traded a small, bounded loss for a rare, total one — so
@@ -147,7 +147,7 @@ pub fn load(base: &Path) -> (AppState, Option<String>) {
 ///   affordable *because of* the debounce and not otherwise: at the old
 ///   call rate, fsyncing a 50-message burst would have cost ~110 ms of
 ///   blocking IO in one frame. At the debounced rate — at most one write per
-///   [`crate::persist::PERSIST_DEBOUNCE`], i.e. ≤4/s — it is ~0.9% duty and the
+///   `persist::PERSIST_DEBOUNCE`, i.e. ≤4/s — it is ~0.9% duty and the
 ///   burst total drops from 14.05 ms (50 × 281 µs, all in a single frame) to
 ///   4.3 ms across two frames.
 /// - `std::fs::rename` over an existing destination. This is a

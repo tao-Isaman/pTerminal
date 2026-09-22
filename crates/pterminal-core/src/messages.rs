@@ -228,7 +228,7 @@ pub fn orchestrator_status(entries: &[WsStatus]) -> String {
 }
 
 /// UTC `HH:MM:SS` for `t`, wrapping at 24h (`% 86400`) — used to render
-/// [`crate::term::Tab::last_activity`] into status.md's `last active <hms>`
+/// `Tab::last_activity` into status.md's `last active <hms>`
 /// field. `t` before `UNIX_EPOCH` (an `Err` from `duration_since`) renders
 /// the dashed placeholder `"--:--:--"` rather than panicking; in practice
 /// this can't happen for a real `SystemTime::now()` capture, but a pure

@@ -28,6 +28,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
+/// The running app's version — the ROOT package's `CARGO_PKG_VERSION`, i.e.
+/// the `version = "…"` line of the top-level `Cargo.toml` that CI's
+/// "versions agree" step checks the release tag against. This is the value
+/// handed to `update::spawn_update_check` (A6): that function now lives in
+/// the `pterminal-core` library, whose own `CARGO_PKG_VERSION` is the
+/// placeholder `0.0.0`, so reading the macro *there* would make every
+/// published release look "newer" than the running app — a green build that
+/// silently never recognises its own version. `tests::
+/// update_check_is_keyed_to_the_root_package_version` pins this to the
+/// manifest so the mistake cannot come back unnoticed.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Draft state for the "new tab" dialog. Populated by shortcuts/buttons in
 /// this task; rendered and acted on by `dialogs::show_dialogs`.
 ///
@@ -208,7 +220,7 @@ pub struct PtApp {
     /// docs.
     pub orchestrator_status_written: Option<u64>,
     /// **Final-review finding (per-frame `shared.md` re-read).** Per-workspace
-    /// cache for [`crate::orchestrator::shared_excerpt_for`], keyed by `shared.md`'s own path
+    /// cache for `pterminal_core::orchestrator_model::shared_excerpt_for`, keyed by `shared.md`'s own path
     /// rather than workspace index: `(file length, mtime, computed excerpt)`.
     /// Without this, `refresh_orchestrator_status` re-read and re-flattened
     /// every workspace's ENTIRE `shared.md` every single frame — cost scaling
@@ -227,7 +239,7 @@ pub struct PtApp {
     /// stale bytes, not a correctness hazard, so `close_workspace` does not
     /// need to (and does not) clear this map the way it clears
     /// `roster_written`. A path whose file is deleted out from under it also
-    /// self-prunes: [`crate::orchestrator::shared_excerpt_for`] removes the entry on a `NotFound`
+    /// self-prunes: `pterminal_core::orchestrator_model::shared_excerpt_for` removes the entry on a `NotFound`
     /// stat.
     pub shared_excerpt_cache: HashMap<PathBuf, (u64, std::time::SystemTime, String)>,
     /// Workspace indices whose last [`PtApp::deliver_messages`] call left a
@@ -470,7 +482,7 @@ impl PtApp {
             focus_input_bar: false,
             input_bar_px: crate::ui::INPUT_BAR_PX_SEED,
             // once per launch; every failure mode is a silent no-op
-            update_check: Some(crate::update::spawn_update_check()),
+            update_check: Some(crate::update::spawn_update_check(APP_VERSION)),
             update_available: None,
             update_download: None,
             history,
@@ -768,5 +780,27 @@ impl eframe::App for PtApp {
     /// here touches the GL context.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.flush_persist();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::APP_VERSION;
+
+    /// A6 trap (see [`APP_VERSION`]'s docs): the version the update check
+    /// compares release tags against must be the root package's, read from
+    /// the same `version = "…"` line CI greps — never a library crate's
+    /// placeholder. The manifest is read the way `release.yml` reads it:
+    /// first `^version = "…"` line wins.
+    #[test]
+    fn update_check_is_keyed_to_the_root_package_version() {
+        let manifest = include_str!("../Cargo.toml");
+        let declared = manifest
+            .lines()
+            .find_map(|l| l.strip_prefix("version = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("root Cargo.toml must carry a literal `version = \"…\"` line");
+        assert_eq!(APP_VERSION, declared, "the update check must be keyed to the root package version");
+        assert_ne!(APP_VERSION, "0.0.0", "0.0.0 is the library crates' placeholder, not a release");
     }
 }

@@ -2612,17 +2612,28 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "arboard",
- "dirs",
  "eframe",
  "egui",
  "notify",
  "open",
+ "pterminal-core",
  "rfd",
+ "serde_json",
+ "tempfile",
+ "winresource",
+]
+
+[[package]]
+name = "pterminal-core"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "notify",
  "serde",
  "serde_json",
  "sysinfo",
  "tempfile",
- "winresource",
 ]
 
 [[package]]

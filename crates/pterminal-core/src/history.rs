@@ -42,8 +42,10 @@ impl History {
         h
     }
 
-    /// In-memory only — for tests and for `PtApp` test fixtures.
-    #[cfg(test)]
+    /// In-memory only — for tests and for `PtApp` test fixtures. Not
+    /// `#[cfg(test)]`: a library's `cfg(test)` is only set for its OWN test
+    /// build, so gating this would hide it from the binary's
+    /// `test_support::bare_app` (A6). Nothing in production calls it.
     pub fn in_memory() -> Self {
         History { entries: Vec::new(), file: PathBuf::new() }
     }

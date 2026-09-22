@@ -1,0 +1,21 @@
+[package]
+name = "pterminal-core"
+# A placeholder, deliberately: the app's real version lives ONLY in the root
+# `pterminal` package (CI's "versions agree" step greps it from the root
+# Cargo.toml, and the in-app update check compares release tags against it).
+# Nothing in this crate may read its own `CARGO_PKG_VERSION` for that purpose
+# — see `update::spawn_update_check`, which takes the version as a parameter.
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+dirs.workspace = true
+notify.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

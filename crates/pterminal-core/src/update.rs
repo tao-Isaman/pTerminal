@@ -103,8 +103,17 @@ fn update_from_release(json: &str, local_version: &str) -> Option<UpdateInfo> {
 /// yields at most one [`UpdateInfo`], and only when a newer release with an
 /// installer asset exists. Every failure mode (no curl, offline, API rate
 /// limit, malformed JSON) is a silent no-op.
-pub fn spawn_update_check() -> Receiver<UpdateInfo> {
+///
+/// `local_version` is the RUNNING APP's version — the binary passes its own
+/// `env!("CARGO_PKG_VERSION")`. It is a parameter rather than read here on
+/// purpose (A6): this module lives in the `pterminal-core` library, whose
+/// package version is a `0.0.0` placeholder, so `env!` evaluated here would
+/// make every published release look newer than the app and the check
+/// would never recognise its own release. Only the root package knows the
+/// version CI's "versions agree" step checked the tag against.
+pub fn spawn_update_check(local_version: &str) -> Receiver<UpdateInfo> {
     let (tx, rx) = channel();
+    let local_version = local_version.to_string();
     std::thread::spawn(move || {
         let url =
             format!("https://api.github.com/repos/{OWNER}/{REPO}/releases/latest");
@@ -115,7 +124,7 @@ pub fn spawn_update_check() -> Receiver<UpdateInfo> {
             return;
         }
         let body = String::from_utf8_lossy(&out.stdout);
-        if let Some(info) = update_from_release(&body, env!("CARGO_PKG_VERSION")) {
+        if let Some(info) = update_from_release(&body, &local_version) {
             let _ = tx.send(info); // app may have exited; dropped receiver is fine
         }
     });

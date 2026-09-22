@@ -136,7 +136,7 @@ pub fn orchestrator_dir() -> PathBuf {
 }
 
 /// Where the orchestrator's running status/notes live — written by
-/// [`PtApp::refresh_orchestrator_status`](crate::app::PtApp) (Task 3) via
+/// `PtApp::refresh_orchestrator_status` (Task 3) via
 /// [`crate::messages::orchestrator_status`], and shown read-only-ish in the
 /// F2 panel when the active workspace is the orchestrator.
 pub fn status_md_path(orch_dir: &Path) -> PathBuf {
