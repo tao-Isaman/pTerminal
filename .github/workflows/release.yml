@@ -1,8 +1,10 @@
 # Builds and publishes a GitHub Release with the Windows installer whenever a
 # v* tag is pushed. Release procedure (from the design doc): bump `version` in
-# Cargo.toml, commit, `git tag vX.Y.Z`, `git push --tags` — the in-app update
-# check compares the release tag against CARGO_PKG_VERSION, so they must match
-# (the "versions agree" step enforces it).
+# the ROOT Cargo.toml (the `pterminal` package — the two library crates under
+# `crates/` carry a `0.0.0` placeholder), commit, `git tag vX.Y.Z`,
+# `git push --tags` — the in-app update check compares the release tag
+# against the root package's CARGO_PKG_VERSION, so they must match (the
+# "versions agree" step enforces it).
 name: release
 
 on:
@@ -27,9 +29,15 @@ jobs:
             throw "tag v$tag does not match Cargo.toml version $cargo - the update check would never see this release as its own version"
           }
 
+      # `--workspace`: the root package is the binary, and a bare `cargo test`
+      # there tests only that package — the `pterminal-core` and
+      # `pterminal-term` library tests would silently stop running.
       - name: test
-        run: cargo test
+        run: cargo test --workspace
 
+      # No `--workspace` needed here: the root package pulls in both library
+      # crates, and this is what puts `pterminal.exe` + `pterm_hook.exe` into
+      # `target/release/` for the installer step.
       - name: build
         run: cargo build --release
 

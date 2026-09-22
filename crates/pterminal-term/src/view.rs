@@ -2296,7 +2296,7 @@ mod thai_composer_probe {
     /// missing from the grid = the bytes arrive corrupted (Claude Code's
     /// composer echo — upstream); grid intact = pTerminal's renderer is at
     /// fault. Run manually:
-    ///   cargo test --bin pterminal thai_composer -- --ignored --nocapture
+    ///   cargo test -p pterminal-term thai_composer -- --ignored --nocapture
     #[test]
     #[ignore]
     fn probe_thai_typing_through_real_claude_composer() {
