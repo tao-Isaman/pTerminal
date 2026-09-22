@@ -3357,17 +3357,30 @@ mod tests {
     /// reference included).
     ///
     /// The failure is forced deterministically and without launching real
-    /// `claude`: `spawn_agent` calls `hooks::write_settings` FIRST, which
-    /// starts with `create_dir_all(work_dir.join(".claude"))` — so a plain
-    /// FILE named `.claude` in the workspace root makes that call, and with it
-    /// the whole spawn, fail before `TabTerm::spawn` is ever reached.
+    /// `claude`: a Claude `AgentProvider::launch` FIRST reads the checkout's
+    /// `.claude/settings.local.json` to strip pre-A4 hook entries
+    /// (`hooks::forget_checkout_hooks`), and an I/O error there other than
+    /// "missing" fails the launch — so holding that file open with no share
+    /// mode (a sharing violation for every other opener, the "locked
+    /// settings file" case named above) makes the spawn fail before
+    /// `TabTerm::spawn` is ever reached. (Before A4 the same test used a
+    /// plain FILE named `.claude`, which made the old writer's
+    /// `create_dir_all` fail; the new code treats that as "nothing to
+    /// strip" and would spawn fine.)
     #[test]
     fn a_failed_resume_spawn_keeps_the_saved_tab_as_a_placeholder() {
+        use std::os::windows::fs::OpenOptionsExt;
         let ctx = eframe::egui::Context::default();
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().to_path_buf();
-        // A file, not a directory: `write_settings`' create_dir_all fails.
-        std::fs::write(repo.join(".claude"), "not a directory").expect("write .claude file");
+        std::fs::create_dir_all(repo.join(".claude")).expect("mkdir .claude");
+        let _lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(0)
+            .open(repo.join(".claude").join("settings.local.json"))
+            .expect("open settings.local.json exclusively");
 
         let wt = state::WorktreeInfo { path: PathBuf::from("D:\\wt\\gone"), branch: "pt/gone".into() };
         let saved = state::SavedTab {
