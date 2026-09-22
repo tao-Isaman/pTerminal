@@ -199,7 +199,10 @@ pub(crate) fn agent_readme_for_spawn(is_orchestrator: bool, is_git: bool, repo_r
 /// update again.
 pub(crate) fn degrade_direct_mode_peers(ws: &mut WsRt, repo: &Path) {
     for other in ws.tabs.iter_mut() {
-        if other.provider == crate::provider::AgentProvider::Claude && other.kind == TabKind::Agent
+        // Only a provider that routes status through the per-checkout hook
+        // file can have had its routing stolen (A3: `uses_direct_mode_hooks`
+        // — Codex's notify command is argv, nothing on disk to overwrite).
+        if other.provider.uses_direct_mode_hooks() && other.kind == TabKind::Agent
             && other.worktree.is_none()
             && other.cwd == repo
             && other.status != AgentStatus::Exited
@@ -791,7 +794,7 @@ impl PtApp {
                         // this resumed tab just overwrote hook routing for
                         // any other live direct-mode agent tab already
                         // sitting at the same cwd.
-                        if tab.provider == crate::provider::AgentProvider::Claude && tab.kind == TabKind::Agent && tab.worktree.is_none() {
+                        if tab.provider.uses_direct_mode_hooks() && tab.kind == TabKind::Agent && tab.worktree.is_none() {
                             degrade_direct_mode_peers(ws, &tab.cwd);
                         }
                         ws.tabs.push(tab);
@@ -1801,8 +1804,12 @@ impl PtApp {
                     if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
                         if tab.status != AgentStatus::Exited && tab.term.exited().is_none() {
                             tab.term.write_input("\r");
-                            if tab.provider == crate::provider::AgentProvider::Codex {
-                                tab.status = AgentStatus::Unknown;
+                            // Same rule as a hand-typed Enter in `ui.rs`:
+                            // a provider that only reports turn completion
+                            // (Codex) can't flip itself to Working, so the
+                            // stale pre-submit status is reset here instead.
+                            if let Some(status) = tab.provider.status_on_enter() {
+                                tab.status = status;
                             }
                         }
                         break;
@@ -2207,7 +2214,7 @@ impl PtApp {
         // as Ctrl+W.
         if t && !ws.meta.is_orchestrator {
             self.new_tab = Some(NewTabDraft {
-                provider: crate::provider::AgentProvider::Claude,
+                provider: Default::default(),
                 ws_index: self.active_ws,
                 prompt: String::new(),
                 isolate: ws.meta.default_isolate && ws.meta.is_git,
@@ -2413,7 +2420,7 @@ impl PtApp {
         let Some(ws) = self.workspaces.get_mut(self.active_ws) else { return };
         let Some(tab) = ws.tabs.get_mut(ws.active_tab) else { return };
         if tab.kind != TabKind::Agent
-            || tab.provider != crate::provider::AgentProvider::Claude
+            || !tab.provider.supports_handoff()
             || tab.missing_dir.is_some()
             || tab.term.exited().is_some()
             || tab.handoff_armed.is_some()
@@ -2750,7 +2757,7 @@ mod tests {
     /// end deterministically via `write_input("exit\r")`, matching
     /// `term::tests::write_input_reaches_pty`'s convention. `Agent` was
     /// tried first and had to be abandoned: it drives `spawn_agent`, whose
-    /// `agent_args` builds `cmd.exe /c claude --resume bogus-id-123`, and
+    /// `provider::claude_args` builds `cmd.exe /c claude --resume bogus-id-123`, and
     /// under a real ConPTY that process did NOT exit or fail fast — three
     /// separate timed runs each ran to a 15s bounded wait exactly on the
     /// nose rather than exiting early, leaving real orphaned `claude.exe`/

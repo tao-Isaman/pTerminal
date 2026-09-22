@@ -105,7 +105,9 @@ fn new_orchestrator_workspace() -> state::Workspace {
         default_isolate: false,
         kept_worktrees: vec![],
         saved_tabs: vec![state::SavedTab {
-            provider: crate::provider::AgentProvider::Claude,
+            // A fresh orchestrator starts on the default provider; the
+            // sidebar's context menu switches it and the choice persists.
+            provider: Default::default(),
             tab_id: 0,
             kind: state::SavedTabKind::Agent,
             title: "orchestrator".to_string(),

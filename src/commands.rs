@@ -53,17 +53,19 @@ pub fn parse_args(args: &[String]) -> Option<Result<ResumeCmd, String>> {
         return Some(Err(usage()));
     }
 
-    let mut provider = crate::provider::AgentProvider::Claude;
+    // `--provider` defaults to the same provider a saved tab without the
+    // field deserialises to (`AgentProvider::default()`), so an old-style
+    // `pterminal resume --id ...` keeps meaning what it always did.
+    let mut provider = crate::provider::AgentProvider::default();
     let mut id: Option<String> = None;
     let mut dir: Option<PathBuf> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--provider" => {
-                provider = match args.get(i + 1).map(String::as_str) {
-                    Some("claude") => crate::provider::AgentProvider::Claude,
-                    Some("codex") => crate::provider::AgentProvider::Codex,
-                    _ => return Some(Err(usage())),
+                provider = match args.get(i + 1).and_then(|v| crate::provider::AgentProvider::from_cli_name(v)) {
+                    Some(p) => p,
+                    None => return Some(Err(usage())),
                 };
                 i += 2;
             }

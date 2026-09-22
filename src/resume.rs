@@ -155,7 +155,7 @@ impl PtApp {
         // (isolate: false) spawn, so it just repointed
         // `.claude/settings.local.json`'s hook routing away from any other
         // live direct-mode agent tab already running at `repo`.
-        if cmd.provider == crate::provider::AgentProvider::Claude {
+        if cmd.provider.uses_direct_mode_hooks() {
             degrade_direct_mode_peers(ws, &repo);
         }
 
@@ -229,7 +229,7 @@ impl PtApp {
     /// gap on the resume-via-CLI path, just not yet closed. Without it,
     /// closing the app in the pre-`SessionStart` window and relaunching
     /// would resume the saved tab with `resume_session: None` —
-    /// `agent_args("", None)` builds a bare `["/c", "claude"]`, silently
+    /// `provider::claude_args("", None)` builds a bare `["/c", "claude"]`, silently
     /// starting a brand-new session instead of continuing the transferred
     /// one. This is almost certainly what actually produced the unexplained
     /// bare-`claude` tab in this task's own live-verification incident (see

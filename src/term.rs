@@ -418,8 +418,12 @@ pub struct SubTab {
 /// A running tab: its terminal plus everything the app needs to render tab
 /// chrome and roll up resource usage without re-deriving it every frame.
 pub struct Tab {
-    pub codex_shared: Option<PathBuf>,
-    pub codex_readme: Option<PathBuf>,
+    /// The coordination paths this tab was launched with, kept so
+    /// [`Tab::respawn`] can hand them back to `provider.relaunch` (A3:
+    /// replaced the Codex-only `codex_shared`/`codex_readme` pair that every
+    /// shell tab used to carry too). Populated for every agent tab whatever
+    /// its provider; `Default` for shells and dead placeholders.
+    pub agent_ctx: crate::provider::AgentContext,
     pub provider: crate::provider::AgentProvider,
     pub id: u64,
     pub title: String,
@@ -570,23 +574,6 @@ pub fn handoff_ready(armed: std::time::SystemTime, mtime: Option<std::time::Syst
     mtime.is_some_and(|m| m >= armed)
 }
 
-pub fn agent_args(prompt: &str, resume: Option<&str>) -> Vec<String> {
-    let mut args: Vec<String> = vec!["/c".into(), "claude".into()];
-    match resume {
-        Some(sid) => {
-            args.push("--resume".into());
-            args.push(sid.into());
-        }
-        None => {
-            let prompt = prompt.replace('"', "");
-            if !prompt.is_empty() {
-                args.push(prompt);
-            }
-        }
-    }
-    args
-}
-
 /// Returns `base` if it isn't in `taken`, else the first `base-2`, `base-3`,
 /// … suffix that is. Used to keep agent tab titles unique within a
 /// workspace (message delivery, Task 4/5, addresses agents by title, so a
@@ -621,12 +608,16 @@ pub fn unique_title(base: &str, taken: &[String]) -> String {
     }
 }
 
-/// Spawns an agent tab: optionally creates an isolated worktree, writes the
-/// Claude Code hook settings that report status back through
-/// `hooks::events_file`, truncates any stale event file from a previous run
-/// of this tab id, then launches `claude` inside `cmd.exe` (it is an npm
-/// shim on Windows and cannot be exec'd directly) with the prompt as an
-/// argument.
+/// Spawns an agent tab: optionally creates an isolated worktree, runs the
+/// provider's status-capture setup (`AgentProvider::prepare_status_capture`
+/// — for Claude, the hook settings that report status back through
+/// `hooks::events_file`), truncates any stale event file from a previous run
+/// of this tab id, then launches whatever `AgentProvider::launch` says (for
+/// Claude, `claude` inside `cmd.exe` — it is an npm shim on Windows and
+/// cannot be exec'd directly — with the prompt as an argument; for Codex,
+/// `codex.exe` with its notify command in argv). Everything
+/// provider-specific lives in `provider.rs`; this function is the same for
+/// every provider.
 ///
 /// **Direct-mode (`isolate: false`) hook takeover.** `hooks::write_settings`
 /// overwrites `.claude/settings.local.json` at `cwd` unconditionally. When
@@ -684,26 +675,34 @@ pub fn spawn_agent(
             agent_readme: spec.agent_readme.as_deref(),
             agent_name: &title,
         };
-        if spec.provider == crate::provider::AgentProvider::Claude {
-            hooks::write_settings(&cwd, &hook_setup)?;
-        }
+        // Provider-specific status capture first (Claude: the hook settings
+        // file; Codex: nothing — its notify command is argv, below), then
+        // the provider-neutral part: the events file is per tab id, and a
+        // stale one from a previous run of this id must not feed
+        // `status_from_events` a leftover status.
+        spec.provider.prepare_status_capture(&cwd, &hook_setup)?;
         std::fs::create_dir_all(hooks::events_dir())?;
         // truncate any stale event file from a previous run of this id
         let _ = std::fs::write(hooks::events_file(id), "");
 
-        // claude is an npm shim on Windows -> run through cmd.
-        let args = agent_args(&spec.prompt, spec.resume_session.as_deref());
-
-        let term = if spec.provider == crate::provider::AgentProvider::Codex {
-            let executable = crate::provider::codex_executable()?;
-            let args = crate::provider::codex_args(id, &title,
-                spec.main_repo_shared_md.as_deref(), spec.agent_readme.as_deref(),
-                &spec.prompt, spec.resume_session.as_deref(), hooks::pterm_hook_exe().as_deref());
-            TabTerm::spawn(ctx, id, &executable.to_string_lossy(), &args, &cwd)?
-        } else { TabTerm::spawn(ctx, id, "cmd.exe", &args, &cwd)? };
+        // A3: one launch path for every provider. The program/argv split
+        // (cmd.exe shim for Claude, codex.exe found on PATH for Codex) is
+        // the provider's business, not this function's.
+        let agent_ctx = crate::provider::AgentContext {
+            shared_md: spec.main_repo_shared_md.clone(),
+            agent_readme: spec.agent_readme.clone(),
+        };
+        let launch = spec.provider.launch(&crate::provider::LaunchSpec {
+            tab_id: id,
+            title: &title,
+            prompt: &spec.prompt,
+            resume_session: spec.resume_session.as_deref(),
+            context: &agent_ctx,
+            hook_helper: hooks::pterm_hook_exe().as_deref(),
+        })?;
+        let term = TabTerm::spawn(ctx, id, &launch.program, &launch.args, &cwd)?;
         Ok(Tab {
-            codex_shared: spec.main_repo_shared_md.clone(),
-            codex_readme: spec.agent_readme.clone(),
+            agent_ctx,
             id,
             title: title.clone(),
             kind: TabKind::Agent,
@@ -762,12 +761,14 @@ pub fn spawn_shell(
 ) -> anyhow::Result<Tab> {
     let term = TabTerm::spawn(ctx, id, "powershell.exe", &[], cwd)?;
     Ok(Tab {
-        codex_shared: None,
-        codex_readme: None,
+        agent_ctx: Default::default(),
         id,
         title: "shell".into(),
         kind: TabKind::Shell,
-        provider: crate::provider::AgentProvider::Claude,
+        // A shell has no provider; the field is a placeholder that nothing
+        // reads for `TabKind::Shell` (every provider gate also checks
+        // `kind == Agent`), so the default is as good as any.
+        provider: Default::default(),
         term,
         status: AgentStatus::Unknown,
         worktree: None,
@@ -836,8 +837,7 @@ pub fn spawn_dead_tab(
             .collect();
     let term = TabTerm::spawn(ctx, saved.tab_id, "cmd.exe", &args, repo_root)?;
     Ok(Tab {
-        codex_shared: None,
-        codex_readme: None,
+        agent_ctx: Default::default(),
         id: saved.tab_id,
         title: saved.title.clone(),
         provider: saved.provider,
@@ -956,8 +956,9 @@ impl Tab {
     ///
     /// **Deliberate no-change (Task 3).** Even though this tab may have a
     /// known `session_id` by now, restart still reruns a bare `cmd /c claude`
-    /// rather than `agent_args(_, self.session_id.as_deref())` — i.e.
-    /// "Restart" does not `--resume`. Task 5 owns that decision (it also has
+    /// (`provider.relaunch`, which is `launch` with no prompt and no resume
+    /// for every provider) rather than a `--resume self.session_id` launch —
+    /// i.e. "Restart" does not `--resume`. Task 5 owns that decision (it also has
     /// to decide what happens to `session_id`/`children` display mid-restart
     /// app-wide); this task only guarantees the new bookkeeping fields reset
     /// to their spawn-time defaults here exactly as `spawn_agent`/
@@ -979,11 +980,13 @@ impl Tab {
     /// `spawn_agent`, hook settings and all) instead, and hides the Restart
     /// button for them so the path isn't reachable from the UI at all.
     /// True when this tab renders the bottom input bar (`ui::input_bar`):
-    /// a live agent tab — not a shell, not a dead placeholder, not exited.
-    /// The one definition `central_ui` (whether to draw it) and the
-    /// background size-sync (how much terrain it takes) both read.
+    /// a live agent tab whose provider wants one — not a shell, not a dead
+    /// placeholder, not exited, and not Codex (`supports_input_bar`: it has
+    /// its own native input UI). The one definition `central_ui` (whether to
+    /// draw it) and the background size-sync (how much terrain it takes)
+    /// both read.
     pub fn has_input_bar(&self) -> bool {
-        self.kind == TabKind::Agent && self.provider == crate::provider::AgentProvider::Claude
+        self.kind == TabKind::Agent && self.provider.supports_input_bar()
             && self.missing_dir.is_none() && self.term.exited().is_none()
     }
 
@@ -1013,15 +1016,16 @@ impl Tab {
         let term = match self.kind {
             TabKind::Agent => {
                 let _ = std::fs::write(hooks::events_file(self.id), "");
-                if self.provider == crate::provider::AgentProvider::Codex {
-                    let executable = crate::provider::codex_executable()?;
-                    let args = crate::provider::codex_args(self.id, &self.title,
-                        self.codex_shared.as_deref(), self.codex_readme.as_deref(), "", None,
-                        hooks::pterm_hook_exe().as_deref());
-                    TabTerm::spawn(ctx, self.id, &executable.to_string_lossy(), &args, &self.cwd)?
-                } else {
-                    TabTerm::spawn(ctx, self.id, "cmd.exe", &["/c".to_string(), "claude".to_string()], &self.cwd)?
-                }
+                // A3: the bare restart launch (no prompt, no resume — see
+                // the doc comment above) comes from the provider, built from
+                // the same `agent_ctx` the first spawn used.
+                let launch = self.provider.relaunch(
+                    self.id,
+                    &self.title,
+                    &self.agent_ctx,
+                    hooks::pterm_hook_exe().as_deref(),
+                )?;
+                TabTerm::spawn(ctx, self.id, &launch.program, &launch.args, &self.cwd)?
             }
             TabKind::Shell => TabTerm::spawn(ctx, self.id, "powershell.exe", &[], &self.cwd)?,
         };
@@ -1630,23 +1634,8 @@ mod tests {
         assert_eq!(unique_title("all", &taken), "all-3");
     }
 
-    #[test]
-    fn agent_args_prompt_path_strips_quotes_unchanged() {
-        let args = agent_args("say \"hi\" now", None);
-        assert_eq!(args, vec!["/c", "claude", "say hi now"]);
-    }
-
-    #[test]
-    fn agent_args_empty_prompt_omits_trailing_arg() {
-        let args = agent_args("", None);
-        assert_eq!(args, vec!["/c", "claude"]);
-    }
-
-    #[test]
-    fn agent_args_resume_ignores_prompt() {
-        let args = agent_args("ignored prompt entirely", Some("sess-123"));
-        assert_eq!(args, vec!["/c", "claude", "--resume", "sess-123"]);
-    }
+    // The `agent_args` tests moved to `provider::tests` (as `claude_args_*`)
+    // with the function itself in A3.
 
     /// Compose-box payload: the exact bracketed-paste envelope, Thai
     /// (multi-byte + combining marks) passed through untouched, and no

@@ -65,8 +65,9 @@ impl PtApp {
                 ui.checkbox(&mut draft.shell, "plain shell (no agent)");
                 if !draft.shell {
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut draft.provider, crate::provider::AgentProvider::Claude, "Claude Code");
-                        ui.selectable_value(&mut draft.provider, crate::provider::AgentProvider::Codex, "Codex CLI");
+                        for provider in crate::provider::AgentProvider::ALL {
+                            ui.selectable_value(&mut draft.provider, provider, provider.label());
+                        }
                     });
                     ui.label("initial prompt (optional):");
                     ui.text_edit_singleline(&mut draft.prompt);
@@ -299,7 +300,7 @@ impl PtApp {
         } else {
             // Direct-mode hook takeover — see `degrade_direct_mode_peers`'s
             // doc comment for the full rationale.
-            if !draft.isolate && draft.provider == crate::provider::AgentProvider::Claude {
+            if !draft.isolate && draft.provider.uses_direct_mode_hooks() {
                 degrade_direct_mode_peers(ws, &repo);
             }
             // shared.md + gitignore entry + per-agent README, once per

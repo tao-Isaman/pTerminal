@@ -66,7 +66,7 @@ impl PtApp {
                     let row_resp = ui.selectable_label(i == self.active_ws, label);
                     row_resp.context_menu(|ui| {
                         ui.label("Start a new orchestrator session with:");
-                        for provider in [crate::provider::AgentProvider::Claude, crate::provider::AgentProvider::Codex] {
+                        for provider in crate::provider::AgentProvider::ALL {
                             if ui.add_enabled(!dialog_open, egui::Button::new(provider.label())).clicked() {
                                 orchestrator_provider = Some((i, provider));
                                 ui.close_menu();
@@ -249,11 +249,15 @@ impl PtApp {
                 // my first attempt) would silently narrow the warning: an
                 // isolated tab whose worktree happens to sit at the same path
                 // as a direct-mode tab's cwd would stop being reported.
-                let claude_agents_at: std::collections::HashMap<&std::path::Path, usize> =
+                //
+                // A3: "Claude" here became `uses_direct_mode_hooks()` — the
+                // property the warning is actually about (a per-checkout hook
+                // file that a second spawn overwrites), not the brand name.
+                let hooked_agents_at: std::collections::HashMap<&std::path::Path, usize> =
                     ws.tabs
                         .iter()
                         .filter(|t| {
-                            t.provider == crate::provider::AgentProvider::Claude
+                            t.provider.uses_direct_mode_hooks()
                                 && t.kind == TabKind::Agent
                         })
                         .fold(std::collections::HashMap::new(), |mut m, t| {
@@ -274,17 +278,17 @@ impl PtApp {
                     // can't take over another tab's status routing the way
                     // a second direct-mode agent spawn does.
                     //
-                    // Task P4: the "some OTHER Claude agent tab shares this
-                    // cwd" test is now a lookup into `claude_agents_at`
+                    // Task P4: the "some OTHER hook-routed agent tab shares
+                    // this cwd" test is now a lookup into `hooked_agents_at`
                     // (built once above), not a nested scan per tab. `> 1`
                     // rather than `>= 1` because whenever the outer condition
-                    // holds `tab` is itself a Claude agent tab and so is
+                    // holds `tab` is itself a hook-routed agent tab and so is
                     // counted in its own group — which is exactly the `j != i`
                     // the old inner loop excluded by hand.
-                    let shared_dir_warning = tab.provider == crate::provider::AgentProvider::Claude
+                    let shared_dir_warning = tab.provider.uses_direct_mode_hooks()
                         && tab.kind == TabKind::Agent
                         && tab.worktree.is_none()
-                        && claude_agents_at.get(tab.cwd.as_path()).is_some_and(|n| *n > 1);
+                        && hooked_agents_at.get(tab.cwd.as_path()).is_some_and(|n| *n > 1);
                     // Two-section label: the status marker keeps its own
                     // color while the title stays in the theme's text color,
                     // which a plain `RichText` (one color for the whole
@@ -332,8 +336,8 @@ impl PtApp {
                         .on_hover_ui(|ui| {
                             if tab.kind == TabKind::Agent {
                                 ui.label(tab.provider.label());
-                                if tab.provider == crate::provider::AgentProvider::Codex {
-                                    ui.small("Status reflects turn completion; approval and subagent tracking are unavailable.");
+                                if let Some(note) = tab.provider.hover_note() {
+                                    ui.small(note);
                                 }
                             }
                             let mut hover = format!(
@@ -522,7 +526,7 @@ impl PtApp {
                     if ui.add_enabled(!dialog_open, egui::Button::new("+")).clicked() {
                         let isolate = ws.meta.default_isolate && ws.meta.is_git;
                         self.new_tab = Some(NewTabDraft {
-                            provider: crate::provider::AgentProvider::Claude,
+                            provider: Default::default(),
                             ws_index: active_ws,
                             prompt: String::new(),
                             isolate,
@@ -580,7 +584,7 @@ impl PtApp {
                     .and_then(|w| w.tabs.get(w.active_tab))
                     .filter(|t| {
                         t.kind == crate::term::TabKind::Agent
-                            && t.provider == crate::provider::AgentProvider::Claude
+                            && t.provider.supports_context_readout()
                             && t.missing_dir.is_none()
                             && t.term.exited().is_none()
                     })
@@ -844,9 +848,14 @@ impl PtApp {
                     // holds egui focus (set just above, this same frame —
                     // the bar renders before the terminal).
                     let term_focused = focused && !self.input_bar_has_focus;
-                    if term_focused && tab.provider == crate::provider::AgentProvider::Codex
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        tab.status = AgentStatus::Unknown;
+                    // A provider that only reports turn completion (Codex)
+                    // never flips itself to Working, so Enter in its
+                    // terminal resets the stale status instead
+                    // (`status_on_enter`; Claude's hooks make it `None`).
+                    if let Some(status) = tab.provider.status_on_enter() {
+                        if term_focused && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            tab.status = status;
+                        }
                     }
                     let open_req = tab.term.ui(ui, term_focused, history, shift_enter); // only the ACTIVE tab renders — spec perf requirement
                     // Ctrl+click on a file path in the terminal (see the
