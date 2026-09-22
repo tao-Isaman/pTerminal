@@ -10,7 +10,7 @@
 //! went wrong; stacking a new decision on top of an unacknowledged error
 //! would only be confusing.
 
-use crate::app::{NewTabDraft, PendingClaim, PtApp, degrade_direct_mode_peers};
+use crate::app::{NewTabDraft, PendingClaim, PtApp};
 use crate::term::{self, SpawnSpec, TabKind};
 use crate::{git, shared_ctx};
 use eframe::egui;
@@ -298,11 +298,6 @@ impl PtApp {
         let result = if draft.shell {
             term::spawn_shell(ctx, id, &repo)
         } else {
-            // Direct-mode hook takeover — see `degrade_direct_mode_peers`'s
-            // doc comment for the full rationale.
-            if !draft.isolate && draft.provider.uses_direct_mode_hooks() {
-                degrade_direct_mode_peers(ws, &repo);
-            }
             // shared.md + gitignore entry + per-agent README, once per
             // workspace. Gitignore ruling (user-approved pre-flight
             // decision): auto-add without a confirmation prompt; any

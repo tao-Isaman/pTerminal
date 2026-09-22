@@ -3,7 +3,7 @@
 //! the resumed agent tab into the right workspace. The command-file
 //! format itself lives in `commands.rs`.
 
-use crate::app::{PendingClaim, PtApp, agent_readme_for_spawn, degrade_direct_mode_peers};
+use crate::app::{PendingClaim, PtApp, agent_readme_for_spawn};
 use crate::commands;
 use crate::shared_ctx;
 use crate::term::{self, Tab, TabKind};
@@ -80,9 +80,9 @@ impl PtApp {
     /// [`PtApp::finish_add_workspace`] itself (name from the folder,
     /// `is_git`/`default_isolate` autodetected, no saved tabs, no picker
     /// dialog) — then opens a fresh agent tab in it mirroring
-    /// `dialogs::open_tab`'s agent path: the same direct-mode hook-takeover
-    /// degrade, the same `shared.md`/`.gitignore`/per-agent-README wiring
-    /// for a git repo, and the same unique-title/`PendingClaim`/persist
+    /// `dialogs::open_tab`'s agent path: the same
+    /// `shared.md`/`.gitignore`/per-agent-README wiring for a git repo, and
+    /// the same unique-title/`PendingClaim`/persist
     /// dance — with two deliberate differences from a brand-new tab:
     /// `resume_session: Some(cmd.session_id)` instead of a fresh
     /// prompt-driven launch (`prompt` is therefore empty — ignored by
@@ -149,15 +149,6 @@ impl PtApp {
         let repo = ws.meta.repo_path.clone();
         let is_git = ws.meta.is_git;
         let is_orchestrator = ws.meta.is_orchestrator;
-
-        // Direct-mode hook takeover (see `degrade_direct_mode_peers`'s doc
-        // comment for the full rationale): this resume is always a direct
-        // (isolate: false) spawn, so it just repointed
-        // `.claude/settings.local.json`'s hook routing away from any other
-        // live direct-mode agent tab already running at `repo`.
-        if cmd.provider.uses_direct_mode_hooks() {
-            degrade_direct_mode_peers(ws, &repo);
-        }
 
         let shared = if is_git {
             match shared_ctx::ensure_shared_md(&repo) {

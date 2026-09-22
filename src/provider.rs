@@ -193,17 +193,6 @@ impl AgentProvider {
         }
     }
 
-    /// TEMPORARY (removed by the next A4 commit together with its callers):
-    /// the per-checkout-hooks capability the pre-A4 workaround gates on.
-    /// Kept for this one commit so the app compiles unchanged around the new
-    /// launch path; it is already a lie — Claude's routing is per tab now.
-    pub fn uses_direct_mode_hooks(self) -> bool {
-        match self {
-            Self::Claude => true,
-            Self::Codex => false,
-        }
-    }
-
     /// Whether the tab renders pTerminal's bottom input bar
     /// (`Tab::has_input_bar`, `ui::input_bar`). Codex uses its own native
     /// terminal input interface (README), so the bar is Claude-only.
@@ -676,7 +665,6 @@ mod tests {
     fn capabilities_per_provider() {
         let c = AgentProvider::Claude;
         let x = AgentProvider::Codex;
-        assert!(c.uses_direct_mode_hooks() && !x.uses_direct_mode_hooks());
         assert!(c.supports_input_bar() && !x.supports_input_bar());
         assert!(c.supports_handoff() && !x.supports_handoff());
         assert!(c.supports_context_readout() && !x.supports_context_readout());

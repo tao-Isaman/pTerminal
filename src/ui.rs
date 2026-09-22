@@ -200,7 +200,7 @@ impl PtApp {
                 // 3 us per widget: id allocation, layout, interaction,
                 // galley lookup, tessellation) and ~5% our own per-frame
                 // derivation. Isolating that derivation — the cpu/mem folds,
-                // the `format!`s, the shared-dir scan — for one workspace's
+                // the `format!`s, the since-removed shared-dir scan — for one workspace's
                 // strip measured 17 us against the strip's 40 us total, and
                 // most of that 17 us is the one owned `String` per label that
                 // egui's `impl Into<String>` API makes mandatory whether the
@@ -227,68 +227,17 @@ impl PtApp {
                 // two values every time.
                 let font = egui::TextStyle::Button.resolve(ui.style());
                 let base = ui.visuals().text_color();
-                // Task P4: how many Claude AGENT tabs sit in each `cwd`,
-                // counted once per frame. The shared-dir warning marker below
-                // used to answer that with a nested `ws.tabs.iter().any(...)`
-                // per tab — O(n^2) `PathBuf` comparisons (full
-                // component-wise path compares, not pointer compares)
-                // re-derived every frame from data that only changes when a
-                // tab is opened or closed. A scaling fix, not a measured win:
-                // at the 6-tab strip this app actually shows it is a wash
-                // against the nested scan (see the measurement note above),
-                // and it is here because O(n^2) path comparisons in a
-                // frame-rate loop is the wrong shape, not because the clock
-                // moved.
-                //
-                // **The filter here must match the old INNER predicate, not
-                // the outer one.** The nested scan tested `other.provider ==
-                // Claude && other.kind == Agent && other.cwd == tab.cwd` —
-                // and pointedly NOT `other.worktree.is_none()`, even though
-                // the outer condition requires that of `tab` itself. Adding
-                // the worktree filter here (the obvious-looking symmetry, and
-                // my first attempt) would silently narrow the warning: an
-                // isolated tab whose worktree happens to sit at the same path
-                // as a direct-mode tab's cwd would stop being reported.
-                //
-                // A3: "Claude" here became `uses_direct_mode_hooks()` — the
-                // property the warning is actually about (a per-checkout hook
-                // file that a second spawn overwrites), not the brand name.
-                let hooked_agents_at: std::collections::HashMap<&std::path::Path, usize> =
-                    ws.tabs
-                        .iter()
-                        .filter(|t| {
-                            t.provider.uses_direct_mode_hooks()
-                                && t.kind == TabKind::Agent
-                        })
-                        .fold(std::collections::HashMap::new(), |mut m, t| {
-                            *m.entry(t.cwd.as_path()).or_insert(0) += 1;
-                            m
-                        });
+                // A4: the per-cwd "another tab is working directly in this
+                // directory" warning marker that used to be computed here
+                // (a once-per-frame `hooked_agents_at` map, then a `⚠` on
+                // every direct-mode Claude tab sharing its cwd with another)
+                // is gone with the problem it warned about: two direct-mode
+                // tabs in one checkout no longer overwrite each other's hook
+                // routing, since each launch names its own per-tab settings
+                // file (`hooks::write_tab_settings`). Sharing a checkout is
+                // now merely ordinary, the same as two shells there.
                 let mut close_req = None;
                 for (i, tab) in ws.tabs.iter().enumerate() {
-                    // Shared-dir warning marker (Step 3). Only Agent tabs
-                    // with no worktree (i.e. working directly in a shared
-                    // checkout, not an isolated one) can collide with each
-                    // other's hook routing (see `spawn_agent`'s doc comment
-                    // on direct-mode hook takeover) — so the marker only
-                    // ever appears on those. "Another tab working directly
-                    // in this directory" is scoped to OTHER AGENT tabs at
-                    // the same `cwd`, not shells: a shell is passive (no
-                    // hooks, no `.claude/settings.local.json` writes), so it
-                    // can't take over another tab's status routing the way
-                    // a second direct-mode agent spawn does.
-                    //
-                    // Task P4: the "some OTHER hook-routed agent tab shares
-                    // this cwd" test is now a lookup into `hooked_agents_at`
-                    // (built once above), not a nested scan per tab. `> 1`
-                    // rather than `>= 1` because whenever the outer condition
-                    // holds `tab` is itself a hook-routed agent tab and so is
-                    // counted in its own group — which is exactly the `j != i`
-                    // the old inner loop excluded by hand.
-                    let shared_dir_warning = tab.provider.uses_direct_mode_hooks()
-                        && tab.kind == TabKind::Agent
-                        && tab.worktree.is_none()
-                        && hooked_agents_at.get(tab.cwd.as_path()).is_some_and(|n| *n > 1);
                     // Two-section label: the status marker keeps its own
                     // color while the title stays in the theme's text color,
                     // which a plain `RichText` (one color for the whole
@@ -318,17 +267,11 @@ impl PtApp {
                         );
                     };
                     fmt(marker, marker_color.unwrap_or(base));
-                    let title = if shared_dir_warning {
-                        format!(" {} ⚠", tab.title)
-                    } else {
-                        format!(" {}", tab.title)
-                    };
-                    fmt(&title, title_color.unwrap_or(base));
+                    fmt(&format!(" {}", tab.title), title_color.unwrap_or(base));
                     // perf: hover text built lazily via `on_hover_ui` — the
                     // closure only runs the frame the tab is actually
-                    // hovered, so the `format!` (and the conditional
-                    // shared-dir line append) no longer allocate for every
-                    // tab on every frame the way the old eager
+                    // hovered, so the `format!` no longer allocates for
+                    // every tab on every frame the way the old eager
                     // `on_hover_text(hover)` String did. Displayed text is
                     // identical.
                     let resp = ui
@@ -340,16 +283,12 @@ impl PtApp {
                                     ui.small(note);
                                 }
                             }
-                            let mut hover = format!(
+                            ui.label(format!(
                                 "{}\ncpu {:.0}%  ram {:.0} MB",
                                 tab.cwd.display(),
                                 tab.cpu,
                                 tab.mem as f64 / 1e6
-                            );
-                            if shared_dir_warning {
-                                hover.push_str("\nanother tab is working directly in this directory");
-                            }
-                            ui.label(hover);
+                            ));
                         });
                     if resp.clicked() {
                         ws.active_tab = i;
