@@ -3,6 +3,7 @@ mod provider;
 mod app;
 mod editor;
 mod commands;
+mod delivery;
 mod dialogs;
 mod egui_term_vendored;
 mod git;

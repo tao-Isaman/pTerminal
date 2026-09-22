@@ -17,7 +17,8 @@
 //! noticed by `drain_events` (events.rs), which calls in here after its
 //! hook-event loop.
 
-use crate::app::{PtApp, SUBMIT_DELAY};
+use crate::app::PtApp;
+use crate::delivery::SUBMIT_DELAY;
 use crate::hooks;
 use crate::shared_ctx;
 use crate::tabs::{PendingClaim, agent_readme_for_spawn};

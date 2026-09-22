@@ -765,7 +765,7 @@ impl PtApp {
                             let tab_id = tab.id;
                             self.pending_submit.push((
                                 tab_id,
-                                std::time::Instant::now() + crate::app::SUBMIT_DELAY,
+                                std::time::Instant::now() + crate::delivery::SUBMIT_DELAY,
                             ));
                         }
                     } else {
