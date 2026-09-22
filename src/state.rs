@@ -147,7 +147,7 @@ pub fn load(base: &Path) -> (AppState, Option<String>) {
 ///   affordable *because of* the debounce and not otherwise: at the old
 ///   call rate, fsyncing a 50-message burst would have cost ~110 ms of
 ///   blocking IO in one frame. At the debounced rate — at most one write per
-///   [`crate::app::PERSIST_DEBOUNCE`], i.e. ≤4/s — it is ~0.9% duty and the
+///   [`crate::persist::PERSIST_DEBOUNCE`], i.e. ≤4/s — it is ~0.9% duty and the
 ///   burst total drops from 14.05 ms (50 × 281 µs, all in a single frame) to
 ///   4.3 ms across two frames.
 /// - `std::fs::rename` over an existing destination. This is a

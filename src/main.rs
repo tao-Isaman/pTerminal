@@ -10,6 +10,7 @@ mod history;
 mod hooks;
 mod messages;
 mod orchestrator;
+mod persist;
 mod resources;
 mod resume;
 mod shared_ctx;
