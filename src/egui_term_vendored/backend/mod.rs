@@ -1,47 +1,64 @@
+//! The terminal backend: one child process, its grid, and everything the
+//! view needs to draw and drive it.
+//!
+//! `TerminalBackend` is a thin facade over cohesive pieces that must not
+//! know about each other except through the seams named here:
+//!
+//! * [`pty`] — the transport. Spawns the child, runs alacritty's event
+//!   loop thread, writes bytes and window sizes to the child. Its only
+//!   link to the rest is [`pty::SharedTerm`], the locked grid the event
+//!   loop parses output into.
+//! * [`grid`] — the model. The render snapshot (`RenderableContent`),
+//!   the dirty flag, and the whole-grid operations (clear, cursor-row
+//!   context). Reads the `Term` under a lock the facade takes.
+//! * [`selection`] — pixel→cell mapping and the live `Term::selection`.
+//! * [`links`] — URL/file-path detection under the pointer and the
+//!   Ctrl+click hand-off.
+//! * [`mouse`] — mouse-report byte encoding for apps with mouse mode on.
+//! * [`size`] — grid geometry and the resize gate.
+//!
+//! The facade owns the lock discipline: every `process_command` locks the
+//! `Term` once and passes `&mut Term` down, so no module locks on its own
+//! (the PTY reader thread contends for the same `FairMutex`, and holding
+//! it twice per command would double that contention). Public paths used
+//! outside this directory (`backend::{TerminalBackend, BackendCommand,
+//! PtyEvent, RenderableContent, TerminalSize, grid_spec, ...}`) are
+//! re-exported below so callers never see the split.
+
 pub mod settings;
 
+mod grid;
+mod links;
+mod mouse;
+mod pty;
+mod selection;
+mod size;
+
+pub use grid::RenderableContent;
+pub use links::LinkAction;
+pub use mouse::{MouseButton, MouseMode};
+pub use pty::EventProxy;
+pub use selection::SelectionType;
+pub use size::{grid_spec, TerminalSize};
+
 use crate::egui_term_vendored::types::Size;
-use alacritty_terminal::event::{
-    Event, EventListener, Notify, OnResize, WindowSize,
-};
-use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
-use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
-use alacritty_terminal::selection::{
-    Selection, SelectionRange, SelectionType as AlacrittySelectionType,
-};
-use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
-use alacritty_terminal::term::{
-    self, cell::Cell, test::TermSize, viewport_to_point, Term, TermMode,
-};
-// pTerminal delta 9: `Handler` brings `Term::clear_screen` into scope (it's
-// a `vte::ansi::Handler` trait method, normally invoked by the escape-code
-// parser as the child prints `\x1b[2J` etc.) so `BackendCommand::ClearScreen`
-// can call it directly. `ClearMode` is its argument type.
-use alacritty_terminal::vte::ansi::{ClearMode, Handler};
-use alacritty_terminal::tty;
+use alacritty_terminal::event::Event;
+use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::index::Point;
+use alacritty_terminal::term::{self, Term, TermMode};
 use egui::Modifiers;
+use grid::GridSnapshot;
+use links::{LinkDetector, LinkHover};
+use pty::{PtyTransport, SharedTerm};
 use settings::BackendSettings;
-use std::borrow::Cow;
-use std::cmp::min;
 use std::io::Result;
-use std::path::{Path, PathBuf};
-use std::ops::{Index, RangeInclusive};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
-use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::sync::Arc;
 
 pub type TerminalMode = TermMode;
 pub type PtyEvent = Event;
-pub type SelectionType = AlacrittySelectionType;
-
-/// pTerminal delta: how often a terminal that is *not* on screen asks for a
-/// repaint while its child is producing output. Long enough that a chatty
-/// background tab costs ~nothing, short enough that its event channel keeps
-/// getting drained and its exit is noticed promptly.
-const HIDDEN_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub enum BackendCommand {
@@ -51,155 +68,27 @@ pub enum BackendCommand {
     SelectStart(SelectionType, f32, f32),
     SelectUpdate(f32, f32),
     // pTerminal delta 9: right-click menu primitives — see the delta index
-    // entry in mod.rs and `TerminalBackend::select_all`/`clear_screen`.
+    // entry in mod.rs and `selection::select_all`/`grid::clear_screen`.
     SelectAll,
     ClearScreen,
     ProcessLink(LinkAction, Point),
     MouseReport(MouseButton, Modifiers, Point, bool),
 }
 
-#[derive(Debug, Clone)]
-pub enum MouseMode {
-    Sgr,
-    Normal(bool),
-}
-
-impl From<TermMode> for MouseMode {
-    fn from(term_mode: TermMode) -> Self {
-        if term_mode.contains(TermMode::SGR_MOUSE) {
-            MouseMode::Sgr
-        } else if term_mode.contains(TermMode::UTF8_MOUSE) {
-            MouseMode::Normal(true)
-        } else {
-            MouseMode::Normal(false)
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum MouseButton {
-    LeftButton = 0,
-    MiddleButton = 1,
-    RightButton = 2,
-    LeftMove = 32,
-    MiddleMove = 33,
-    RightMove = 34,
-    NoneMove = 35,
-    ScrollUp = 64,
-    ScrollDown = 65,
-    Other = 99,
-}
-
-#[derive(Debug, Clone)]
-pub enum LinkAction {
-    Clear,
-    Hover,
-    Open,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct TerminalSize {
-    pub cell_width: u16,
-    pub cell_height: u16,
-    num_cols: u16,
-    num_lines: u16,
-    layout_size: Size,
-}
-
-impl Default for TerminalSize {
-    fn default() -> Self {
-        Self {
-            cell_width: 1,
-            cell_height: 1,
-            num_cols: 80,
-            num_lines: 50,
-            layout_size: Size::default(),
-        }
-    }
-}
-
-impl Dimensions for TerminalSize {
-    fn total_lines(&self) -> usize {
-        self.screen_lines()
-    }
-
-    fn screen_lines(&self) -> usize {
-        self.num_lines as usize
-    }
-
-    fn columns(&self) -> usize {
-        self.num_cols as usize
-    }
-
-    fn last_column(&self) -> Column {
-        Column(self.num_cols as usize - 1)
-    }
-
-    fn bottommost_line(&self) -> Line {
-        Line(self.num_lines as i32 - 1)
-    }
-}
-
-/// The PTY-visible grid a layout would produce — `(cols, lines, cell_w,
-/// cell_h)`. Mirrors [`TerminalBackend::resize`]'s math exactly (the `/`
-/// uses `floor()`ed cell sizes, the stored cells truncate), so "the spec
-/// changed" is precisely "`resize` would change the terminal". Everything
-/// that decides whether/when to forward a resize (`needs_resize`, the
-/// view's debounce) keys on this tuple: sub-cell pixel jitter must be
-/// invisible, or the debounce clock restarts forever and the resize never
-/// lands.
-pub fn grid_spec(layout_size: Size, font_size: Size) -> (u16, u16, u16, u16) {
-    (
-        (layout_size.width / font_size.width.floor()) as u16,
-        (layout_size.height / font_size.height.floor()) as u16,
-        font_size.width as u16,
-        font_size.height as u16,
-    )
-}
-
-impl From<TerminalSize> for WindowSize {
-    fn from(size: TerminalSize) -> Self {
-        Self {
-            num_lines: size.num_lines,
-            num_cols: size.num_cols,
-            cell_width: size.cell_width,
-            cell_height: size.cell_height,
-        }
-    }
-}
-
 pub struct TerminalBackend {
     pub id: u64,
-    pub url_regex: RegexSearch,
-    /// pTerminal delta (Ctrl+click file paths): candidate file-path matcher.
-    /// A match only becomes a hover target if the file EXISTS on disk —
-    /// see the `LinkAction::Hover` arm.
-    pub path_regex: RegexSearch,
-    /// The directory this terminal's child was spawned in — relative path
-    /// matches resolve against it. The child's LIVE cwd isn't tracked
-    /// (ponytail: spawn cwd covers repo-rooted compiler/agent output).
-    spawn_cwd: Option<PathBuf>,
-    /// Set by a Ctrl+click on an existing file path; drained by
-    /// [`Self::take_file_open_request`] via `TabTerm::ui`, which turns it
-    /// into an editor tab.
-    file_open_request: Option<PathBuf>,
-    term: Arc<FairMutex<Term<EventProxy>>>,
+    /// The grid, shared with the transport's event-loop thread.
+    term: SharedTerm,
+    pty: PtyTransport,
     size: TerminalSize,
-    notifier: Notifier,
-    last_content: RenderableContent,
-    /// pTerminal perf delta: `true` when the terminal may have changed since
-    /// the last [`Self::sync`] — set by every `process_command` and by
-    /// [`Self::mark_dirty`] (called from `TabTerm::poll` when PTY events
-    /// arrive). While clean, `sync` returns the cached snapshot instead of
-    /// re-walking the grid under the PTY lock, so frames driven by unrelated
-    /// UI (typing in a panel, hovering a tab) cost nothing here.
-    dirty: bool,
+    snapshot: GridSnapshot,
+    links: LinkDetector,
 }
 
 impl TerminalBackend {
     /// pTerminal delta: `visible` is new. It is shared with the caller
     /// (`term::TabTerm`) and tells the PTY event forwarding thread whether this
-    /// terminal is currently on screen — see the thread body below.
+    /// terminal is currently on screen — see `pty::PtyTransport::spawn`.
     pub fn new(
         id: u64,
         app_context: egui::Context,
@@ -207,28 +96,11 @@ impl TerminalBackend {
         settings: BackendSettings,
         visible: Arc<AtomicBool>,
     ) -> Result<Self> {
-        // pTerminal delta: `tty::Options::default()` leaves `escape_args` false, so on
-        // Windows a multi-word arg (e.g. an agent's initial prompt) is written into the
-        // child's command line with no quoting and the child sees only its first word —
-        // reproduced live in Task 13's acceptance run (`cmd /c claude Reply with ...`
-        // reached Claude Code as just `Reply`). Escaping is a no-op for single-word args,
-        // so this is safe to always set.
         // (Ctrl+click file paths): kept for resolving relative path matches;
-        // cloned before `working_directory` moves into `pty_config`.
+        // cloned before `working_directory` moves into the PTY options.
         let spawn_cwd = settings.working_directory.clone();
-        #[cfg(target_os = "windows")]
-        let pty_config = tty::Options {
-            shell: Some(tty::Shell::new(settings.shell, settings.args)),
-            working_directory: settings.working_directory,
-            escape_args: true,
-            ..tty::Options::default()
-        };
-        #[cfg(not(target_os = "windows"))]
-        let pty_config = tty::Options {
-            shell: Some(tty::Shell::new(settings.shell, settings.args)),
-            working_directory: settings.working_directory,
-            ..tty::Options::default()
-        };
+        let pty_config =
+            pty::pty_options(settings.shell, settings.args, settings.working_directory);
         // pTerminal delta: scrollback size comes from `BackendSettings` instead of
         // alacritty_terminal's hardcoded default.
         let config = term::Config {
@@ -236,83 +108,29 @@ impl TerminalBackend {
             ..term::Config::default()
         };
         let terminal_size = TerminalSize::default();
-        let pty = tty::new(&pty_config, terminal_size.into(), id)?;
-        let (event_sender, event_receiver) = mpsc::channel();
-        let event_proxy = EventProxy(event_sender);
+        let (event_proxy, event_receiver) = pty::event_channel();
         let mut term = Term::new(config, &terminal_size, event_proxy.clone());
-        let initial_content = RenderableContent {
-            // pTerminal perf delta: a fresh grid is all blanks — an empty
-            // snapshot renders identically (just the background fill), and
-            // the first real `sync` (the backend starts `dirty`) fills it.
-            cells: Vec::new(),
-            display_offset: 0,
-            history_size: 0,
-            cursor_point: term.grid().cursor.point,
-            selectable_range: None,
-            terminal_mode: *term.mode(),
-            terminal_size,
-            cursor: term.grid_mut().cursor_cell().clone(),
-            hovered_hyperlink: None,
-            hovered_url: None,
-            hovered_file: None,
-        };
-        let term = Arc::new(FairMutex::new(term));
-        let pty_event_loop =
-            EventLoop::new(term.clone(), event_proxy, pty, false, false)?;
-        let notifier = Notifier(pty_event_loop.channel());
-        let url_regex = RegexSearch::new(r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#).unwrap();
-        let _pty_event_loop_thread = pty_event_loop.spawn();
-        // pTerminal delta: upstream was `loop { if let Ok(event) = ..recv() { .. } }`,
-        // which busy-spins forever once the channel closes, and panicked the thread
-        // when the consumer went away. Both happen on every terminal close.
-        let _pty_event_subscription = std::thread::Builder::new()
-            .name(format!("pty_event_subscription_{}", id))
-            .spawn(move || {
-                while let Ok(event) = event_receiver.recv() {
-                    if pty_event_proxy_sender.send((id, event.clone())).is_err() {
-                        break;
-                    }
-                    // pTerminal delta: upstream requested an immediate repaint for
-                    // every event, so one background tab printing output pinned the
-                    // whole app at frame rate — and every frame deep-clones the
-                    // *visible* terminal's grid in `sync()`. Off-screen terminals now
-                    // only ask for a lazy repaint; that still wakes the app loop often
-                    // enough to drain this channel (which is unbounded and carries
-                    // owned payloads) and to notice the child exiting.
-                    if visible.load(Ordering::Relaxed) {
-                        app_context.request_repaint();
-                    } else {
-                        app_context.request_repaint_after(HIDDEN_REPAINT_INTERVAL);
-                    }
-                    if let Event::Exit = event {
-                        break;
-                    }
-                }
-            })?;
-
-        // Candidate file paths: optional drive letter, at least one dir
-        // separator, a dot-extension, optional `:line` suffix. No spaces
-        // (ponytail: unquoted spaced paths are rare in terminal output).
-        // Deliberately loose — the existence check at hover time is the
-        // real filter.
-        // `~` in the tail too: Windows 8.3 short names (`C:\Users\RUNNER~1\...`)
-        // are real paths — caught live by the CI runner's temp dir.
-        let path_regex = RegexSearch::new(
-            r#"([A-Za-z]:)?[\w.~-]*[\\/][\w\\/.~-]+\.[A-Za-z0-9]+(:\d+)?"#,
-        )
-        .unwrap();
+        let snapshot = GridSnapshot::new(&mut term, terminal_size);
+        let term: SharedTerm = Arc::new(alacritty_terminal::sync::FairMutex::new(term));
+        let pty = PtyTransport::spawn(
+            id,
+            app_context,
+            pty_event_proxy_sender,
+            &pty_config,
+            terminal_size.into(),
+            term.clone(),
+            event_proxy,
+            event_receiver,
+            visible,
+        )?;
 
         Ok(Self {
             id,
-            url_regex,
-            path_regex,
-            spawn_cwd,
-            file_open_request: None,
-            term: term.clone(),
+            term,
+            pty,
             size: terminal_size,
-            notifier,
-            last_content: initial_content,
-            dirty: true,
+            snapshot,
+            links: LinkDetector::new(spawn_cwd),
         })
     }
 
@@ -320,26 +138,26 @@ impl TerminalBackend {
     /// in an editor tab" request from a Ctrl+click, if any. Drained once
     /// per frame by `TabTerm::ui`.
     pub fn take_file_open_request(&mut self) -> Option<PathBuf> {
-        self.file_open_request.take()
+        self.links.take_file_open_request()
     }
 
     /// pTerminal perf delta: tells the backend its `Term` may have changed
     /// (PTY output arrived), so the next [`Self::sync`] re-snapshots instead
     /// of serving the cached content. Called from `TabTerm::poll`.
     pub fn mark_dirty(&mut self) {
-        self.dirty = true;
+        self.snapshot.mark_dirty();
     }
 
     pub fn process_command(&mut self, cmd: BackendCommand) {
         // Every command can change what's on screen (write, scroll, resize,
         // selection, hover) — over-invalidating on the read-only ones is
         // harmless, it just costs one snapshot rebuild.
-        self.dirty = true;
+        self.snapshot.mark_dirty();
         let term = self.term.clone();
         let mut term = term.lock();
         match cmd {
             BackendCommand::Write(input) => {
-                self.write(input);
+                self.pty.write(input);
                 term.scroll_display(Scroll::Bottom);
             },
             BackendCommand::Scroll(delta) => {
@@ -349,22 +167,29 @@ impl TerminalBackend {
                 self.resize(&mut term, layout_size, font_size);
             },
             BackendCommand::SelectStart(selection_type, x, y) => {
-                self.start_selection(&mut term, selection_type, x, y);
+                selection::start(&mut term, &self.size, selection_type, x, y);
             },
             BackendCommand::SelectUpdate(x, y) => {
-                self.update_selection(&mut term, x, y);
+                selection::update(&mut term, &self.size, x, y);
             },
             BackendCommand::SelectAll => {
-                self.select_all(&mut term);
+                selection::select_all(&mut term);
             },
             BackendCommand::ClearScreen => {
-                self.clear_screen(&mut term);
+                grid::clear_screen(&mut term);
             },
             BackendCommand::ProcessLink(link_action, point) => {
                 self.process_link_action(&term, link_action, point);
             },
             BackendCommand::MouseReport(button, modifiers, point, pressed) => {
-                self.process_mouse_report(button, modifiers, point, pressed);
+                // The mode is read off the last synced snapshot, not the
+                // live `Term` — that is what upstream did, and a mode flip
+                // the app hasn't rendered yet shouldn't change how a click
+                // it already saw is reported.
+                let mode = self.snapshot.content().terminal_mode;
+                if let Some(bytes) = mouse::mouse_report(mode, button, modifiers, point, pressed) {
+                    self.pty.write(bytes);
+                }
             },
         };
     }
@@ -375,13 +200,7 @@ impl TerminalBackend {
         terminal_size: &TerminalSize,
         display_offset: usize,
     ) -> Point {
-        let col = (x as usize) / (terminal_size.cell_width as usize);
-        let col = min(Column(col), Column(terminal_size.num_cols as usize - 1));
-
-        let line = (y as usize) / (terminal_size.cell_height as usize);
-        let line = min(line, terminal_size.num_lines as usize - 1);
-
-        viewport_to_point(display_offset, Point::new(line, col))
+        selection::selection_point(x, y, terminal_size, display_offset)
     }
 
     // pTerminal delta 7: exposes whether there's an active selection without
@@ -392,90 +211,25 @@ impl TerminalBackend {
         self.last_content().selectable_range.is_some()
     }
 
-    // pTerminal delta 9: delegates to alacritty_terminal 0.25's own
-    // `Term::selection_to_string(&self) -> Option<String>`
-    // (`term/mod.rs:529`, an inherent method on `impl<T> Term<T>` — no
-    // `EventListener` bound required) instead of a hand-rolled
-    // `grid.iter_from` walk. That hand-rolled walk went through two
-    // distinct, real bugs before landing here:
-    //
-    // 1. Upstream's ORIGINAL `selectable_content()` (unmodified vendored
-    //    code, before this delta touched it) walked
-    //    `content.grid.display_iter()` — bound to whatever the viewport
-    //    happened to be scrolled to at the last `sync()`, not the actual
-    //    selection. Harmless for a small on-screen selection, but exactly
-    //    wrong for `BackendCommand::SelectAll`, whose whole point is a
-    //    selection spanning far more than one screen. Caught by this
-    //    delta's own unit test before any fix existed: an oldest,
-    //    scrolled-off marker was missing from the copied text.
-    // 2. This delta's OWN first fix — walking `content.grid.iter_from`
-    //    manually, bounded by the selection's `SelectionRange` — replaced
-    //    bug #1 with two further bugs of its own: an `iter_from`
-    //    off-by-one that dropped the selection's first character (fixed,
-    //    then caught for real via a regression test), and — the subject
-    //    of THIS revision — appending every selected cell with nothing
-    //    between rows, so a multi-row selection (an ordinary 2+ line
-    //    drag-select, or Select All) copied as one run-on string, each
-    //    source row space-padded out to the full column width. Unusable
-    //    when pasted. Both `view.rs`'s Ctrl+C (`WriteToClipboard`) and the
-    //    context menu's Copy (`term.rs`) call this same method, so either
-    //    path reproduced it.
-    //
-    // `Term::selection_to_string()` reads the LIVE `Term::selection` field
-    // directly (via `Selection::to_range`, not a display-bound snapshot),
-    // then walks per line via its own `bounds_to_string`/`line_to_string`
-    // helpers, which (a) insert `\n` between rows, (b) trim each row to
-    // its own occupied length (`LineLength::line_length` — trailing blank
-    // cells are dropped, so no more space-padding to full column width),
-    // and (c) suppress that trailing `\n` when the row's last cell
-    // carries `Flags::WRAPLINE`, so a soft-wrapped line (one logical line
-    // that overflowed the terminal width and continues on the next grid
-    // row) is NOT broken by a spurious newline. All three behaviors are
-    // upstream's own long-standing, unit-tested implementation (see its
-    // `term/mod.rs` `selection_to_string` tests) — not reproduced by hand
-    // here, eliminating the class of off-by-one/run-on bugs above by
-    // construction rather than by another manual patch.
+    /// The selected text, read from the LIVE selection — see
+    /// `selection::selected_text` for why it is not read off the snapshot.
     pub fn selectable_content(&self) -> String {
-        self.term.lock().selection_to_string().unwrap_or_default()
+        selection::selected_text(&self.term.lock())
     }
 
-    /// pTerminal perf delta: upstream deep-cloned the ENTIRE grid here —
-    /// scrollback included — every frame (`terminal.grid().clone()`). With a
-    /// 10k-line scrollback that was ~10k `Vec<Cell>` allocations and
-    /// megabytes of memcpy per frame, all while holding the same
-    /// `FairMutex<Term>` the PTY reader thread needs to apply new output.
-    /// The renderer only ever walks the visible viewport
-    /// (`display_iter()`), so only that is snapshotted now, into a reused
-    /// buffer — and only when [`Self::dirty`] says something changed.
+    /// The render snapshot, rebuilt from the grid only if something may
+    /// have changed since the last call — see `GridSnapshot::refresh`.
     pub fn sync(&mut self) -> &RenderableContent {
-        if !self.dirty {
-            return &self.last_content;
+        if self.snapshot.is_dirty() {
+            let term = self.term.clone();
+            let mut terminal = term.lock();
+            self.snapshot.refresh(&mut terminal, self.size);
         }
-        self.dirty = false;
-        let term = self.term.clone();
-        let mut terminal = term.lock();
-        let selectable_range = match &terminal.selection {
-            Some(s) => s.to_range(&terminal),
-            None => None,
-        };
-
-        self.last_content.cursor = terminal.grid_mut().cursor_cell().clone();
-        let grid = terminal.grid();
-        self.last_content.cells.clear();
-        self.last_content
-            .cells
-            .extend(grid.display_iter().map(|i| (i.point, i.cell.clone())));
-        self.last_content.display_offset = grid.display_offset();
-        self.last_content.history_size = grid.history_size();
-        self.last_content.cursor_point = grid.cursor.point;
-        self.last_content.selectable_range = selectable_range;
-        self.last_content.terminal_mode = *terminal.mode();
-        self.last_content.terminal_size = self.size;
         self.last_content()
     }
 
     pub fn last_content(&self) -> &RenderableContent {
-        &self.last_content
+        self.snapshot.content()
     }
 
     /// pTerminal delta (background-tab size sync): the `(layout, font)` of
@@ -483,33 +237,13 @@ impl TerminalBackend {
     /// reproduce this grid. The never-resized default state reports a zero
     /// layout, which callers treat as "no real size yet".
     pub fn applied_size(&self) -> (Size, Size) {
-        (
-            self.size.layout_size,
-            Size::new(self.size.cell_width as f32, self.size.cell_height as f32),
-        )
+        self.size.applied()
     }
 
-    /// pTerminal delta (history ghost suggestions): the cursor row as the
-    /// shell rendered it, split at the cursor — `(text left of the cursor,
-    /// is there any non-blank cell at or right of the cursor)`. Read from
-    /// the synced snapshot, so it reflects the last `sync()`. The right-side
-    /// flag gates the ghost: suggestions only make sense with the cursor at
-    /// the end of the line.
+    /// pTerminal delta (history ghost suggestions): see
+    /// `GridSnapshot::cursor_line_context`.
     pub fn cursor_line_context(&self) -> (String, bool) {
-        let c = &self.last_content;
-        let mut left = String::new();
-        let mut has_right = false;
-        for (point, cell) in &c.cells {
-            if point.line != c.cursor_point.line {
-                continue;
-            }
-            if point.column < c.cursor_point.column {
-                left.push(cell.c);
-            } else if cell.c != ' ' && cell.c != '\t' {
-                has_right = true;
-            }
-        }
-        (left, has_right)
+        self.snapshot.cursor_line_context()
     }
 
     fn process_link_action(
@@ -520,254 +254,41 @@ impl TerminalBackend {
     ) {
         match link_action {
             LinkAction::Hover => {
-                // pTerminal perf delta: the matched text is extracted here,
-                // at hover time, from the LIVE grid (upstream walked the
-                // cloned grid at click time — `last_content` no longer
-                // carries the full grid to walk).
-                let url_range = self.regex_match_at(
-                    terminal,
-                    point,
-                    &mut self.url_regex.clone(),
-                );
-                if let Some(range) = url_range {
-                    self.last_content.hovered_url =
-                        Some(Self::match_text(terminal, &range));
-                    self.last_content.hovered_file = None;
-                    self.last_content.hovered_hyperlink = Some(range);
-                    return;
-                }
-                // pTerminal delta (Ctrl+click file paths): no URL under the
-                // pointer — try a file-path candidate. It only becomes a
-                // hover target (underline + clickable) if the file EXISTS,
-                // which is what keeps the loose regex honest.
-                let path_range = self.regex_match_at(
-                    terminal,
-                    point,
-                    &mut self.path_regex.clone(),
-                );
-                let resolved = path_range.as_ref().and_then(|r| {
-                    resolve_existing_file(
-                        &Self::match_text(terminal, r),
-                        self.spawn_cwd.as_deref(),
-                    )
-                });
-                match resolved {
-                    Some(p) => {
-                        self.last_content.hovered_file = Some(p);
-                        self.last_content.hovered_url = None;
-                        self.last_content.hovered_hyperlink = path_range;
+                let hover = self.links.hover_at(terminal, point);
+                let c = self.snapshot.content_mut();
+                match hover {
+                    Some(LinkHover::Url { range, url }) => {
+                        c.hovered_url = Some(url);
+                        c.hovered_file = None;
+                        c.hovered_hyperlink = Some(range);
+                    },
+                    Some(LinkHover::File { range, path }) => {
+                        c.hovered_file = Some(path);
+                        c.hovered_url = None;
+                        c.hovered_hyperlink = Some(range);
                     },
                     None => {
-                        self.last_content.hovered_hyperlink = None;
-                        self.last_content.hovered_url = None;
-                        self.last_content.hovered_file = None;
+                        c.hovered_hyperlink = None;
+                        c.hovered_url = None;
+                        c.hovered_file = None;
                     },
                 }
             },
             LinkAction::Clear => {
-                self.last_content.hovered_hyperlink = None;
-                self.last_content.hovered_url = None;
-                self.last_content.hovered_file = None;
+                let c = self.snapshot.content_mut();
+                c.hovered_hyperlink = None;
+                c.hovered_url = None;
+                c.hovered_file = None;
             },
             LinkAction::Open => {
-                self.open_link();
-            },
-        };
-    }
-
-    /// The grid text covered by `range` — shared by the URL and file-path
-    /// hover extraction.
-    fn match_text(terminal: &Term<EventProxy>, range: &Match) -> String {
-        let start = *range.start();
-        let end = *range.end();
-        let mut text = String::from(terminal.grid().index(start).c);
-        for indexed in terminal.grid().iter_from(start) {
-            text.push(indexed.c);
-            if indexed.point == end {
-                break;
-            }
-        }
-        text
-    }
-
-    fn open_link(&mut self) {
-        if let Some(url) = &self.last_content.hovered_url {
-            // pTerminal delta: 6 — upstream did
-            // `open::that(url).unwrap_or_else(|_| panic!("link opening is failed"))`.
-            // This runs on the UI thread, so a Ctrl+click on any link the OS
-            // has no handler for (`mailto:` with no mail client, an unknown
-            // scheme, a false-positive URL match in terminal output) took the
-            // whole app down with it. A link that won't open is not worth a
-            // crash: ignore the failure and leave the terminal alone.
-            let _ = open::that(url);
-        } else if let Some(path) = self.last_content.hovered_file.clone() {
-            // pTerminal delta (Ctrl+click file paths): opened by pTerminal
-            // itself, not the OS — `TabTerm::ui` drains this into an editor
-            // tab in the active workspace.
-            self.file_open_request = Some(path);
-        }
-    }
-
-    fn process_mouse_report(
-        &self,
-        button: MouseButton,
-        modifiers: Modifiers,
-        point: Point,
-        pressed: bool,
-    ) {
-        let mut mods = 0;
-        if modifiers.contains(Modifiers::SHIFT) {
-            mods += 4;
-        }
-        if modifiers.contains(Modifiers::ALT) {
-            mods += 8;
-        }
-        if modifiers.contains(Modifiers::COMMAND) {
-            mods += 16;
-        }
-
-        match MouseMode::from(self.last_content().terminal_mode) {
-            MouseMode::Sgr => {
-                self.sgr_mouse_report(point, button as u8 + mods, pressed)
-            },
-            MouseMode::Normal(is_utf8) => {
-                if pressed {
-                    self.normal_mouse_report(
-                        point,
-                        button as u8 + mods,
-                        is_utf8,
-                    )
-                } else {
-                    self.normal_mouse_report(point, 3 + mods, is_utf8)
+                let c = self.snapshot.content();
+                if let Some(url) = &c.hovered_url {
+                    links::open_url(url);
+                } else if let Some(path) = c.hovered_file.clone() {
+                    self.links.request_file_open(path);
                 }
             },
-        }
-    }
-
-    fn sgr_mouse_report(&self, point: Point, button: u8, pressed: bool) {
-        let c = if pressed { 'M' } else { 'm' };
-
-        let msg = format!(
-            "\x1b[<{};{};{}{}",
-            button,
-            point.column + 1,
-            point.line + 1,
-            c
-        );
-
-        self.notifier.notify(msg.as_bytes().to_vec());
-    }
-
-    fn normal_mouse_report(&self, point: Point, button: u8, is_utf8: bool) {
-        let Point { line, column } = point;
-        let max_point = if is_utf8 { 2015 } else { 223 };
-
-        if line >= max_point || column >= max_point {
-            return;
-        }
-
-        let mut msg = vec![b'\x1b', b'[', b'M', 32 + button];
-
-        let mouse_pos_encode = |pos: usize| -> Vec<u8> {
-            let pos = 32 + 1 + pos;
-            let first = 0xC0 + pos / 64;
-            let second = 0x80 + (pos & 63);
-            vec![first as u8, second as u8]
         };
-
-        if is_utf8 && column >= Column(95) {
-            msg.append(&mut mouse_pos_encode(column.0));
-        } else {
-            msg.push(32 + 1 + column.0 as u8);
-        }
-
-        if is_utf8 && line >= 95 {
-            msg.append(&mut mouse_pos_encode(line.0 as usize));
-        } else {
-            msg.push(32 + 1 + line.0 as u8);
-        }
-
-        self.notifier.notify(msg);
-    }
-
-    fn start_selection(
-        &mut self,
-        terminal: &mut Term<EventProxy>,
-        selection_type: SelectionType,
-        x: f32,
-        y: f32,
-    ) {
-        let location = Self::selection_point(
-            x,
-            y,
-            &self.size,
-            terminal.grid().display_offset(),
-        );
-        terminal.selection = Some(Selection::new(
-            selection_type,
-            location,
-            self.selection_side(x),
-        ));
-    }
-
-    fn update_selection(
-        &mut self,
-        terminal: &mut Term<EventProxy>,
-        x: f32,
-        y: f32,
-    ) {
-        let display_offset = terminal.grid().display_offset();
-        if let Some(ref mut selection) = terminal.selection {
-            let location =
-                Self::selection_point(x, y, &self.size, display_offset);
-            selection.update(location, self.selection_side(x));
-        }
-    }
-
-    // pTerminal delta 9: selects the ENTIRE buffer (scrollback + visible
-    // screen) for the right-click menu's "Select All". Mirrors
-    // `start_selection`'s `Selection::new` + `update` pattern — a fresh
-    // `Selection` anchors both ends at one point, so the end has to be
-    // moved out to the bottom-right corner afterward; there's no
-    // "span the whole grid" constructor. `topmost_line()`/`bottommost_line()`
-    // /`last_column()` come from the already-imported `Dimensions` trait,
-    // implemented for `Term` itself (`term/mod.rs`, `impl<T> Dimensions for
-    // Term<T>`), so no locking/indirection beyond what's already in scope.
-    fn select_all(&mut self, terminal: &mut Term<EventProxy>) {
-        let start = Point::new(terminal.topmost_line(), Column(0));
-        let end = Point::new(terminal.bottommost_line(), terminal.last_column());
-        let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
-        selection.update(end, Side::Right);
-        terminal.selection = Some(selection);
-    }
-
-    // pTerminal delta 9: clears the visible screen AND scrollback for the
-    // right-click menu's "Clear". `clear_screen` is normally driven by an
-    // ANSI escape sequence from the child process (e.g. `\x1b[2J`); calling
-    // it directly here mutates the grid without the child knowing, exactly
-    // like every other `BackendCommand` that reaches into `Term` outside the
-    // escape-sequence path (e.g. `SelectStart`/`Scroll`). `ClearMode::All`
-    // clears the visible viewport (the whole alt-screen region if one is
-    // active) and always drops any active selection; `ClearMode::Saved`
-    // additionally discards the scrollback history (a no-op when there is
-    // none) via `Grid::clear_history`, which also resets `display_offset`
-    // to 0. Verified: both calls compile against alacritty_terminal 0.25.1
-    // and the unit test below confirms the buffer is actually empty
-    // afterward, not just that the selection was cleared.
-    fn clear_screen(&mut self, terminal: &mut Term<EventProxy>) {
-        terminal.clear_screen(ClearMode::All);
-        terminal.clear_screen(ClearMode::Saved);
-    }
-
-    fn selection_side(&self, x: f32) -> Side {
-        let cell_x = x as usize % self.size.cell_width as usize;
-        let half_cell_width = (self.size.cell_width as f32 / 2.0) as usize;
-
-        if cell_x > half_cell_width {
-            Side::Right
-        } else {
-            Side::Left
-        }
     }
 
     /// pTerminal perf delta: lets `TerminalView::resize` skip
@@ -783,13 +304,7 @@ impl TerminalBackend {
     /// space below the UI). The PTY only cares about the cell grid, so only
     /// a grid change is a resize.
     pub fn needs_resize(&self, layout_size: Size, font_size: Size) -> bool {
-        grid_spec(layout_size, font_size)
-            != (
-                self.size.num_cols,
-                self.size.num_lines,
-                self.size.cell_width,
-                self.size.cell_height,
-            )
+        !self.size.is_grid_for(layout_size, font_size)
     }
 
     fn resize(
@@ -798,36 +313,22 @@ impl TerminalBackend {
         layout_size: Size,
         font_size: Size,
     ) {
-        if layout_size == self.size.layout_size
-            && font_size.width as u16 == self.size.cell_width
-            && font_size.height as u16 == self.size.cell_height
-        {
+        if self.size.is_exactly(layout_size, font_size) {
             return;
         }
 
-        let lines = (layout_size.height / font_size.height.floor()) as u16;
-        let cols = (layout_size.width / font_size.width.floor()) as u16;
-        if lines > 0 && cols > 0 {
-            self.size = TerminalSize {
-                layout_size,
-                cell_height: font_size.height as u16,
-                cell_width: font_size.width as u16,
-                num_lines: lines,
-                num_cols: cols,
-            };
-
-            self.notifier.on_resize(self.size.into());
-            terminal.resize(TermSize::new(
-                self.size.num_cols as usize,
-                self.size.num_lines as usize,
-            ));
+        if let Some(size) = TerminalSize::for_layout(layout_size, font_size) {
+            self.size = size;
+            // Transport first, then the grid — the order upstream used.
+            self.pty.resize(size.into());
+            grid::resize_grid(terminal, size);
         }
     }
 
-    fn write<I: Into<Cow<'static, [u8]>>>(&self, input: I) {
-        self.notifier.notify(input);
-    }
-
+    /// Scrolling straddles the transport/grid seam, so it lives in the
+    /// facade: in an alternate-screen app with `ALTERNATE_SCROLL` on, a
+    /// wheel notch is the app's business (sent as arrow-key bytes), otherwise
+    /// it moves our own viewport over the scrollback.
     fn scroll(&mut self, terminal: &mut Term<EventProxy>, delta_value: i32) {
         if delta_value != 0 {
             let scroll = Scroll::Delta(delta_value);
@@ -844,138 +345,24 @@ impl TerminalBackend {
                     content.push(line_cmd);
                 }
 
-                self.notifier.notify(content);
+                self.pty.write(content);
             } else {
                 terminal.grid_mut().scroll_display(scroll);
             }
         }
     }
-
-    /// Based on alacritty/src/display/hint.rs > regex_match_at
-    /// Retrieve the match, if the specified point is inside the content matching the regex.
-    fn regex_match_at(
-        &self,
-        terminal: &Term<EventProxy>,
-        point: Point,
-        regex: &mut RegexSearch,
-    ) -> Option<Match> {
-        let x = visible_regex_match_iter(terminal, regex)
-            .find(|rm| rm.contains(&point));
-        x
-    }
 }
 
-/// Copied from alacritty/src/display/hint.rs:
-/// Iterate over all visible regex matches.
-fn visible_regex_match_iter<'a>(
-    term: &'a Term<EventProxy>,
-    regex: &'a mut RegexSearch,
-) -> impl Iterator<Item = Match> + 'a {
-    let viewport_start = Line(-(term.grid().display_offset() as i32));
-    let viewport_end = viewport_start + term.bottommost_line();
-    let mut start =
-        term.line_search_left(Point::new(viewport_start, Column(0)));
-    let mut end = term.line_search_right(Point::new(viewport_end, Column(0)));
-    start.line = start.line.max(viewport_start - 100);
-    end.line = end.line.min(viewport_end + 100);
-
-    RegexIter::new(start, end, Direction::Right, term, regex)
-        .skip_while(move |rm| rm.end().line < viewport_start)
-        .take_while(move |rm| rm.start().line <= viewport_end)
-}
-
-/// pTerminal perf delta: upstream held a full `Grid<Cell>` clone here
-/// (scrollback included). The renderer only reads the visible viewport, so
-/// this now carries exactly that: the visible cells (with their original
-/// buffer-space `Point`s, so selection/hyperlink range checks still work
-/// unchanged), plus the two grid scalars the renderer used to pull from the
-/// clone. The hovered link's URL text is captured at hover time
-/// (`hovered_url`) since there is no longer a full grid to walk at click
-/// time.
-pub struct RenderableContent {
-    pub cells: Vec<(Point, Cell)>,
-    pub display_offset: usize,
-    /// pTerminal delta (scrollbar): lines of scrollback above the viewport.
-    /// 0 in the alternate screen (it has no history) — which is exactly when
-    /// the scrollbar must not draw.
-    pub history_size: usize,
-    pub cursor_point: Point,
-    pub hovered_hyperlink: Option<RangeInclusive<Point>>,
-    pub hovered_url: Option<String>,
-    /// pTerminal delta (Ctrl+click file paths): the EXISTING file under the
-    /// Ctrl+hover, resolved to an absolute path. Mutually exclusive with
-    /// `hovered_url`; both share `hovered_hyperlink` for the underline.
-    pub hovered_file: Option<PathBuf>,
-    pub selectable_range: Option<SelectionRange>,
-    pub cursor: Cell,
-    pub terminal_mode: TermMode,
-    pub terminal_size: TerminalSize,
-}
-
-/// pTerminal delta (Ctrl+click file paths): turns a regex match's text into
-/// an absolute path of an EXISTING file, or `None`. Strips a trailing
-/// `:line` suffix (compiler/`file:line` convention — the editor has no
-/// goto-line yet, so the number is dropped; ponytail ceiling). Relative
-/// candidates resolve against `cwd` (the terminal's spawn directory).
-fn resolve_existing_file(text: &str, cwd: Option<&Path>) -> Option<PathBuf> {
-    let candidate = PathBuf::from(strip_line_suffix(text));
-    let full = if candidate.is_absolute() {
-        candidate
-    } else {
-        cwd?.join(candidate)
-    };
-    full.is_file().then_some(full)
-}
-
-/// `"src\app.rs:123"` → `"src\app.rs"`; leaves drive colons (`D:\x.rs`)
-/// and non-numeric suffixes alone.
-fn strip_line_suffix(s: &str) -> &str {
-    match s.rsplit_once(':') {
-        Some((head, tail))
-            if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            head
-        }
-        _ => s,
-    }
-}
-
-impl Default for RenderableContent {
-    fn default() -> Self {
-        Self {
-            cells: Vec::new(),
-            display_offset: 0,
-            history_size: 0,
-            cursor_point: Point::default(),
-            hovered_hyperlink: None,
-            hovered_url: None,
-            hovered_file: None,
-            selectable_range: None,
-            cursor: Cell::default(),
-            terminal_mode: TermMode::empty(),
-            terminal_size: TerminalSize::default(),
-        }
-    }
-}
-
-impl Drop for TerminalBackend {
-    fn drop(&mut self) {
-        let _ = self.notifier.0.send(Msg::Shutdown);
-    }
-}
-
-#[derive(Clone)]
-pub struct EventProxy(mpsc::Sender<Event>);
-
-impl EventListener for EventProxy {
-    fn send_event(&self, event: Event) {
-        let _ = self.0.send(event.clone());
-    }
-}
-
+/// End-to-end tests that drive a whole `TerminalBackend` over a real
+/// `cmd.exe` child. Unit tests for the pieces live next to them
+/// (`links`, `mouse`, `selection`, `size`).
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::index::{Column, Line, Side};
+    use alacritty_terminal::selection::Selection;
+    use alacritty_terminal::vte::ansi::Handler;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     /// Waits for `cond` to hold, polling every 10 ms. `false` on timeout.
@@ -1033,6 +420,7 @@ mod tests {
     // `RenderableContent` no longer carries the full grid (scrollback
     // included), which is exactly what this helper needs to walk.
     fn full_grid_text(backend: &mut TerminalBackend) -> String {
+        use alacritty_terminal::grid::Dimensions;
         let term = backend.term.lock();
         let grid = term.grid();
         let start = Point::new(grid.topmost_line(), Column(0));
@@ -1160,56 +548,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn strip_line_suffix_rules() {
-        assert_eq!(strip_line_suffix(r"src\app.rs:123"), r"src\app.rs");
-        assert_eq!(strip_line_suffix("src/app.rs"), "src/app.rs");
-        assert_eq!(strip_line_suffix(r"D:\x\y.rs"), r"D:\x\y.rs"); // drive colon
-        assert_eq!(strip_line_suffix("a.rs:"), "a.rs:"); // empty suffix
-        assert_eq!(strip_line_suffix("a.rs:12b"), "a.rs:12b"); // non-numeric
-    }
-
-    #[test]
-    fn resolve_existing_file_checks_disk_and_resolves_relative() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("real.rs");
-        std::fs::write(&f, "x").unwrap();
-
-        // absolute, exists
-        assert_eq!(
-            resolve_existing_file(&f.display().to_string(), None),
-            Some(f.clone())
-        );
-        // absolute with :line
-        assert_eq!(
-            resolve_existing_file(&format!("{}:42", f.display()), None),
-            Some(f.clone())
-        );
-        // relative against cwd
-        assert_eq!(
-            resolve_existing_file("real.rs", Some(dir.path())),
-            Some(f.clone())
-        );
-        // relative without a cwd -> None
-        assert_eq!(resolve_existing_file("real.rs", None), None);
-        // nonexistent -> None
-        assert_eq!(
-            resolve_existing_file("not-there.rs", Some(dir.path())),
-            None
-        );
-        // a DIRECTORY is not an openable file
-        assert_eq!(
-            resolve_existing_file(&dir.path().display().to_string(), None),
-            None
-        );
-    }
-
     /// End-to-end (Ctrl+click file paths): echo a real file's absolute path
     /// into a live cmd.exe, Hover a point inside it (existence-checked
     /// underline target), then Open — the request must surface via
     /// `take_file_open_request`, and open::that must NOT be involved.
     #[test]
     fn hovering_and_clicking_an_echoed_file_path_requests_an_editor_open() {
+        use alacritty_terminal::grid::Dimensions;
         let mut backend = spawn_backend(914);
         let dir = std::env::temp_dir().join("pt-path-click-test");
         let _ = std::fs::create_dir_all(&dir);
@@ -1263,30 +608,6 @@ mod tests {
         assert_eq!(backend.take_file_open_request(), None); // drained once
     }
 
-    /// Regression test for the `Grid::iter_from` off-by-one caught during
-    /// live verification (Select All then Copy on a buffer starting with
-    /// "Windows PowerShell" produced "indows PowerShell" — the selection's
-    /// very first character silently dropped). That hand-rolled
-    /// range-walking loop is gone now (superseded by the Task 3 review fix
-    /// below: `selectable_content()` delegates to
-    /// `Term::selection_to_string()` and no longer walks the grid by
-    /// hand), so this specific bug class cannot recur structurally — the
-    /// test is kept as a precise-shape regression check, with its expected
-    /// value recomputed for `selection_to_string()`'s real semantics
-    /// instead of the old hand-rolled loop's.
-    ///
-    /// A default, freshly-spawned `TerminalBackend` has no scrollback yet
-    /// (`history_size() == 0`) and — read synchronously, before the
-    /// child's own startup banner can arrive over the PTY channel — a
-    /// still-completely-blank grid, so Select All's range is exactly the
-    /// visible 50-line × 80-column grid with every cell blank.
-    /// `Term::selection_to_string()` trims each blank row to an empty
-    /// string (`LineLength::line_length` finds no non-space cell) and
-    /// joins the 50 (empty) rows with `\n`, giving exactly 49 newline
-    /// characters: 50 rows joined by 49 separators, zero characters of
-    /// actual content. (Under the OLD hand-rolled loop this asserted
-    /// `4000 == 50 * 80` — every cell's literal space, one run-on string,
-    /// nothing between rows; a dropped first cell read 3999.)
     /// Ghost-suggestion support: typed-but-unsubmitted text must come back
     /// as the cursor row's left-of-cursor context, with nothing right of
     /// the cursor.
@@ -1315,6 +636,30 @@ mod tests {
         assert!(left.contains('>'), "prompt marker missing from {left:?}");
     }
 
+    /// Regression test for the `Grid::iter_from` off-by-one caught during
+    /// live verification (Select All then Copy on a buffer starting with
+    /// "Windows PowerShell" produced "indows PowerShell" — the selection's
+    /// very first character silently dropped). That hand-rolled
+    /// range-walking loop is gone now (superseded by the Task 3 review fix
+    /// below: `selectable_content()` delegates to
+    /// `Term::selection_to_string()` and no longer walks the grid by
+    /// hand), so this specific bug class cannot recur structurally — the
+    /// test is kept as a precise-shape regression check, with its expected
+    /// value recomputed for `selection_to_string()`'s real semantics
+    /// instead of the old hand-rolled loop's.
+    ///
+    /// A default, freshly-spawned `TerminalBackend` has no scrollback yet
+    /// (`history_size() == 0`) and — read synchronously, before the
+    /// child's own startup banner can arrive over the PTY channel — a
+    /// still-completely-blank grid, so Select All's range is exactly the
+    /// visible 50-line × 80-column grid with every cell blank.
+    /// `Term::selection_to_string()` trims each blank row to an empty
+    /// string (`LineLength::line_length` finds no non-space cell) and
+    /// joins the 50 (empty) rows with `\n`, giving exactly 49 newline
+    /// characters: 50 rows joined by 49 separators, zero characters of
+    /// actual content. (Under the OLD hand-rolled loop this asserted
+    /// `4000 == 50 * 80` — every cell's literal space, one run-on string,
+    /// nothing between rows; a dropped first cell read 3999.)
     #[test]
     fn select_all_on_a_fresh_backend_does_not_drop_the_first_character() {
         let mut backend = spawn_backend(911);
@@ -1355,7 +700,7 @@ mod tests {
     /// Bypasses the PTY child entirely for determinism: `ClearScreen`
     /// wipes whatever the shell has printed asynchronously so far, then
     /// `Handler::goto`/`input`/`carriage_return`/`linefeed` (the same
-    /// trait already used by `TerminalBackend::clear_screen`, driving the
+    /// trait already used by `grid::clear_screen`, driving the
     /// grid exactly as an incoming escape sequence would) write two known
     /// lines directly, and a hand-built `Selection` (mirroring
     /// `select_all`'s own `Selection::new`/`update` pattern) selects
