@@ -172,7 +172,26 @@ impl AgentProvider {
         hook_helper: Option<&Path>,
         cwd: &Path,
     ) -> anyhow::Result<Launch> {
-        self.launch(&LaunchSpec { tab_id, title, prompt: "", resume_session: None, context, hook_helper, cwd })
+        self.launch(&relaunch_spec(tab_id, title, context, hook_helper, cwd))
+    }
+
+    /// The argv half of [`relaunch`](Self::relaunch), with no side effects
+    /// and no program resolution — the same split [`launch_args`]
+    /// (Self::launch_args) is to [`launch`](Self::launch). Exists so the
+    /// "relaunch is launch with an empty prompt and no resume" invariant can
+    /// be pinned for BOTH providers on a machine with no Codex install: the
+    /// v0.1.26 release run failed on exactly that, `relaunch` resolving
+    /// `codex.exe` on a CI runner that has none. Both `relaunch` and this go
+    /// through [`relaunch_spec`], so they cannot drift apart.
+    pub fn relaunch_args(
+        self,
+        tab_id: u64,
+        title: &str,
+        context: &AgentContext,
+        hook_helper: Option<&Path>,
+        cwd: &Path,
+    ) -> Vec<String> {
+        self.launch_args(&relaunch_spec(tab_id, title, context, hook_helper, cwd))
     }
 
     /// Pure argv half of [`Self::launch`]: no disk access, only path
@@ -262,6 +281,20 @@ impl AgentProvider {
 /// positional prompt. The rest is unchanged: `--resume <sid>` when
 /// resuming, else the prompt as one argument with `"` stripped (cmd's
 /// quoting would otherwise split it).
+/// The one definition of what a Restart launches: the tab's own identity and
+/// context, an empty prompt, no resume session (see `Tab::respawn` for why a
+/// restart is "bring the session back", never a re-run of the original
+/// prompt). Shared by `relaunch` and `relaunch_args`.
+fn relaunch_spec<'a>(
+    tab_id: u64,
+    title: &'a str,
+    context: &'a AgentContext,
+    hook_helper: Option<&'a Path>,
+    cwd: &'a Path,
+) -> LaunchSpec<'a> {
+    LaunchSpec { tab_id, title, prompt: "", resume_session: None, context, hook_helper, cwd }
+}
+
 pub fn claude_args(settings: &Path, prompt: &str, resume: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "/c".into(),
@@ -647,6 +680,14 @@ mod tests {
 
     /// `relaunch` is exactly `launch` with an empty prompt and no resume —
     /// for both providers, so the two can never drift apart again.
+    ///
+    /// Compares the pure argv halves (`relaunch_args` vs `launch_args`), not
+    /// `relaunch` itself: the Codex arm of `relaunch` resolves `codex.exe` on
+    /// PATH, which made this test pass on the dev box and fail the v0.1.26
+    /// release run on a CI runner with no Codex. `claude_relaunch` above
+    /// still exercises the real `relaunch` path for the provider every
+    /// machine has. `relaunch` and `relaunch_args` share `relaunch_spec`, so
+    /// this comparison covers what `relaunch` actually sends.
     #[test]
     fn relaunch_is_launch_with_no_prompt_and_no_resume() {
         let dir = tempfile::tempdir().unwrap();
@@ -654,7 +695,7 @@ mod tests {
         for provider in AgentProvider::ALL {
             let spec = spec7(&context, "", None, dir.path());
             assert_eq!(
-                provider.relaunch(7, "fix \"login\"", &context, Some(Path::new(HELPER)), dir.path()).unwrap().args,
+                provider.relaunch_args(7, "fix \"login\"", &context, Some(Path::new(HELPER)), dir.path()),
                 provider.launch_args(&spec),
                 "{provider:?}"
             );
