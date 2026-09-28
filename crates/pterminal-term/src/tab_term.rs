@@ -411,6 +411,62 @@ mod tests {
         assert_eq!(term.exited(), Some(0));
     }
 
+    /// Probe for how the installed Codex treats a writable-root request in an
+    /// UNTRUSTED directory (a fresh temp dir, so Codex's default sandbox
+    /// applies). Run by hand: `PROBE=prod|adddir|none cargo test -p
+    /// pterminal-term -- --ignored codex_writable_root_probe --nocapture`.
+    /// `prod` is exactly what `codex_args` emits today; `adddir` swaps the
+    /// writable-root override for the legacy `--add-dir` flag; `none` drops
+    /// the grant. Reports whether the TUI is still alive after 20 s.
+    ///
+    /// Measured on Codex 0.157.1: `adddir` exited 1 within a second ("Error
+    /// adding directories: Ignoring --add-dir … effective permissions do not
+    /// allow additional writable roots"); `prod` and `none` were still
+    /// running at 20 s. That measurement is why `codex_args` uses the
+    /// config override and not the flag.
+    #[test]
+    #[ignore = "requires an installed Codex CLI; starts the real TUI for 20 s"]
+    fn codex_writable_root_probe() {
+        let ctx = egui::Context::default();
+        let executable = pterminal_core::provider::codex_executable().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let main = tempfile::tempdir().unwrap();
+        let readme = main.path().join(".pterminal").join("README-agents.md");
+        std::fs::create_dir_all(readme.parent().unwrap()).unwrap();
+        std::fs::write(&readme, "probe").unwrap();
+        let which = std::env::var("PROBE").unwrap_or_else(|_| "prod".into());
+        let mut args = pterminal_core::provider::codex_args(
+            90_777, "probe", None, Some(&readme), "", None, None,
+        );
+        let dir = readme.parent().unwrap().to_string_lossy().into_owned();
+        // The writable-root grant is the `-c` pair whose value names the key.
+        let grant = args
+            .iter()
+            .position(|a| a.starts_with("sandbox_workspace_write.writable_roots="))
+            .expect("codex_args emits the writable-root override");
+        match which.as_str() {
+            "adddir" => {
+                args.drain(grant - 1..grant + 1);
+                args.extend(["--add-dir".to_string(), dir]);
+            }
+            "none" => {
+                args.drain(grant - 1..grant + 1);
+            }
+            _ => {}
+        }
+        eprintln!("PROBE {which}: args = {args:?}");
+        let mut term = TabTerm::spawn(&ctx, 90_777, &executable.to_string_lossy(), &args, cwd.path()).unwrap();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(20) && term.exited().is_none() {
+            term.poll();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        term.select_all();
+        let screen = term.copy_selection();
+        let shown: String = screen.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("\n");
+        eprintln!("PROBE {which}: exited = {:?}\n{shown}", term.exited());
+    }
+
     /// The live proof that A4's mechanism works, run by hand before the rest
     /// of the wave was built on it (`cargo test -p pterminal-term -- --ignored
     /// installed_claude_fires_hooks_from_settings_flag --nocapture`):

@@ -51,8 +51,9 @@ pub struct AgentContext {
     /// always the MAIN repo's even for a worktree tab.
     pub shared_md: Option<PathBuf>,
     /// The per-agent README (`shared_ctx::write_agent_readme`, or the
-    /// orchestrator variant). Its parent directory is what Codex gets as
-    /// `--add-dir` so a worktree agent can still append messages.
+    /// orchestrator variant). Its parent directory is what Codex gets as a
+    /// writable root (see `codex_args`) so a worktree agent can still append
+    /// messages.
     pub agent_readme: Option<PathBuf>,
 }
 
@@ -383,8 +384,28 @@ pub fn codex_args(
     }
     // Isolated agents need to append messages in the main checkout. Grant
     // only the coordination directory, not the whole main working tree.
+    //
+    // As a CONFIG override, not `--add-dir`: Codex 0.157.1 made `--add-dir`
+    // fatal whenever the effective sandbox does not allow extra writable
+    // roots (e.g. the read-only default in a directory the user has not
+    // trusted — every fresh worktree). The TUI printed "Error adding
+    // directories: Ignoring --add-dir (...) because the effective
+    // permissions do not allow additional writable roots" and exited 1, so
+    // no isolated Codex tab could start at all. `sandbox_workspace_write.
+    // writable_roots` is the same grant (it is what `--add-dir` populates),
+    // consulted only in workspace-write mode and silently irrelevant
+    // otherwise. Probed on 0.157.1 (`tab_term::tests::codex_writable_root_probe`):
+    // `--add-dir` exits 1 within a second; this form and no grant at all both
+    // leave the TUI running. Under read-only the agent falls back to the
+    // per-command approval prompt for that write, exactly as before.
     if let Some(dir) = readme.and_then(Path::parent) {
-        args.extend(["--add-dir".into(), dir.to_string_lossy().into_owned()]);
+        args.extend([
+            "-c".into(),
+            format!(
+                "sandbox_workspace_write.writable_roots=[{}]",
+                serde_json::to_string(&dir.to_string_lossy()).unwrap()
+            ),
+        ]);
     }
     args.extend([
         "-c".into(),
@@ -602,8 +623,8 @@ mod tests {
             AgentProvider::Codex.launch_args(&spec7(&context, "do the thing \"quoted\"", None, Path::new("D:\\repo"))),
             vec![
                 "--no-alt-screen".to_string(),
-                "--add-dir".into(),
-                "D:\\repo\\.pterminal".into(),
+                "-c".into(),
+                "sandbox_workspace_write.writable_roots=[\"D:\\\\repo\\\\.pterminal\"]".into(),
                 "-c".into(),
                 CODEX_DEV_INSTRUCTIONS.into(),
                 "-c".into(),
@@ -621,8 +642,8 @@ mod tests {
             AgentProvider::Codex.launch_args(&spec7(&context, "ignored", Some("sess-abc"), Path::new("D:\\repo"))),
             vec![
                 "--no-alt-screen".to_string(),
-                "--add-dir".into(),
-                "D:\\repo\\.pterminal".into(),
+                "-c".into(),
+                "sandbox_workspace_write.writable_roots=[\"D:\\\\repo\\\\.pterminal\"]".into(),
                 "-c".into(),
                 CODEX_DEV_INSTRUCTIONS.into(),
                 "-c".into(),
@@ -643,8 +664,8 @@ mod tests {
             AgentProvider::Codex.launch_args(&spec7(&context, "", None, Path::new("D:\\repo"))),
             vec![
                 "--no-alt-screen".to_string(),
-                "--add-dir".into(),
-                "D:\\repo\\.pterminal".into(),
+                "-c".into(),
+                "sandbox_workspace_write.writable_roots=[\"D:\\\\repo\\\\.pterminal\"]".into(),
                 "-c".into(),
                 CODEX_DEV_INSTRUCTIONS.into(),
                 "-c".into(),
@@ -653,7 +674,7 @@ mod tests {
         );
     }
 
-    /// A shell-like context (no paths, no helper): no `--add-dir`, no
+    /// A shell-like context (no paths, no helper): no writable root, no
     /// `notify`, just the instructions — the old `codex_args(7, "fix", None,
     /// None, "", None, None)` output.
     #[test]
