@@ -390,6 +390,16 @@ impl PtApp {
         let wt = tab.worktree.clone();
 
         let outcome: Result<(), String> = match (&action, &wt) {
+            // A worktree that is no longer a git worktree (directory gone,
+            // or `.git` file gone) has nothing to be dirty and nothing
+            // `worktree remove` can act on: every arm below would fail at
+            // `is_dirty` with "not a git repository" and leave the tab open
+            // for good. Reap the branch instead — see
+            // `git::reap_vanished_worktree`.
+            (CloseAction::Merge | CloseAction::Discard, Some(wt)) if !git::is_git_repo(&wt.path) => {
+                git::reap_vanished_worktree(&repo, wt, matches!(action, CloseAction::Merge))
+                    .map_err(|e| e.to_string())
+            }
             (CloseAction::Merge, Some(wt)) => (|| {
                 if git::is_dirty(&wt.path).map_err(|e| e.to_string())? {
                     return Err(format!(

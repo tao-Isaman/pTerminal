@@ -104,10 +104,14 @@ pub struct CloseDraft {
 /// (or the identity fields) get filled in.
 pub(crate) fn close_draft_for(ws: &WsRt, ws_index: usize, tab_idx: usize) -> Option<CloseDraft> {
     let tab = ws.tabs.get(tab_idx)?;
+    // A vanished worktree (see `git::reap_vanished_worktree`) has no working
+    // tree to be dirty; without the `is_git_repo` guard `is_dirty`'s error
+    // read as "dirty" and the dialog demanded the discard double-confirm
+    // for work that no longer exists anywhere but the branch.
     let dirty = tab
         .worktree
         .as_ref()
-        .map(|wt| git::is_dirty(&wt.path).unwrap_or(true))
+        .map(|wt| git::is_git_repo(&wt.path) && git::is_dirty(&wt.path).unwrap_or(true))
         .unwrap_or(false);
     Some(CloseDraft { ws_index, tab_id: tab.id, dirty, confirm_discard: false })
 }

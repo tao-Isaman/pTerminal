@@ -175,6 +175,72 @@ pub fn delete_branch(repo: &Path, branch: &str) -> Result<(), GitError> {
     run(&c(repo, &["branch", "-D", branch])).map(|_| ())
 }
 
+/// True if `refs/heads/<branch>` exists in `repo`.
+pub fn branch_exists(repo: &Path, branch: &str) -> bool {
+    run(&c(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])).is_ok()
+}
+
+/// `git worktree prune`: drops the registrations of worktrees whose
+/// directory (or whose `.git` file) is gone. Without it a later
+/// `worktree add` at the same path fails with "already registered".
+pub fn worktree_prune(repo: &Path) -> Result<(), GitError> {
+    run(&c(repo, &["worktree", "prune"])).map(|_| ())
+}
+
+/// Closes out a tab whose worktree has **vanished**: `wt.path` is no longer
+/// a git worktree (the directory is gone, or it exists but its `.git` file
+/// does not — something outside pTerminal ran `git worktree remove`/`prune`,
+/// or the folder was deleted and later re-created by a hook writing
+/// `.claude/settings.local.json` into it, which is exactly the shape a user
+/// hit: a tab that could not be closed at all because both Merge and Discard
+/// began with `is_dirty`, whose `git status` died with "not a git repository"
+/// and left the tab open with an error dialog, forever).
+///
+/// There is no working tree to be dirty, so the only thing that can still
+/// hold the user's work is the branch: with `merge` it is merged into the
+/// main checkout first (a conflict surfaces like any other merge failure and
+/// the tab stays open), then deleted; without `merge` it is just deleted. A
+/// branch that no longer exists is not an error — whatever removed the
+/// worktree may have removed it too. The stale registration is pruned
+/// first so the path can be reused, and a leftover directory is removed
+/// only if it holds nothing but bookkeeping (see `remove_bookkeeping_dir`).
+pub fn reap_vanished_worktree(repo: &Path, wt: &WorktreeInfo, merge: bool) -> Result<(), GitError> {
+    worktree_prune(repo)?;
+    if branch_exists(repo, &wt.branch) {
+        if merge {
+            merge_branch(repo, &wt.branch)?;
+        }
+        delete_branch(repo, &wt.branch)?;
+    }
+    remove_bookkeeping_dir(&wt.path);
+    Ok(())
+}
+
+/// Deletes `dir` if — and only if — it contains nothing but
+/// [`OUR_SETTINGS`] (and the `.claude/` directory holding it). That is the
+/// residue a vanished worktree leaves behind when a hook re-created the
+/// folder; anything else in there might be the user's, so the directory is
+/// left alone and the tab still closes (nothing here is an error).
+fn remove_bookkeeping_dir(dir: &Path) {
+    fn only_bookkeeping(dir: &Path, root: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else { return false };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            let ok = if path.is_dir() {
+                rel == ".claude" && only_bookkeeping(&path, root)
+            } else {
+                rel == OUR_SETTINGS
+            };
+            if !ok { return false; }
+        }
+        true
+    }
+    if dir.is_dir() && only_bookkeeping(dir, dir) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +320,77 @@ mod tests {
         worktree_remove(&repo, &wt.path, false).unwrap();
         assert!(!wt.path.exists());
         delete_branch(&repo, "pt/feat-x").unwrap();
+    }
+
+    /// Commits `content` as `name` on the worktree's branch.
+    fn commit_in_worktree(wt: &WorktreeInfo, name: &str, content: &str) {
+        std::fs::write(wt.path.join(name), content).unwrap();
+        run(&["-C".into(), wt.path.display().to_string(), "add".into(), ".".into()]).unwrap();
+        run(&["-C".into(), wt.path.display().to_string(),
+            "-c".into(), "user.email=t@t".into(), "-c".into(), "user.name=t".into(),
+            "commit".into(), "-m".into(), "agent work".into()]).unwrap();
+    }
+
+    /// The user-reported shape: the worktree's `.git` file is gone (its
+    /// registration too), the folder was re-created holding only our
+    /// settings file. Merge must still land the branch's commits, the branch
+    /// must go, the registration must be pruned so the path is reusable, and
+    /// the bookkeeping-only folder must be cleaned up.
+    #[test]
+    fn reap_vanished_worktree_merges_branch_and_cleans_bookkeeping_dir() {
+        let dir = temp_repo();
+        let repo = dir.path().join("repo");
+        let wt = worktree_add(&repo, "feat-v").unwrap();
+        commit_in_worktree(&wt, "new.txt", "from agent");
+
+        // Vanish it the way the field did: directory gone, registration
+        // pruned by someone else, folder re-created by a hook write.
+        std::fs::remove_dir_all(&wt.path).unwrap();
+        worktree_prune(&repo).unwrap();
+        std::fs::create_dir_all(wt.path.join(".claude")).unwrap();
+        std::fs::write(wt.path.join(OUR_SETTINGS), "{}").unwrap();
+        assert!(!is_git_repo(&wt.path));
+        assert!(is_dirty(&wt.path).is_err(), "premise: git status fails here");
+
+        reap_vanished_worktree(&repo, &wt, true).unwrap();
+        assert!(repo.join("new.txt").exists(), "the branch's commit must be merged");
+        assert!(!branch_exists(&repo, &wt.branch));
+        assert!(!wt.path.exists(), "a folder holding only our settings file is removed");
+        // The path is reusable: no stale registration left behind.
+        worktree_add(&repo, "feat-v").unwrap();
+    }
+
+    /// Discard on a vanished worktree drops the branch without merging, and
+    /// a leftover folder with anything that might be the user's stays put.
+    #[test]
+    fn reap_vanished_worktree_discard_keeps_user_files() {
+        let dir = temp_repo();
+        let repo = dir.path().join("repo");
+        let wt = worktree_add(&repo, "feat-d").unwrap();
+        commit_in_worktree(&wt, "new.txt", "from agent");
+        std::fs::remove_dir_all(&wt.path).unwrap();
+        std::fs::create_dir_all(wt.path.join(".claude")).unwrap();
+        std::fs::write(wt.path.join(OUR_SETTINGS), "{}").unwrap();
+        std::fs::write(wt.path.join("notes.md"), "mine").unwrap();
+
+        reap_vanished_worktree(&repo, &wt, false).unwrap();
+        assert!(!repo.join("new.txt").exists(), "discard must not merge");
+        assert!(!branch_exists(&repo, &wt.branch));
+        assert!(wt.path.join("notes.md").exists(), "a user file keeps the folder alive");
+    }
+
+    /// Whatever removed the worktree may have removed the branch too — that
+    /// is not an error; the tab must still close.
+    #[test]
+    fn reap_vanished_worktree_without_branch_is_ok() {
+        let dir = temp_repo();
+        let repo = dir.path().join("repo");
+        let wt = worktree_add(&repo, "feat-g").unwrap();
+        std::fs::remove_dir_all(&wt.path).unwrap();
+        worktree_prune(&repo).unwrap();
+        delete_branch(&repo, &wt.branch).unwrap();
+        reap_vanished_worktree(&repo, &wt, true).unwrap();
+        assert!(!wt.path.exists());
     }
 
     #[test]
