@@ -1,6 +1,6 @@
 [package]
 name = "pterminal"
-version = "0.1.26"
+version = "0.1.27"
 edition = "2024"
 # `src/bin/pterm_hook.rs` adds a second binary target; pin `cargo run` to the
 # GUI app so it stays unambiguous without an explicit `--bin`.
@@ -22,7 +22,7 @@ members = ["crates/pterminal-core", "crates/pterminal-term"]
 # Every third-party version is pinned exactly once, here; the member crates
 # say `.workspace = true`. egui is pinned to 0.31.x because
 # `crates/pterminal-term` is a patched copy of egui_term 0.1.0 written
-# against egui 0.31, and eframe below is pinned to match — `cargo tree -i
+# against egui 0.31, and eframe below is pinned to match â€” `cargo tree -i
 # egui` must keep showing exactly one egui version.
 [workspace.dependencies]
 alacritty_terminal = "0.25.1"
@@ -51,7 +51,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 # Thai-fallback font metric checks (ui.rs): already in the tree via epaint,
-# so this adds no new download — pin the same minor.
+# so this adds no new download â€” pin the same minor.
 ab_glyph = "0.2"
 tempfile.workspace = true
 
