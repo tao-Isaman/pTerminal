@@ -155,16 +155,23 @@ impl AgentProvider {
     }
 
     /// The "Restart" launch (`Tab::respawn`): the same provider, tab id,
-    /// title, coordination paths and cwd, but **no prompt and no `--resume`**
-    /// — a restart is "bring the session back", not a re-run of whatever the
-    /// tab originally opened with, and `respawn` documents why it
-    /// deliberately doesn't resume the known `session_id` either. Expressed
-    /// as an empty-prompt, no-resume [`Self::launch`] because that is exactly
-    /// what both inline branches built before A3: `cmd /c claude` for Claude
-    /// and `codex_args(.., "", None, ..)` for Codex. Going through `launch`
-    /// also rewrites Claude's per-tab settings file — same content as at
-    /// first spawn (same id, title and paths), so that is a no-op in effect,
-    /// and it means a restart never depends on a `%TEMP%` file surviving.
+    /// title, coordination paths and cwd, **no prompt**, and `--resume`
+    /// (Claude) / `codex resume` (Codex) of `resume_session` when the tab
+    /// already knows its session id. A restart is "bring the session back",
+    /// not a re-run of whatever prompt the tab originally opened with — and
+    /// "the session" means the conversation the dead child was in the middle
+    /// of. Before this change a restart always launched a bare fresh
+    /// session, so a child that crashed mid-task (exit code `-1073740791`,
+    /// `STATUS_STACK_BUFFER_OVERRUN`, Node's fast-fail — seen live) came
+    /// back with no memory of the task; the user had to find the session id
+    /// by hand. With no known id (the child died before its `SessionStart`
+    /// hook ever reported one) this degrades to the old fresh launch.
+    /// Expressed as an empty-prompt [`Self::launch`] so it is exactly the
+    /// resume-on-launch argv `resume_saved_tabs` builds for the same tab.
+    /// Going through `launch` also rewrites Claude's per-tab settings file —
+    /// same content as at first spawn (same id, title and paths), so that is
+    /// a no-op in effect, and it means a restart never depends on a `%TEMP%`
+    /// file surviving.
     pub fn relaunch(
         self,
         tab_id: u64,
@@ -172,15 +179,16 @@ impl AgentProvider {
         context: &AgentContext,
         hook_helper: Option<&Path>,
         cwd: &Path,
+        resume_session: Option<&str>,
     ) -> anyhow::Result<Launch> {
-        self.launch(&relaunch_spec(tab_id, title, context, hook_helper, cwd))
+        self.launch(&relaunch_spec(tab_id, title, context, hook_helper, cwd, resume_session))
     }
 
     /// The argv half of [`relaunch`](Self::relaunch), with no side effects
     /// and no program resolution — the same split [`launch_args`]
     /// (Self::launch_args) is to [`launch`](Self::launch). Exists so the
-    /// "relaunch is launch with an empty prompt and no resume" invariant can
-    /// be pinned for BOTH providers on a machine with no Codex install: the
+    /// "relaunch is launch with an empty prompt and the known session"
+    /// invariant can be pinned for BOTH providers on a machine with no Codex install: the
     /// v0.1.26 release run failed on exactly that, `relaunch` resolving
     /// `codex.exe` on a CI runner that has none. Both `relaunch` and this go
     /// through [`relaunch_spec`], so they cannot drift apart.
@@ -191,8 +199,9 @@ impl AgentProvider {
         context: &AgentContext,
         hook_helper: Option<&Path>,
         cwd: &Path,
+        resume_session: Option<&str>,
     ) -> Vec<String> {
-        self.launch_args(&relaunch_spec(tab_id, title, context, hook_helper, cwd))
+        self.launch_args(&relaunch_spec(tab_id, title, context, hook_helper, cwd, resume_session))
     }
 
     /// Pure argv half of [`Self::launch`]: no disk access, only path
@@ -283,17 +292,19 @@ impl AgentProvider {
 /// resuming, else the prompt as one argument with `"` stripped (cmd's
 /// quoting would otherwise split it).
 /// The one definition of what a Restart launches: the tab's own identity and
-/// context, an empty prompt, no resume session (see `Tab::respawn` for why a
-/// restart is "bring the session back", never a re-run of the original
-/// prompt). Shared by `relaunch` and `relaunch_args`.
+/// context, an empty prompt, and the tab's known session id as the resume
+/// target (`None` → a fresh session; see `Tab::respawn` for why a restart is
+/// "bring the session back", never a re-run of the original prompt). Shared
+/// by `relaunch` and `relaunch_args`.
 fn relaunch_spec<'a>(
     tab_id: u64,
     title: &'a str,
     context: &'a AgentContext,
     hook_helper: Option<&'a Path>,
     cwd: &'a Path,
+    resume_session: Option<&'a str>,
 ) -> LaunchSpec<'a> {
-    LaunchSpec { tab_id, title, prompt: "", resume_session: None, context, hook_helper, cwd }
+    LaunchSpec { tab_id, title, prompt: "", resume_session, context, hook_helper, cwd }
 }
 
 pub fn claude_args(settings: &Path, prompt: &str, resume: Option<&str>) -> Vec<String> {
@@ -600,19 +611,42 @@ mod tests {
         );
     }
 
-    /// Respawn is the bare `cmd /c claude` the old `Tab::respawn` hard-coded
-    /// (plus A4's `--settings`): no prompt, no `--resume`, whatever the tab
-    /// knows.
+    /// Respawn of a tab with no known session id is the bare `cmd /c claude`
+    /// the old `Tab::respawn` hard-coded (plus A4's `--settings`): no
+    /// prompt, no `--resume`.
     #[test]
-    fn claude_relaunch_matches_old_respawn() {
+    fn claude_relaunch_without_session_matches_old_respawn() {
         let dir = tempfile::tempdir().unwrap();
         let launch = AgentProvider::Claude
-            .relaunch(7, "fix \"login\"", &ctx(), Some(Path::new(HELPER)), dir.path())
+            .relaunch(7, "fix \"login\"", &ctx(), Some(Path::new(HELPER)), dir.path(), None)
             .unwrap();
         assert_eq!(launch.program, "cmd.exe");
         assert_eq!(
             launch.args,
             vec!["/c".to_string(), "claude".into(), "--settings".into(), expected_settings(7)]
+        );
+    }
+
+    /// Respawn of a tab that knows its session id continues that session
+    /// (`--resume <sid>`, no prompt) — the fix for "Restart after the child
+    /// crashed with -1073740791 started a brand-new conversation".
+    #[test]
+    fn claude_relaunch_with_session_resumes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch = AgentProvider::Claude
+            .relaunch(7, "fix \"login\"", &ctx(), Some(Path::new(HELPER)), dir.path(), Some("sess-crashed"))
+            .unwrap();
+        assert_eq!(launch.program, "cmd.exe");
+        assert_eq!(
+            launch.args,
+            vec![
+                "/c".to_string(),
+                "claude".into(),
+                "--settings".into(),
+                expected_settings(7),
+                "--resume".into(),
+                "sess-crashed".into()
+            ]
         );
     }
 
@@ -655,13 +689,13 @@ mod tests {
     }
 
     /// Respawn keeps the stored coordination paths and the notify command
-    /// (the old `respawn` passed `codex_shared`/`codex_readme` through) but
-    /// drops the prompt and never resumes.
+    /// (the old `respawn` passed `codex_shared`/`codex_readme` through) and
+    /// drops the prompt; with no known session id it starts fresh.
     #[test]
     fn codex_relaunch_args_match_old_respawn() {
         let context = ctx();
         assert_eq!(
-            AgentProvider::Codex.launch_args(&spec7(&context, "", None, Path::new("D:\\repo"))),
+            AgentProvider::Codex.relaunch_args(7, "fix \"login\"", &context, Some(Path::new(HELPER)), Path::new("D:\\repo"), None),
             vec![
                 "--no-alt-screen".to_string(),
                 "-c".into(),
@@ -672,6 +706,23 @@ mod tests {
                 expected_notify(7),
             ]
         );
+    }
+
+    /// A Codex restart with a captured session id is `codex resume <sid>`,
+    /// the same shape `resume_saved_tabs` launches on app relaunch.
+    #[test]
+    fn codex_relaunch_args_with_session_resume_it() {
+        let context = ctx();
+        let args = AgentProvider::Codex.relaunch_args(
+            7,
+            "fix \"login\"",
+            &context,
+            Some(Path::new(HELPER)),
+            Path::new("D:\\repo"),
+            Some("abc-123"),
+        );
+        assert_eq!(&args[args.len() - 2..], ["resume", "abc-123"]);
+        assert!(!args.iter().any(|a| a == "--"), "a resume carries no prompt");
     }
 
     /// A shell-like context (no paths, no helper): no writable root, no
@@ -699,8 +750,9 @@ mod tests {
         );
     }
 
-    /// `relaunch` is exactly `launch` with an empty prompt and no resume —
-    /// for both providers, so the two can never drift apart again.
+    /// `relaunch` is exactly `launch` with an empty prompt and the tab's
+    /// known session id (or none) as the resume target — for both providers,
+    /// so the two can never drift apart again.
     ///
     /// Compares the pure argv halves (`relaunch_args` vs `launch_args`), not
     /// `relaunch` itself: the Codex arm of `relaunch` resolves `codex.exe` on
@@ -710,16 +762,18 @@ mod tests {
     /// machine has. `relaunch` and `relaunch_args` share `relaunch_spec`, so
     /// this comparison covers what `relaunch` actually sends.
     #[test]
-    fn relaunch_is_launch_with_no_prompt_and_no_resume() {
+    fn relaunch_is_launch_with_no_prompt_and_the_known_session() {
         let dir = tempfile::tempdir().unwrap();
         let context = ctx();
         for provider in AgentProvider::ALL {
-            let spec = spec7(&context, "", None, dir.path());
-            assert_eq!(
-                provider.relaunch_args(7, "fix \"login\"", &context, Some(Path::new(HELPER)), dir.path()),
-                provider.launch_args(&spec),
-                "{provider:?}"
-            );
+            for resume in [None, Some("sess-xyz")] {
+                let spec = spec7(&context, "", resume, dir.path());
+                assert_eq!(
+                    provider.relaunch_args(7, "fix \"login\"", &context, Some(Path::new(HELPER)), dir.path(), resume),
+                    provider.launch_args(&spec),
+                    "{provider:?} resume={resume:?}"
+                );
+            }
         }
     }
 
