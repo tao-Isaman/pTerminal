@@ -10,7 +10,7 @@ Build: `cargo build --release`, run `target\release\pterminal.exe`.
 - [ ] Keep flow: worktree listed in sidebar, survives restart, reopens as shell
 - [ ] Discard flow: dirty worktree requires second confirmation
 - [ ] F2 panel: live-updates when an agent appends to shared.md
-- [ ] Exit banner + Restart works for shell and agent tabs
+- [ ] Exit banner + Restart works for shell and agent tabs; Restart on an agent tab that has a session id continues the same conversation (`claude --resume <id>` / `codex resume <id>` visible on the child command line), not a fresh one
 - [ ] PERF: open 20 shell tabs → Task Manager: pterminal idle CPU ≈ 0%, RAM < 200MB
 - [ ] PERF: run `dir /s C:\Windows` in a BACKGROUND tab → active tab stays smooth (~60fps)
 - [ ] Corrupt %APPDATA%\pterminal\state.json by hand → app starts fresh, shows message, .bak exists
