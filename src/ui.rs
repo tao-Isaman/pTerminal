@@ -695,10 +695,11 @@ impl PtApp {
                     // terminal view still renders below it (its last
                     // on-screen frame, frozen).
                     if let Some(code) = tab.term.exited() {
+                        let has_session = tab.session_id.is_some();
                         ui.horizontal(|ui| {
                             ui.colored_label(
                                 egui::Color32::LIGHT_RED,
-                                format!("process exited with code {code}"),
+                                exit_banner_text(code, tab.kind, has_session),
                             );
                             // FINAL-REVIEW FINDING 4: no Restart button for a
                             // dead placeholder — `Tab::respawn` would poison
@@ -1009,6 +1010,40 @@ impl PtApp {
 /// focus rings) moves to green; surfaces move to the site's #212529 family.
 /// Status glyph colors (working green / needs-you amber / exited red) are
 /// semantic, not brand, and stay as they are.
+/// Windows fast-fail status (`STATUS_STACK_BUFFER_OVERRUN`, 0xC0000409),
+/// the code Node's `abort()` ends the process with on Windows. In a long
+/// Claude Code session the usual trigger is V8 running out of heap
+/// (`FATAL ERROR: Reached heap limit`), so the banner names that as the
+/// likely cause — "likely", because any fatal Node abort lands on the same
+/// code.
+const NODE_FAST_FAIL: i32 = -1073740791;
+
+/// The exit banner's text for a tab whose child exited with `code`. A bare
+/// `process exited with code -1073740791` told the user nothing (the live
+/// report was "some time ... got error process exited with code
+/// -1073740791"), so the known crash codes get a plain-language cause, the
+/// hex spelling Windows tools show, and — for an agent tab whose session id
+/// is known — a reminder that Restart continues the same conversation
+/// rather than starting over. Shell tabs and clean exits keep the short
+/// form.
+pub(crate) fn exit_banner_text(code: i32, kind: TabKind, has_session: bool) -> String {
+    let mut text = match code {
+        0 => "process exited".to_string(),
+        NODE_FAST_FAIL => format!(
+            "process crashed with code {code} (0x{:08X}, Windows fast-fail): \
+             the agent's Node process aborted, most often from running out of memory \
+             (JavaScript heap) in a long session — check the lines above for a FATAL ERROR",
+            code as u32
+        ),
+        c if c < 0 => format!("process crashed with code {c} (0x{:08X})", c as u32),
+        c => format!("process exited with code {c}"),
+    };
+    if kind == TabKind::Agent && has_session && code != 0 {
+        text.push_str(". Restart resumes this session");
+    }
+    text
+}
+
 pub(crate) fn brand_visuals() -> egui::Visuals {
     use egui::{Color32, Stroke};
     const GREEN: Color32 = Color32::from_rgb(0, 255, 171); // #00FFAB
@@ -1483,6 +1518,41 @@ mod input_bar_tests {
         let many = bar_height("l1\nl2\nl3\nl4\nl5\nl6\nl7");
         assert!(one > 0.0, "bar rendered nothing");
         assert_eq!(one, many, "bar height must not follow content: {one} vs {many}");
+    }
+}
+
+#[cfg(test)]
+mod exit_banner_tests {
+    use super::*;
+
+    #[test]
+    fn node_fast_fail_names_the_likely_cause_and_the_resume() {
+        let text = exit_banner_text(-1073740791, TabKind::Agent, true);
+        assert!(text.contains("-1073740791"), "{text}");
+        assert!(text.contains("0xC0000409"), "{text}");
+        assert!(text.contains("out of memory"), "{text}");
+        assert!(text.ends_with("Restart resumes this session"), "{text}");
+    }
+
+    #[test]
+    fn agent_without_a_session_id_gets_no_resume_promise() {
+        let text = exit_banner_text(-1073740791, TabKind::Agent, false);
+        assert!(!text.contains("resumes"), "{text}");
+    }
+
+    #[test]
+    fn other_negative_codes_show_hex_without_a_memory_guess() {
+        let text = exit_banner_text(-1073741819, TabKind::Agent, true);
+        assert!(text.contains("0xC0000005"), "{text}");
+        assert!(!text.contains("memory"), "{text}");
+        assert!(text.contains("Restart resumes"), "{text}");
+    }
+
+    #[test]
+    fn clean_and_ordinary_exits_keep_the_short_form() {
+        assert_eq!(exit_banner_text(0, TabKind::Agent, true), "process exited");
+        assert_eq!(exit_banner_text(1, TabKind::Shell, false), "process exited with code 1");
+        assert_eq!(exit_banner_text(1, TabKind::Agent, true), "process exited with code 1. Restart resumes this session");
     }
 }
 
