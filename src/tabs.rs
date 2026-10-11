@@ -368,12 +368,15 @@ impl PtApp {
     /// claims the new child's PIDs, the same dance `open_tab` runs for a
     /// brand-new tab.
     ///
-    /// **Restart vs. resume (Task 5 decision, kept unchanged here).**
-    /// `Tab::respawn` still reruns a bare fresh `cmd /c claude` — no
-    /// `--resume`, exactly as Task 3 left it. `--resume` is exclusively a
-    /// resume-ON-LAUNCH thing (`resume_saved_tabs`, above): once a tab is
-    /// live in the running app, "Restart" means "bring the process back",
-    /// not "reattach to the old conversation". Also clears `selected_child`
+    /// **Restart resumes the known session.** `Tab::respawn` reruns the
+    /// agent with `--resume <session_id>` (Codex: `codex resume`) whenever
+    /// the tab has captured its id, so a child that crashed mid-task (the
+    /// live report: `process exited with code -1073740791`) picks its
+    /// conversation back up exactly like an app relaunch (`resume_saved_tabs`,
+    /// above) would. The earlier "Restart means bring the process back, not
+    /// reattach" decision is reversed: users read Restart as "continue",
+    /// and a bare fresh session silently threw their context away. A tab
+    /// with no id yet still gets a fresh launch. Also clears `selected_child`
     /// when it pointed at THIS tab's now-gone children (`respawn` already
     /// resets `tab.children` to empty) — otherwise the info pane would keep
     /// showing a subagent row that just vanished out from under it.

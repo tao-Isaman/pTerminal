@@ -596,9 +596,12 @@ impl Tab {
     /// Rebuilds `self.term` in place after the child process has exited,
     /// reusing the tab's own identity (`id`, `cwd`, `kind`) — this is
     /// Task 12's "Restart" button. Agent tabs rerun `cmd.exe /c claude`
-    /// with **no initial prompt**: a restart is "bring the session back",
-    /// not a re-run of whatever prompt the tab originally opened with, and
-    /// the events file is truncated the same way `spawn_agent` does on
+    /// with **no initial prompt** and, when the tab already knows its
+    /// `session_id`, **`--resume <sid>`** (Codex: `codex resume <sid>`): a
+    /// restart is "bring the session back", not a re-run of whatever prompt
+    /// the tab originally opened with, and "the session" is the conversation
+    /// the dead child was in the middle of. The events file is truncated the
+    /// same way `spawn_agent` does on
     /// first spawn (a fresh child means a fresh event history — leaving
     /// stale events in place could make `status_from_events` report a
     /// leftover status from the dead process). The provider's per-tab
@@ -613,17 +616,27 @@ impl Tab {
     /// children *before* calling `respawn` and hand that snapshot to a new
     /// `PendingClaim`, the same dance `open_tab` does for a brand-new tab.
     ///
-    /// **Deliberate no-change (Task 3).** Even though this tab may have a
-    /// known `session_id` by now, restart still reruns a bare `cmd /c claude`
-    /// (`provider.relaunch`, which is `launch` with no prompt and no resume
-    /// for every provider) rather than a `--resume self.session_id` launch —
-    /// i.e. "Restart" does not `--resume`. Task 5 owns that decision (it also has
-    /// to decide what happens to `session_id`/`children` display mid-restart
-    /// app-wide); this task only guarantees the new bookkeeping fields reset
-    /// to their spawn-time defaults here exactly as `spawn_agent`/
-    /// `spawn_shell` do, same reasoning as the events-file truncation below:
-    /// a fresh child means fresh bookkeeping, not leftover state from the
-    /// dead process.
+    /// **Restart resumes the known session (bug fix).** Until this change
+    /// a restart deliberately reran a bare `cmd /c claude` with no
+    /// `--resume`, so a child that crashed mid-task (exit code
+    /// `-1073740791` = `STATUS_STACK_BUFFER_OVERRUN`, Node's fast-fail —
+    /// reported live) came back as a brand-new conversation with no memory
+    /// of the task, and the only way to continue it was to close pTerminal
+    /// and relaunch so `resume_saved_tabs` would `--resume` the saved id.
+    /// `provider.relaunch` now takes `self.session_id` and builds the very
+    /// same argv `resume_saved_tabs` would for this tab, so the Restart
+    /// button and an app relaunch agree. `session_id` is therefore **kept**,
+    /// not reset: `--resume` continues the session that id names (the
+    /// resumed child's own `SessionStart` hook reports it back regardless,
+    /// and overwrites it if Claude ever rotates the id), and nulling it
+    /// here would make a `persist()` in the pre-`SessionStart` window write
+    /// `None` into `state.json` — the exact bug `resume_saved_tabs`'s
+    /// "REVIEW FINDING 1" closed for the resume-on-launch path. A tab with
+    /// no known id (its child died before `SessionStart` ever fired) still
+    /// gets the old fresh launch. Every other bookkeeping field resets to
+    /// its spawn-time default exactly as `spawn_agent`/`spawn_shell` do,
+    /// same reasoning as the events-file truncation below: a fresh child
+    /// means fresh bookkeeping, not leftover state from the dead process.
     ///
     /// **Never call this on a dead placeholder** (`missing_dir.is_some()`,
     /// see [`spawn_dead_tab`]) — final-review finding 4. A placeholder never
@@ -675,15 +688,17 @@ impl Tab {
         let term = match self.kind {
             TabKind::Agent => {
                 let _ = std::fs::write(hooks::events_file(self.id), "");
-                // A3: the bare restart launch (no prompt, no resume — see
-                // the doc comment above) comes from the provider, built from
-                // the same `agent_ctx` the first spawn used.
+                // A3: the restart launch (no prompt; `--resume` of the
+                // known session id, if any — see the doc comment above)
+                // comes from the provider, built from the same `agent_ctx`
+                // the first spawn used.
                 let launch = self.provider.relaunch(
                     self.id,
                     &self.title,
                     &self.agent_ctx,
                     hooks::pterm_hook_exe().as_deref(),
                     &self.cwd,
+                    self.session_id.as_deref(),
                 )?;
                 TabTerm::spawn(ctx, self.id, &launch.program, &launch.args, &self.cwd)?
             }
@@ -693,7 +708,8 @@ impl Tab {
         self.status = AgentStatus::Unknown;
         self.root_pids = vec![];
         self.spawned_at = std::time::Instant::now();
-        self.session_id = None;
+        // `session_id` deliberately survives: the new child is `--resume`-ing
+        // exactly that session (doc comment above).
         self.transcript_path = None;
         self.ctx_tokens = None;
         self.ctx_mtime = None;
@@ -1015,7 +1031,7 @@ mod tests {
 
     /// `respawn` resets `last_activity` to "now" along with every other
     /// spawn-time bookkeeping field (`root_pids`, `spawned_at`,
-    /// `session_id`, ...) — a stale `last_activity` surviving a restart
+    /// `transcript_path`, ...) — a stale `last_activity` surviving a restart
     /// would make status.md's `last active <hms>` line describe the DEAD
     /// child's last status change forever, never the fresh one's.
     #[test]
@@ -1028,6 +1044,31 @@ mod tests {
         tab.respawn(&ctx).expect("respawn");
 
         assert!(tab.last_activity >= before, "respawn must overwrite the stale sentinel with something close to now");
+
+        tab.term.write_input("exit\r");
+        assert!(wait_for(|| { tab.term.poll(); tab.term.exited().is_some() }), "shell never exited after respawn");
+    }
+
+    /// Restart-resumes-the-session fix: `respawn` must keep `session_id`
+    /// (the relaunch `--resume`s it, and the very next `persist()` must
+    /// write that id — not `None` — into `state.json`), while still resetting
+    /// the per-child bookkeeping. A shell tab stands in for the field
+    /// handling, which is identical for every kind, so no real
+    /// `claude --resume` child is spawned (see `resume.rs`'s tests for why
+    /// that would hang or leak).
+    #[test]
+    fn respawn_keeps_session_id_for_the_resume() {
+        let ctx = eframe::egui::Context::default();
+        let mut tab = spawn_shell(&ctx, 90_802, Path::new("C:\\")).expect("spawn shell");
+        tab.session_id = Some("sess-survives-restart".to_string());
+        tab.transcript_path = Some(PathBuf::from("C:\\stale\\transcript.jsonl"));
+        tab.events_seen = 7;
+
+        tab.respawn(&ctx).expect("respawn");
+
+        assert_eq!(tab.session_id.as_deref(), Some("sess-survives-restart"));
+        assert_eq!(tab.transcript_path, None, "per-child bookkeeping still resets");
+        assert_eq!(tab.events_seen, 0);
 
         tab.term.write_input("exit\r");
         assert!(wait_for(|| { tab.term.poll(); tab.term.exited().is_some() }), "shell never exited after respawn");
