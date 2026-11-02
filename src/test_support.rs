@@ -98,10 +98,6 @@ pub(crate) fn bare_app(base: PathBuf, workspaces: Vec<WsRt>, active_ws: usize) -
         partial_pending: HashSet::new(),
         selected_child: None,
         pending_submit: Vec::new(),
-        compose_text: String::new(),
-        input_bar_has_focus: false,
-        focus_input_bar: false,
-        input_bar_px: crate::ui::INPUT_BAR_PX_SEED,
         // tests never talk to the network: no check, no notice, no download
         update_check: None,
         update_available: None,

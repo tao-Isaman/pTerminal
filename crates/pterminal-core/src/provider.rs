@@ -222,16 +222,6 @@ impl AgentProvider {
         }
     }
 
-    /// Whether the tab renders pTerminal's bottom input bar
-    /// (`Tab::has_input_bar`, `ui::input_bar`). Codex uses its own native
-    /// terminal input interface (README), so the bar is Claude-only.
-    pub fn supports_input_bar(self) -> bool {
-        match self {
-            Self::Claude => true,
-            Self::Codex => false,
-        }
-    }
-
     /// Whether the one-click context handoff (`PtApp::start_handoff`) is
     /// offered. It asks the session to write a file with the `Write` tool
     /// and completes on the next `Stop` hook event — both Claude Code
@@ -781,7 +771,6 @@ mod tests {
     fn capabilities_per_provider() {
         let c = AgentProvider::Claude;
         let x = AgentProvider::Codex;
-        assert!(c.supports_input_bar() && !x.supports_input_bar());
         assert!(c.supports_handoff() && !x.supports_handoff());
         assert!(c.supports_context_readout() && !x.supports_context_readout());
         assert_eq!(c.status_on_enter(), None);

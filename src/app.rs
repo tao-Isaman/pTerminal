@@ -19,7 +19,6 @@ use crate::git;
 use crate::resources::{MachineStats, ProcSample, SamplerControl, SAMPLE_FAST};
 use crate::state;
 use crate::tabs::PendingClaim;
-use crate::term::TabKind;
 use crate::watcher;
 use crate::workspace::WsRt;
 use eframe::egui;
@@ -288,31 +287,6 @@ pub struct PtApp {
     /// own event. Fixing it properly means deferring the message *text* too,
     /// i.e. a per-tab delivery FIFO; deliberately out of scope for this fix.
     pub pending_submit: Vec<(u64, std::time::Instant)>,
-    /// pTerminal's own input bar, docked at the BOTTOM of every live agent
-    /// tab (user-requested layout): text is composed in a normal egui field
-    /// and sent to claude as ONE bracketed paste + the usual deferred
-    /// Enter, so Claude Code's composer echo (which garbles per-keystroke
-    /// Thai combining marks — upstream, probe-verified in
-    /// `thai_composer_probe`) never sees individual keystrokes.
-    /// `compose_text` is the bar's buffer.
-    pub compose_text: String,
-    /// Mirrors the bar TextEdit's egui focus, set every frame the bar
-    /// renders (same convention as `ctx_panel_has_focus`); the terminal
-    /// stands down while `true`, and clicking the terminal grid naturally
-    /// steals egui focus back for raw interactions (menus, trust prompts,
-    /// shift+tab).
-    pub input_bar_has_focus: bool,
-    /// One-frame focus request for the bar (Ctrl+I), consumed by the bar's
-    /// render pass the same frame `shortcuts` sets it.
-    pub focus_input_bar: bool,
-    /// Height the bar's panel occupied at its last render, logical px —
-    /// exactly what an agent tab's terminal grid loses to it. The
-    /// background size-sync in `drain_events` adds/subtracts it when the
-    /// active and background tabs differ in having a bar, so a shell↔agent
-    /// switch never lands as a PTY resize (each one forces a TUI repaint
-    /// that leaves junk rows — upstream ConPTY). Starts at
-    /// `ui::INPUT_BAR_PX_SEED` so the very first switch is exact too.
-    pub input_bar_px: f32,
     /// The once-per-launch update check ([`crate::update::spawn_update_check`],
     /// started in [`PtApp::new`]); `drain_events` polls it and clears it after
     /// the first answer (or a disconnect — the silent-failure case).
@@ -481,10 +455,6 @@ impl PtApp {
             partial_pending: HashSet::new(),
             selected_child: None,
             pending_submit: Vec::new(),
-            compose_text: String::new(),
-            input_bar_has_focus: false,
-            focus_input_bar: false,
-            input_bar_px: crate::ui::INPUT_BAR_PX_SEED,
             // once per launch; every failure mode is a silent no-op
             update_check: Some(crate::update::spawn_update_check(APP_VERSION)),
             update_available: None,
@@ -577,17 +547,13 @@ impl PtApp {
         if self.dialog_open() {
             return;
         }
-        let (t, w, cycle, open_file, save_file, compose) = ctx.input_mut(|i| {
+        let (t, w, cycle, open_file, save_file) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::T),
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::W),
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab),
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::O),
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::S),
-                // Ctrl+I toggles the Thai-safe compose strip. Consuming it
-                // steals the terminal's Ctrl+I (legacy Tab alias) — the
-                // real Tab key is a separate egui key and unaffected.
-                i.consume_key(egui::Modifiers::CTRL, egui::Key::I),
             )
         });
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2)) {
@@ -628,22 +594,10 @@ impl PtApp {
             ws.active_tab = (ws.active_tab + 1) % ws.tabs.len();
             self.selected_child = None; // Step 8: a keyboard tab switch clears it too
         }
-        // Ctrl+I: focus the bottom input bar (only meaningful on a live
-        // agent tab — a shell or placeholder has no bar to focus). The bar
-        // itself is always visible on agent tabs; this just hands it the
-        // keyboard without reaching for the mouse.
-        let agent_tab_active = ws
-            .tabs
-            .get(ws.active_tab)
-            .is_some_and(|t| t.kind == TabKind::Agent && t.missing_dir.is_none());
-        if compose && agent_tab_active {
-            self.focus_input_bar = true;
-        }
-        // Typing into the terminal grid itself still flows through
-        // untouched — clicking the grid is the raw path for menus, trust
-        // prompts and shift+tab. The 0.1.17 keystroke interception stays
-        // removed (user choice); the bottom input bar is where composed
-        // messages are typed safely instead.
+        // Typing goes straight into the terminal grid — Claude Code's own
+        // composer — for every tab kind. The 0.1.17 keystroke interception
+        // and the 0.1.19–0.1.27 bottom input bar are both gone (user
+        // choice): one input surface, no focus hand-offs.
         // Task 1: Ctrl+S saves the active editor tab, if any — a no-op
         // (silently) when no editor is active, same as every other shortcut
         // here that only fires when its target actually exists.
