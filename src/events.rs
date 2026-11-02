@@ -483,14 +483,6 @@ impl PtApp {
             .get(self.active_ws)
             .and_then(|ws| ws.tabs.get(ws.active_tab));
         let active_size = active_tab.and_then(|t| t.term.applied_size());
-        // Since 0.1.19 a live agent tab renders the bottom input bar and a
-        // shell tab doesn't, so their terminal rects differ by exactly
-        // `input_bar_px`. Syncing the active tab's raw size across that
-        // difference made every shell↔agent switch a PTY resize (= a TUI
-        // repaint that leaves junk rows behind, upstream ConPTY) — adjust
-        // the height so each background tab gets the size IT will render at.
-        let active_has_bar = active_tab.is_some_and(term::Tab::has_input_bar);
-        let bar_px = self.input_bar_px;
         let (active_ws_idx, active_tab_idx) = (
             self.active_ws,
             self.workspaces.get(self.active_ws).map(|w| w.active_tab).unwrap_or(0),
@@ -502,15 +494,10 @@ impl PtApp {
         for (ws_idx, ws) in self.workspaces.iter_mut().enumerate() {
             for (tab_idx, tab) in ws.tabs.iter_mut().enumerate() {
                 tab.term.poll();
-                if let Some((mut l, f)) = active_size {
+                if let Some((l, f)) = active_size {
                     if !(ws_idx == active_ws_idx && tab_idx == active_tab_idx)
                         && tab.term.exited().is_none()
                     {
-                        match (active_has_bar, tab.has_input_bar()) {
-                            (false, true) => l.height -= bar_px,
-                            (true, false) => l.height += bar_px,
-                            _ => {}
-                        }
                         tab.term.resize_to(l, f);
                     }
                 }

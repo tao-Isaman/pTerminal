@@ -650,17 +650,6 @@ impl Tab {
     /// `app.rs` routes placeholders to `respawn_missing_dir_tab` (a genuine
     /// `spawn_agent`) instead, and hides the Restart button for them so the
     /// path isn't reachable from the UI at all.
-    /// True when this tab renders the bottom input bar (`ui::input_bar`):
-    /// a live agent tab whose provider wants one — not a shell, not a dead
-    /// placeholder, not exited, and not Codex (`supports_input_bar`: it has
-    /// its own native input UI). The one definition `central_ui` (whether to
-    /// draw it) and the background size-sync (how much terrain it takes)
-    /// both read.
-    pub fn has_input_bar(&self) -> bool {
-        self.kind == TabKind::Agent && self.provider.supports_input_bar()
-            && self.missing_dir.is_none() && self.term.exited().is_none()
-    }
-
     /// True while this tab could be changing the numbers the resource
     /// sampler feeds the sidebar (its CPU/mem column, its worker-process
     /// rows). `PtApp::drain_events` runs the sampler at `SAMPLE_FAST` while
