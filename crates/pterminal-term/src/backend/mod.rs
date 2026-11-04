@@ -83,6 +83,9 @@ pub struct TerminalBackend {
     size: TerminalSize,
     snapshot: GridSnapshot,
     links: LinkDetector,
+    /// pTerminal perf delta: last frame's shapes per viewport row
+    /// (`view::RowShapeCache`), kept with the terminal they were built from.
+    row_cache: crate::view::RowShapeCache,
 }
 
 impl TerminalBackend {
@@ -134,7 +137,15 @@ impl TerminalBackend {
             size: terminal_size,
             snapshot,
             links: LinkDetector::new(spawn_cwd),
+            row_cache: Default::default(),
         })
+    }
+
+    /// pTerminal perf delta: the synced snapshot together with the row shape
+    /// cache the view paints it through — two disjoint borrows the view
+    /// cannot take through separate method calls.
+    pub(crate) fn content_and_row_cache(&mut self) -> (&RenderableContent, &mut crate::view::RowShapeCache) {
+        (self.snapshot.content(), &mut self.row_cache)
     }
 
     /// pTerminal delta (Ctrl+click file paths): the pending "open this file

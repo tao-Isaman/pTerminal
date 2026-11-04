@@ -14,6 +14,7 @@ use egui::{Id, PointerButton};
 
 use crate::backend::BackendCommand;
 use crate::backend::RenderableContent;
+use crate::backend::VisibleCell;
 use crate::backend::TerminalBackend;
 use crate::backend::{LinkAction, MouseButton, SelectionType};
 use crate::bindings::{BindingAction, BindingsLayout, InputKind};
@@ -692,6 +693,174 @@ fn emit_grid_shapes(
     geom: Option<RunGeometry>,
     shapes: &mut Vec<Shape>,
 ) {
+    emit_cells_shapes(
+        content,
+        content.cells(),
+        theme,
+        font_id,
+        fonts,
+        layout_min,
+        global_bg,
+        mouse_grid_point,
+        geom,
+        shapes,
+    );
+}
+
+/// pTerminal perf delta: per-row shape cache.
+///
+/// The frame loop repaints the visible terminal on every frame that has new
+/// output, and building its shapes (run coalescing, per-cell glyphs,
+/// sprites) is the most expensive part: ~160µs for a dense 200x50 screen.
+/// Most frames from an agent TUI change a few rows (a spinner, a status
+/// line, the line being typed); the rest are identical to last frame.
+/// Ghostty rebuilds only dirty rows (`src/renderer/generic.zig`,
+/// `rebuildCells`); this is the same idea for egui: each row's shapes are
+/// kept and reused while its snapshot version (`RenderableContent::
+/// row_version`, renewed whenever the row is re-copied from the terminal)
+/// and the cursor, selection and hovered link on it are unchanged.
+///
+/// Shapes are cached at their absolute positions, not translated between
+/// rows: sprites are snapped to device pixels from absolute coordinates, so
+/// a translated copy could land half a pixel off its neighbours. A scroll
+/// therefore rebuilds every row, as before.
+#[derive(Default)]
+pub(crate) struct RowShapeCache {
+    /// Everything that affects every row at once; any change clears the cache.
+    frame_key: u64,
+    /// Per viewport row: the key it was built under, and its shapes.
+    rows: Vec<(u64, Vec<Shape>)>,
+    /// Rows rebuilt during the last frame (tests).
+    #[cfg(test)]
+    rebuilt: usize,
+}
+
+/// A small Fx-style hasher for cache keys.
+#[derive(Clone, Copy)]
+struct Fx(u64);
+
+impl Fx {
+    fn new() -> Self {
+        Self(0)
+    }
+
+    fn add(&mut self, v: u64) -> &mut Self {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        self
+    }
+
+    fn point(&mut self, p: TerminalGridPoint) -> &mut Self {
+        self.add(p.line.0 as u32 as u64).add(p.column.0 as u64)
+    }
+}
+
+fn color_key(c: egui::Color32) -> u64 {
+    u32::from_le_bytes(c.to_array()) as u64
+}
+
+/// [`emit_grid_shapes`] through a [`RowShapeCache`]: the same shapes, with
+/// unchanged rows cloned from the last frame instead of rebuilt.
+#[allow(clippy::too_many_arguments)]
+fn emit_grid_shapes_cached(
+    cache: &mut RowShapeCache,
+    content: &RenderableContent,
+    theme: &TerminalTheme,
+    font_id: &egui::FontId,
+    fonts: &egui::epaint::text::Fonts,
+    layout_min: Pos2,
+    global_bg: egui::Color32,
+    mouse_grid_point: TerminalGridPoint,
+    geom: Option<RunGeometry>,
+    shapes: &mut Vec<Shape>,
+) {
+    let mut frame = Fx::new();
+    frame
+        .add(layout_min.x.to_bits() as u64)
+        .add(layout_min.y.to_bits() as u64)
+        .add(content.terminal_size.cell_width as u64)
+        .add(content.terminal_size.cell_height as u64)
+        .add(fonts.pixels_per_point().to_bits() as u64)
+        .add(font_id.size.to_bits() as u64)
+        .add(geom.map_or(0, |g| (g.letter_spacing.to_bits() as u64) << 32 | g.origin_dx.to_bits() as u64))
+        .add(color_key(global_bg))
+        .add(content.terminal_mode.bits() as u64)
+        .add(content.display_offset as u64)
+        .add(content.rows() as u64);
+    if cache.frame_key != frame.0 || cache.rows.len() != content.rows() {
+        cache.frame_key = frame.0;
+        cache.rows.clear();
+        cache.rows.resize_with(content.rows(), || (0, Vec::new()));
+    }
+    #[cfg(test)]
+    {
+        cache.rebuilt = 0;
+    }
+
+    let display_offset = content.display_offset as i32;
+    let cursor_color = color_key(theme.get_color(content.cursor.fg));
+    for row in 0..content.rows() {
+        let line = row as i32 - display_offset;
+        let mut key = Fx::new();
+        key.add(content.row_version(row));
+        if content.cursor_point.line.0 == line {
+            key.add(1).add(content.cursor_point.column.0 as u64).add(cursor_color);
+        }
+        if let Some(sel) = &content.selectable_range {
+            if sel.start.line.0 <= line && line <= sel.end.line.0 {
+                key.add(2).point(sel.start).point(sel.end).add(sel.is_block as u64);
+            }
+        }
+        if let Some(link) = &content.hovered_hyperlink {
+            if link.start().line.0 <= line && line <= link.end().line.0 {
+                key.add(3)
+                    .point(*link.start())
+                    .point(*link.end())
+                    .add(link.contains(&mouse_grid_point) as u64);
+            }
+        }
+        // 0 is the "never built" key of an empty slot; keep real keys off it.
+        let key = key.0 | 1;
+
+        let slot = &mut cache.rows[row];
+        if slot.0 != key {
+            slot.1.clear();
+            emit_cells_shapes(
+                content,
+                content.row_cells(row),
+                theme,
+                font_id,
+                fonts,
+                layout_min,
+                global_bg,
+                mouse_grid_point,
+                geom,
+                &mut slot.1,
+            );
+            slot.0 = key;
+            #[cfg(test)]
+            {
+                cache.rebuilt += 1;
+            }
+        }
+        shapes.extend_from_slice(&slot.1);
+    }
+}
+
+/// The grid painter proper, over any run of `cells` from `content` (all of
+/// them, or one row for [`emit_grid_shapes_cached`]).
+#[allow(clippy::too_many_arguments)]
+fn emit_cells_shapes<'c>(
+    content: &RenderableContent,
+    cells: impl Iterator<Item = VisibleCell<'c>>,
+    theme: &TerminalTheme,
+    font_id: &egui::FontId,
+    fonts: &egui::epaint::text::Fonts,
+    layout_min: Pos2,
+    global_bg: egui::Color32,
+    mouse_grid_point: TerminalGridPoint,
+    geom: Option<RunGeometry>,
+    shapes: &mut Vec<Shape>,
+) {
     let cell_height = content.terminal_size.cell_height as f32;
     let cell_width = content.terminal_size.cell_width as f32;
     let is_app_cursor_mode =
@@ -718,7 +887,7 @@ fn emit_grid_shapes(
     // (P2: each item is a `VisibleCell` copied out of a compact row buffer,
     // with the same `c`/`fg`/`bg`/`flags`/`zerowidth()` the `Cell` clone
     // had — nothing below reads anything else.)
-    for cell in content.cells() {
+    for cell in cells {
         let point = &cell.point;
         let flags = cell.flags;
         if flags.contains(cell::Flags::WIDE_CHAR_SPACER) {
@@ -1563,7 +1732,7 @@ impl<'a> TerminalView<'a> {
         // content immutably for the render loop.
         self.backend.sync();
         let ghost = self.ghost(state);
-        let content = self.backend.last_content();
+        let (content, row_cache) = self.backend.content_and_row_cache();
         let layout_min = layout.rect.min;
         let layout_max = layout.rect.max;
         let cell_height = content.terminal_size.cell_height as f32;
@@ -1595,7 +1764,8 @@ impl<'a> TerminalView<'a> {
         // the two shape lists are pixel-identical.
         let font_id = self.font.font_type();
         let geom = run_geometry(&fonts, &font_id, cell_width);
-        emit_grid_shapes(
+        emit_grid_shapes_cached(
+            row_cache,
             content,
             self.theme,
             &font_id,
@@ -2937,6 +3107,113 @@ mod run_coalescing_tests {
         for x in mark_x {
             assert!(x < base_right - 1.0, "mark at {x} not moved left of the overstrike pen {base_right}");
         }
+    }
+
+    /// Paints `content` through `cache` and also uncached; asserts the two
+    /// agree exactly and returns how many rows the cached path rebuilt.
+    fn paint_cached(cache: &mut RowShapeCache, content: &RenderableContent) -> usize {
+        let fonts = fonts(1.0);
+        let font_id = font_id();
+        let theme = &*DEFAULT_THEME;
+        let global_bg = theme.get_color(Color::Named(NamedColor::Background));
+        let geom = run_geometry(&fonts, &font_id, content.terminal_size.cell_width as f32);
+        let mouse = TerminalGridPoint::new(Line(0), Column(0));
+        let origin = Pos2::new(3.5, 7.25);
+        let mut cached = Vec::new();
+        emit_grid_shapes_cached(cache, content, theme, &font_id, &fonts, origin, global_bg, mouse, geom, &mut cached);
+        let mut fresh = Vec::new();
+        emit_grid_shapes(content, theme, &font_id, &fonts, origin, global_bg, mouse, geom, &mut fresh);
+        assert_eq!(format!("{cached:?}"), format!("{fresh:?}"), "cached shapes differ from a fresh build");
+        cache.rebuilt
+    }
+
+    /// pTerminal perf delta: the row cache reproduces the uncached painter
+    /// exactly, and rebuilds only what changed — rows re-copied from the
+    /// terminal, and rows the cursor or a selection moved onto or off.
+    #[test]
+    fn row_cache_rebuilds_only_changed_rows() {
+        let mut term = Term::new(Config::default(), &Dim, Noop);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, dense_ansi().as_bytes());
+        let mut content = render_content(&dense_ansi());
+        let mut cache = RowShapeCache::default();
+
+        assert_eq!(paint_cached(&mut cache, &content), LINES, "first frame builds every row");
+        assert_eq!(paint_cached(&mut cache, &content), 0, "an unchanged frame rebuilds nothing");
+
+        // One row re-copied from the terminal (as damage would): one rebuild.
+        parser.advance(&mut term, b"\x1b[10;5Hchanged");
+        content.capture_rows(term.grid(), &[9]);
+        assert_eq!(paint_cached(&mut cache, &content), 1);
+
+        // The cursor moves from its row to another: those two rows.
+        content.cursor_point = Point::new(Line(20), Column(3));
+        assert_eq!(paint_cached(&mut cache, &content), 2);
+
+        // A selection over rows 30..=32 appears.
+        content.selectable_range = Some(alacritty_terminal::selection::SelectionRange::new(
+            Point::new(Line(30), Column(2)),
+            Point::new(Line(32), Column(9)),
+            false,
+        ));
+        assert_eq!(paint_cached(&mut cache, &content), 3);
+
+        // A full re-capture renews every row.
+        content.capture_cells(term.grid());
+        assert_eq!(paint_cached(&mut cache, &content), LINES);
+    }
+
+    /// Reference measurement (run with `--release -- --ignored --nocapture`):
+    /// grid shape build time for a dense 200x50 screen, uncached versus
+    /// through the row cache with nothing changed and with one row changed.
+    #[test]
+    #[ignore]
+    fn measure_row_cache() {
+        let fonts = fonts(1.0);
+        let font_id = font_id();
+        let theme = &*DEFAULT_THEME;
+        let global_bg = theme.get_color(Color::Named(NamedColor::Background));
+        let mouse = TerminalGridPoint::new(Line(0), Column(0));
+        let mut term = Term::new(Config::default(), &Dim, Noop);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, dense_ansi().as_bytes());
+        let mut content = render_content(&dense_ansi());
+        let geom = run_geometry(&fonts, &font_id, content.terminal_size.cell_width as f32);
+        let median = |mut v: Vec<std::time::Duration>| {
+            v.sort();
+            v[v.len() / 2].as_secs_f64() * 1e6
+        };
+        let mut out = Vec::new();
+        let uncached: Vec<_> = (0..300)
+            .map(|_| {
+                out.clear();
+                let t = std::time::Instant::now();
+                emit_grid_shapes(&content, theme, &font_id, &fonts, Pos2::ZERO, global_bg, mouse, geom, &mut out);
+                t.elapsed()
+            })
+            .collect();
+        let mut cache = RowShapeCache::default();
+        let mut frame = |content: &RenderableContent, cache: &mut RowShapeCache| {
+            out.clear();
+            let t = std::time::Instant::now();
+            emit_grid_shapes_cached(cache, content, theme, &font_id, &fonts, Pos2::ZERO, global_bg, mouse, geom, &mut out);
+            t.elapsed()
+        };
+        frame(&content, &mut cache);
+        let unchanged: Vec<_> = (0..300).map(|_| frame(&content, &mut cache)).collect();
+        let one_row: Vec<_> = (0..300)
+            .map(|i| {
+                parser.advance(&mut term, format!("\x1b[10;5H{i:06}").as_bytes());
+                content.capture_rows(term.grid(), &[9]);
+                frame(&content, &mut cache)
+            })
+            .collect();
+        println!(
+            "dense 200x50 shape build: uncached {:.1}us, cached unchanged {:.1}us, cached one row changed {:.1}us",
+            median(uncached),
+            median(unchanged),
+            median(one_row),
+        );
     }
 
     fn paint_both(
