@@ -29,3 +29,7 @@ the crate hard-codes. Every change is marked `pTerminal delta` in the source.
    was queued with nothing to wake the loop. The inbox ConPTY masked this by
    closing its pipe on exit; Windows Terminal's ConPTY does not. `register`
    now posts the wake itself when the exit already happened.
+5. **Public emoji classifiers** (`term/mod.rs`). `is_extended_pictographic`
+   and `is_regional_indicator`, added for change 3, are `pub` so the renderer
+   decides which cells to draw as colour emoji by the same rules the grid
+   used to lay them out.

@@ -2613,7 +2613,7 @@ pub mod test {
 }
 
 /// pTerminal delta: regional indicator symbols, which pair up into flags.
-fn is_regional_indicator(c: char) -> bool {
+pub fn is_regional_indicator(c: char) -> bool {
     matches!(c, '\u{1F1E6}'..='\u{1F1FF}')
 }
 
@@ -2621,7 +2621,7 @@ fn is_regional_indicator(c: char) -> bool {
 /// property, covering the blocks emoji are drawn from. Used only to decide
 /// whether a codepoint after a ZWJ, or a skin-tone modifier, continues an
 /// emoji cluster.
-fn is_extended_pictographic(c: char) -> bool {
+pub fn is_extended_pictographic(c: char) -> bool {
     matches!(c,
         '\u{00A9}' | '\u{00AE}' | '\u{203C}' | '\u{2049}' | '\u{2122}' | '\u{2139}'
         | '\u{2194}'..='\u{21AA}'

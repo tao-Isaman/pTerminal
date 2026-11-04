@@ -785,7 +785,8 @@ fn emit_grid_shapes_cached(
         .add(color_key(global_bg))
         .add(content.terminal_mode.bits() as u64)
         .add(content.display_offset as u64)
-        .add(content.rows() as u64);
+        .add(content.rows() as u64)
+        .add(crate::emoji::generation());
     if cache.frame_key != frame.0 || cache.rows.len() != content.rows() {
         cache.frame_key = frame.0;
         cache.rows.clear();
@@ -1001,6 +1002,16 @@ fn emit_cells_shapes<'c>(
             if crate::sprite::draw(cell.c, cell_rect, fg, fonts.pixels_per_point(), shapes) {
                 continue;
             }
+            // Emoji in a wide cell are drawn in colour from Segoe UI Emoji
+            // (`crate::emoji`); a cluster without a colour glyph is text.
+            let zerowidth = cell.zerowidth().unwrap_or(&[]);
+            if is_wide_char
+                && crate::emoji::is_emoji_cluster(cell.c, zerowidth)
+                && let Some(shape) = crate::emoji::shape(cell.c, zerowidth, cell_rect, fonts.pixels_per_point())
+            {
+                shapes.push(shape);
+                continue;
+            }
             paint_cell_text(
                 fonts,
                 font_id,
@@ -1025,9 +1036,11 @@ fn is_thai_mark(c: char) -> bool {
 }
 
 /// pTerminal delta: the zero-width characters of a cell that are actually
-/// drawn. The grid now keeps a whole emoji cluster in one cell (the vendored
-/// alacritty's `join_grapheme`), but egui has no emoji ZWJ ligatures and no
-/// colour/text variants, so the joiners are dropped here: VS15/VS16, a ZWJ
+/// drawn as text. The grid keeps a whole emoji cluster in one cell (the
+/// vendored alacritty's `join_grapheme`), and a wide emoji cell is normally
+/// drawn in colour by `crate::emoji`, which handles ZWJ sequences itself.
+/// When it falls back to text (no colour glyph, no Segoe UI Emoji), egui has
+/// no ZWJ ligatures and no colour/text variants, so the joiners are dropped: VS15/VS16, a ZWJ
 /// together with the codepoint it joins, and skin-tone modifiers. Drawing
 /// them would put two or three glyphs side by side in space meant for one
 /// cluster. Everything else (combining marks, a flag's second regional
@@ -1744,6 +1757,9 @@ impl<'a> TerminalView<'a> {
         // `Context` per cell per frame. `Fonts` is an `Arc` wrapper; one clone
         // up front serves the entire loop.
         let fonts = painter.fonts(|f| f.clone());
+        // pTerminal delta (colour emoji): textures are uploaded through the
+        // painter's context (`crate::emoji`).
+        crate::emoji::set_context(painter.ctx());
 
         // pTerminal perf delta: shape-count/build-time readout — see
         // `shape_stats`. Debug builds only; release keeps the hot path free
@@ -3065,6 +3081,48 @@ mod run_coalescing_tests {
             }
             assert_eq!(checked, 6, "every symbol must have been painted");
         }
+    }
+
+    /// Wide emoji cells become one textured rectangle each, exactly their
+    /// two cells; VS15 keeps a character in text presentation.
+    #[test]
+    fn colour_emoji_are_drawn_as_textures_and_text_stays_text() {
+        let ctx = egui::Context::default();
+        crate::emoji::set_context(&ctx);
+        let fonts = fonts(1.0);
+        let font_id = font_id();
+        let theme = &*DEFAULT_THEME;
+        let global_bg = theme.get_color(Color::Named(NamedColor::Background));
+        let mouse = TerminalGridPoint::new(Line(5), Column(5));
+
+        // 😀, a ZWJ profession, ❤ with VS16, and ❤ with VS15 (text).
+        let content = render_content(
+            "a\u{1F600}b \u{1F468}\u{200D}\u{1F4BB} \u{2764}\u{FE0F} \u{2764}\u{FE0E}",
+        );
+        let mut shapes = Vec::new();
+        emit_grid_shapes(&content, theme, &font_id, &fonts, Pos2::ZERO, global_bg, mouse, None, &mut shapes);
+
+        let images: Vec<Rect> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Mesh(m) if m.texture_id != egui::TextureId::default() => {
+                    Some(Rect::from_points(&m.vertices.iter().map(|v| v.pos).collect::<Vec<_>>()))
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 3, "three colour emoji, the VS15 heart stays text");
+        // Each fills its two cells exactly: 😀 sits in columns 1–2.
+        assert_eq!(images[0], Rect::from_min_size(Pos2::new(CELL_W as f32, 0.0), Vec2::new(2.0 * CELL_W as f32, CELL_H as f32)));
+        let text: String = shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(!text.contains('\u{1F600}'), "😀 is not also drawn as text");
+        assert!(text.contains('a') && text.contains('b'));
     }
 
     /// Thai marks on a tall consonant are drawn where the font's shaping

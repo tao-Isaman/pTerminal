@@ -81,6 +81,13 @@ and [notification documentation](https://learn.chatgpt.com/docs/config-file/conf
   tall stem. Without the font it falls back to overstrike.
 - **Box drawing, block elements and braille** are drawn as geometry snapped to device
   pixels, so borders and blocks tile without seams between cells or rows.
+- **CJK**: Chinese, Japanese and Korean fall back to Windows' own CJK fonts. Han characters
+  follow your Windows locale (Yu Gothic for Japanese, Microsoft JhengHei for Traditional
+  Chinese, Malgun Gothic for Korean, Microsoft YaHei otherwise), and Malgun Gothic always
+  covers Hangul.
+- **Colour emoji** are drawn from Segoe UI Emoji's colour layers (rasterised with
+  tiny-skia), so ZWJ sequences, skin tones and keycaps show as one emoji. Flags show as
+  letters, as elsewhere on Windows. An emoji followed by VS15 stays a text glyph.
 - **ConPTY**: the installer ships Windows Terminal's `conpty.dll` and `OpenConsole.exe`
   (MIT, see `THIRD-PARTY-NOTICES.txt`), loaded only from pTerminal's own folder. It measures
   text by grapheme cluster, and the terminal grid lays out emoji clusters (VS16, skin tones,

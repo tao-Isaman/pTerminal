@@ -1011,7 +1011,7 @@ pub(crate) fn install_system_font_fallbacks(ctx: &egui::Context) {
     ctx.set_fonts(system_font_definitions());
 }
 
-/// egui's bundled fonts plus two Windows system fonts appended as the
+/// egui's bundled fonts plus Windows system fonts appended as the
 /// *lowest-priority* fallbacks in both families, in this order:
 ///
 /// 1. a Thai-capable font ([`thai_font_bytes`]) — egui bundles no Thai;
@@ -1019,7 +1019,9 @@ pub(crate) fn install_system_font_fallbacks(ctx: &egui::Context) {
 ///    glyphs Claude Code draws on every screen: the `⎿` tool-result elbow,
 ///    the `✻ ✶ ✢ ✽` spinner frames, `✗` and `⧉`. Without it each rendered
 ///    as a replacement box (measured in a probe against the real font
-///    stack), which read as garbled output.
+///    stack), which read as garbled output;
+/// 3. CJK fonts ([`cjk_font_files`]) — egui bundles none, so Chinese,
+///    Japanese and Korean text rendered as replacement boxes.
 ///
 /// Bundled fonts keep first priority, so Latin/UI text and the status-marker
 /// glyphs are untouched; only code points they lack fall through. Either
@@ -1033,14 +1035,75 @@ pub(crate) fn install_system_font_fallbacks(ctx: &egui::Context) {
 /// positioning misrenders badly enough to matter.
 pub(crate) fn system_font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
-    for (name, bytes) in [("thai-fallback", thai_font_bytes()), ("symbol-fallback", symbol_font_bytes())] {
+    let mut fallbacks = vec![
+        ("thai-fallback".to_string(), thai_font_bytes()),
+        ("symbol-fallback".to_string(), symbol_font_bytes()),
+    ];
+    for file in cjk_font_files(&user_locale_name()) {
+        fallbacks.push((format!("cjk-{file}"), font_file(file)));
+    }
+    for (name, bytes) in fallbacks {
         let Some(bytes) = bytes else { continue };
-        fonts.font_data.insert(name.into(), egui::FontData::from_owned(bytes).into());
+        // Index 0 of each font collection (.ttc) is its regular UI face.
+        fonts.font_data.insert(name.clone(), egui::FontData::from_owned(bytes).into());
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().push(name.into());
+            fonts.families.entry(family).or_default().push(name.clone());
         }
     }
     fonts
+}
+
+/// A font file from the Windows fonts folder.
+fn font_file(file: &str) -> Option<Vec<u8>> {
+    let dir = PathBuf::from(std::env::var_os("WINDIR")?).join("Fonts");
+    std::fs::read(dir.join(file)).ok()
+}
+
+/// The CJK fallback font files for a user whose Windows locale is `locale`
+/// (a BCP-47 name such as `ja-JP`), those present on disk only.
+///
+/// Chinese, Japanese and Korean share the unified Han ideographs but draw
+/// many of them differently, so the Han font follows the locale: Yu Gothic
+/// for Japanese, Microsoft JhengHei for Traditional Chinese, Malgun Gothic
+/// for Korean, and Microsoft YaHei otherwise. Each covers Han, kana and CJK
+/// punctuation. Only Malgun Gothic has Hangul, so it follows as a second
+/// fallback whenever it is not already the first.
+pub(crate) fn cjk_font_files(locale: &str) -> Vec<&'static str> {
+    let lang = locale.to_ascii_lowercase();
+    let han: &[&'static str] = if lang.starts_with("ja") {
+        &["YuGothR.ttc", "msgothic.ttc", "msyh.ttc"]
+    } else if lang.starts_with("ko") {
+        &["malgun.ttf", "msyh.ttc"]
+    } else if ["zh-tw", "zh-hk", "zh-mo", "zh-hant"].iter().any(|p| lang.starts_with(p)) {
+        &["msjh.ttc", "msyh.ttc"]
+    } else {
+        &["msyh.ttc", "msjh.ttc", "YuGothR.ttc"]
+    };
+    let present = |f: &&str| {
+        std::env::var_os("WINDIR")
+            .is_some_and(|w| PathBuf::from(w).join("Fonts").join(f).is_file())
+    };
+    let mut out: Vec<&'static str> = han.iter().copied().filter(present).take(1).collect();
+    if out.first() != Some(&"malgun.ttf") && present(&"malgun.ttf") {
+        out.push("malgun.ttf");
+    }
+    out
+}
+
+/// The user's Windows locale name, such as `en-US` or `ja-JP`; empty if it
+/// cannot be read.
+pub(crate) fn user_locale_name() -> String {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetUserDefaultLocaleName(name: *mut u16, len: i32) -> i32;
+    }
+    let mut buf = [0u16; 85]; // LOCALE_NAME_MAX_LENGTH
+    // SAFETY: `buf` is a valid, writable buffer of exactly the length passed.
+    let n = unsafe { GetUserDefaultLocaleName(buf.as_mut_ptr(), buf.len() as i32) };
+    if n <= 1 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..n as usize - 1])
 }
 
 /// Segoe UI Symbol ships with every Windows install since 7 (~2.5 MB).
@@ -1166,6 +1229,28 @@ mod tests {
         for c in ['\u{23BF}', '\u{273B}', '\u{2736}', '\u{2722}', '\u{273D}', '\u{2717}', '\u{29C9}', '\u{0E02}'] {
             assert!(fonts.has_glyphs(&mono, &c.to_string()), "U+{:04X} {c} has no glyph", c as u32);
         }
+    }
+
+    /// Chinese, Japanese and Korean resolve through the CJK fallbacks in the
+    /// terminal's family.
+    #[test]
+    fn cjk_glyphs_resolve_in_the_monospace_family() {
+        let fonts = egui::epaint::text::Fonts::new(1.0, 8 * 1024, system_font_definitions());
+        let mono = egui::FontId::monospace(14.0);
+        for c in ['中', '文', 'あ', 'カ', '한', '글', '。'] {
+            assert!(fonts.has_glyphs(&mono, &c.to_string()), "U+{:04X} {c} has no glyph", c as u32);
+        }
+    }
+
+    /// The Han font follows the locale, and Hangul is always covered.
+    #[test]
+    fn cjk_font_order_follows_the_locale() {
+        assert_eq!(cjk_font_files("ja-JP"), ["YuGothR.ttc", "malgun.ttf"]);
+        assert_eq!(cjk_font_files("zh-TW"), ["msjh.ttc", "malgun.ttf"]);
+        assert_eq!(cjk_font_files("zh-CN"), ["msyh.ttc", "malgun.ttf"]);
+        assert_eq!(cjk_font_files("en-US"), ["msyh.ttc", "malgun.ttf"]);
+        assert_eq!(cjk_font_files("ko-KR"), ["malgun.ttf"]);
+        assert!(user_locale_name().contains('-'), "the Windows locale name is readable");
     }
 
     #[test]
