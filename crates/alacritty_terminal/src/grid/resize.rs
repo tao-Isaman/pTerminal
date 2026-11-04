@@ -16,11 +16,30 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        self.resize_with(reflow, lines, columns, true)
+    }
+
+    /// pTerminal delta: [`Self::resize`] with control over whether growing the
+    /// visible area pulls lines back out of scrollback.
+    ///
+    /// `pull_scrollback: false` is for a grid fed by Windows ConPTY. ConPTY
+    /// keeps its own buffer with no scrollback and does not move its cursor
+    /// when the console grows taller; if the grid pulls history rows into
+    /// view and moves the cursor down by the same amount, every absolute
+    /// cursor position ConPTY emits afterwards lands that many rows off, and
+    /// the client's redraws leave duplicated or torn rows behind. Ghostty
+    /// turns the same behaviour off under ConPTY for the same reason
+    /// (`resize_pull_scrollback`, src/terminal/Terminal.zig).
+    pub fn resize_with<D>(&mut self, reflow: bool, lines: usize, columns: usize, pull_scrollback: bool)
+    where
+        T: ResetDiscriminant<D>,
+        D: PartialEq,
+    {
         // Use empty template cell for resetting cells due to resize.
         let template = mem::take(&mut self.cursor.template);
 
         match self.lines.cmp(&lines) {
-            Ordering::Less => self.grow_lines(lines),
+            Ordering::Less => self.grow_lines(lines, pull_scrollback),
             Ordering::Greater => self.shrink_lines(lines),
             Ordering::Equal => (),
         }
@@ -40,7 +59,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
     /// Alacritty keeps the cursor at the bottom of the terminal as long as there
     /// is scrollback available. Once scrollback is exhausted, new lines are
     /// simply added to the bottom of the screen.
-    fn grow_lines<D>(&mut self, target: usize)
+    fn grow_lines<D>(&mut self, target: usize, pull_scrollback: bool)
     where
         T: ResetDiscriminant<D>,
         D: PartialEq,
@@ -51,7 +70,10 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         self.raw.grow_visible_lines(target);
         self.lines = target;
 
-        let history_size = self.history_size();
+        // pTerminal delta: with `pull_scrollback` off, behave exactly as the
+        // empty-history case always did — content stays anchored at the top,
+        // blank rows appear at the bottom, the cursor does not move.
+        let history_size = if pull_scrollback { self.history_size() } else { 0 };
         let from_history = min(history_size, lines_added);
 
         // Move existing lines up for every line that couldn't be pulled from history.

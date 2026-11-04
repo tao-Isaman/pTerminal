@@ -102,9 +102,12 @@ impl TerminalBackend {
         let pty_config =
             pty::pty_options(settings.shell, settings.args, settings.working_directory);
         // pTerminal delta: scrollback size comes from `BackendSettings` instead of
-        // alacritty_terminal's hardcoded default.
+        // alacritty_terminal's hardcoded default. Every terminal here is fed by
+        // ConPTY, so growing the window must not pull scrollback into view
+        // (see `Grid::resize_with` in the vendored alacritty_terminal).
         let config = term::Config {
             scrolling_history: settings.scrolling_history,
+            resize_pull_scrollback: false,
             ..term::Config::default()
         };
         let terminal_size = TerminalSize::default();
