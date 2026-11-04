@@ -151,6 +151,7 @@ mod backend;
 mod bindings;
 mod font;
 mod shaping;
+mod sprite;
 // pTerminal's own per-tab wrapper (not upstream code) — see the crate doc.
 mod tab_term;
 mod theme;

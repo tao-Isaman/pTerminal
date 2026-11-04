@@ -826,6 +826,12 @@ fn emit_grid_shapes(
                 // Was `swap(&mut fg, &mut bg)`; only `fg` is read below.
                 fg = bg;
             }
+            // Box drawing, blocks and braille are drawn as geometry so they
+            // tile seamlessly (`crate::sprite`); everything else is text.
+            let cell_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_width, cell_height));
+            if crate::sprite::draw(cell.c, cell_rect, fg, fonts.pixels_per_point(), shapes) {
+                continue;
+            }
             paint_cell_text(
                 fonts,
                 font_id,
