@@ -1,0 +1,30 @@
+# Runs the test suite on both the inbox ConPTY and the Windows Terminal ConPTY
+# that ships with the installer, without building or publishing anything.
+# The release workflow does the same before it publishes; this one lets a
+# pull request (or a manual run on a branch) prove it first.
+name: conpty-check
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: fetch ConPTY
+        shell: pwsh
+        run: .github\scripts\fetch-conpty.ps1
+
+      - name: test on the inbox ConPTY
+        run: cargo test --workspace --no-fail-fast
+
+      - name: test on the bundled ConPTY
+        shell: pwsh
+        env:
+          PTERMINAL_EXPECT_CONPTY_DLL: "1"
+        run: |
+          Copy-Item installer\conpty\* target\debug\deps\
+          cargo test --workspace --no-fail-fast
