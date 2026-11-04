@@ -1184,6 +1184,11 @@ impl<T: EventListener> Handler for Term<T> {
             }
 
             self.grid[line][column].push_zerowidth(c);
+            // pTerminal delta: record the change. Upstream did not, so a mark
+            // arriving in a later chunk than its base was left out of the
+            // column-level damage (row-level consumers were still covered by
+            // the cursor row's damage).
+            self.damage.damage_line(line.0 as usize, column.0, column.0);
             return;
         }
 

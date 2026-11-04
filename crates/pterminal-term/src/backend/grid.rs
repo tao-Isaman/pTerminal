@@ -14,7 +14,7 @@ use alacritty_terminal::grid::{Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::{test::TermSize, Term, TermMode};
+use alacritty_terminal::term::{test::TermSize, Term, TermDamage, TermMode};
 // pTerminal delta 9: `Handler` brings `Term::clear_screen` into scope (it's
 // a `vte::ansi::Handler` trait method, normally invoked by the escape-code
 // parser as the child prints `\x1b[2J` etc.) so `BackendCommand::ClearScreen`
@@ -111,6 +111,14 @@ impl<'a> VisibleCell<'a> {
 pub struct RenderableContent {
     cells: Vec<SnapCell>,
     zerowidth: Vec<char>,
+    /// pTerminal perf delta: a version per row of `cells`, freshly assigned
+    /// whenever that row is (re)captured. The renderer reuses a row's shapes
+    /// while its version — and the cursor/selection/hover state on it — is
+    /// unchanged. Versions, not content hashes: a fresh number per capture
+    /// costs nothing to compute and can never collide into a stale row.
+    row_versions: Vec<u64>,
+    /// Source of `row_versions`; only ever increases.
+    next_version: u64,
     /// Cells per row of `cells`. 0 only before the first sync (no rows).
     columns: usize,
     pub display_offset: usize,
@@ -159,6 +167,41 @@ impl RenderableContent {
             })
     }
 
+    /// Number of captured viewport rows.
+    pub fn rows(&self) -> usize {
+        self.row_versions.len()
+    }
+
+    /// Version of viewport row `row` (see `row_versions`).
+    pub fn row_version(&self, row: usize) -> u64 {
+        self.row_versions[row]
+    }
+
+    fn fresh_version(&mut self) -> u64 {
+        self.next_version += 1;
+        self.next_version
+    }
+
+    /// The cells of viewport row `row`, as [`Self::cells`] yields them.
+    pub fn row_cells(&self, row: usize) -> impl Iterator<Item = VisibleCell<'_>> + '_ {
+        let columns = self.columns.max(1);
+        let line = Line(row as i32 - self.display_offset as i32);
+        let pool = &self.zerowidth;
+        self.cells[row * columns..(row + 1) * columns].iter().enumerate().map(move |(col, cell)| {
+            VisibleCell {
+                point: Point::new(line, Column(col)),
+                c: cell.c,
+                fg: cell.fg,
+                bg: cell.bg,
+                flags: cell.flags,
+                zerowidth: (cell.zw_start != NO_EXTRA).then(|| {
+                    let s = cell.zw_start as usize;
+                    &pool[s..s + cell.zw_len as usize]
+                }),
+            }
+        })
+    }
+
     /// The row holding buffer line `line`, when it is inside the viewport.
     fn viewport_row(&self, line: Line) -> Option<&[SnapCell]> {
         if self.columns == 0 {
@@ -185,6 +228,7 @@ impl RenderableContent {
         self.display_offset = display_offset;
         self.cells.clear();
         self.zerowidth.clear();
+        self.row_versions.clear();
         self.cells.reserve(columns * lines);
         for row in 0..lines {
             let line = Line(row as i32 - display_offset as i32);
@@ -202,6 +246,40 @@ impl RenderableContent {
                 self.cells
                     .push(SnapCell::from_cell(&Cell::default(), &mut self.zerowidth));
             }
+            let version = self.fresh_version();
+            self.row_versions.push(version);
+        }
+    }
+
+    /// pTerminal perf delta: whether [`Self::capture_rows`] can update this
+    /// snapshot in place for `grid` — same geometry, same scroll position,
+    /// and a zero-width pool not yet bloated by replaced rows (each partial
+    /// capture appends; a full capture compacts).
+    fn can_patch(&self, grid: &Grid<Cell>) -> bool {
+        self.columns == grid.columns()
+            && self.row_versions.len() == grid.screen_lines()
+            && self.display_offset == grid.display_offset()
+            && self.zerowidth.len() <= self.cells.len() + 4096
+    }
+
+    /// pTerminal perf delta: re-copies only the viewport rows in `rows` (the
+    /// terminal's damage since the last capture) and gives them new versions.
+    /// Ghostty
+    /// moved from cloning the viewport every frame to copying only dirty rows
+    /// for the same reason (`src/terminal/render.zig`): the copy runs under
+    /// the terminal lock the PTY reader needs.
+    pub(crate) fn capture_rows(&mut self, grid: &Grid<Cell>, rows: &[usize]) {
+        let columns = self.columns;
+        for &row in rows {
+            if row >= self.row_versions.len() {
+                continue;
+            }
+            let line = Line(row as i32 - self.display_offset as i32);
+            let start = row * columns;
+            for (i, cell) in grid[line].into_iter().take(columns).enumerate() {
+                self.cells[start + i] = SnapCell::from_cell(cell, &mut self.zerowidth);
+            }
+            self.row_versions[row] = self.fresh_version();
         }
     }
 
@@ -218,6 +296,8 @@ impl Default for RenderableContent {
         Self {
             cells: Vec::new(),
             zerowidth: Vec::new(),
+            row_versions: Vec::new(),
+            next_version: 0,
             columns: 0,
             display_offset: 0,
             history_size: 0,
@@ -243,6 +323,9 @@ pub(super) struct GridSnapshot {
     /// instead of re-walking the grid under the PTY lock, so frames driven
     /// by unrelated UI (typing in a panel, hovering a tab) cost nothing here.
     dirty: bool,
+    /// How many refreshes patched damaged rows instead of re-copying all.
+    #[cfg(test)]
+    partial_refreshes: usize,
 }
 
 impl GridSnapshot {
@@ -255,6 +338,8 @@ impl GridSnapshot {
             // the first real `sync` (the backend starts `dirty`) fills it.
             cells: Vec::new(),
             zerowidth: Vec::new(),
+            row_versions: Vec::new(),
+            next_version: 0,
             columns: 0,
             display_offset: 0,
             history_size: 0,
@@ -270,6 +355,8 @@ impl GridSnapshot {
         Self {
             content,
             dirty: true,
+            #[cfg(test)]
+            partial_refreshes: 0,
         }
     }
 
@@ -311,9 +398,27 @@ impl GridSnapshot {
         };
 
         self.content.cursor = terminal.grid_mut().cursor_cell().clone();
+        // pTerminal perf delta: copy only the rows the terminal reports as
+        // damaged since the last capture, when the snapshot's geometry still
+        // matches; otherwise (first sync, resize, scrollback scroll, full
+        // damage) capture everything.
+        let damaged: Option<Vec<usize>> = match terminal.damage() {
+            TermDamage::Full => None,
+            TermDamage::Partial(lines) => Some(lines.map(|d| d.line).collect()),
+        };
+        terminal.reset_damage();
         let grid = terminal.grid();
-        // sets `display_offset` too
-        self.content.capture_cells(grid);
+        match damaged {
+            Some(rows) if self.content.can_patch(grid) => {
+                #[cfg(test)]
+                {
+                    self.partial_refreshes += 1;
+                }
+                self.content.capture_rows(grid, &rows)
+            },
+            // sets `display_offset` too
+            _ => self.content.capture_cells(grid),
+        }
         self.content.history_size = grid.history_size();
         self.content.cursor_point = grid.cursor.point;
         self.content.selectable_range = selectable_range;
@@ -491,6 +596,65 @@ mod tests {
         assert_eq!(content.display_offset, term.grid().display_offset());
     }
 
+    /// Everything the painter reads from a snapshot, row by row.
+    fn visible(content: &RenderableContent) -> Vec<String> {
+        (0..content.rows())
+            .map(|r| {
+                let cells: Vec<String> = content
+                    .row_cells(r)
+                    .map(|c| format!("{:?}{:?}{:?}{:?}{:?}{:?}", c.point, c.c, c.fg, c.bg, c.flags, c.zerowidth()))
+                    .collect();
+                cells.join("")
+            })
+            .collect()
+    }
+
+    /// pTerminal perf delta: a snapshot refreshed chunk by chunk from the
+    /// terminal's damage must always equal a full re-capture — including
+    /// combining marks that arrive in later chunks than their base, one of
+    /// them entirely on its own, plus scrolling, erasing, colours, the
+    /// alternate screen and a scrolled-back viewport.
+    #[test]
+    fn damage_patched_snapshot_equals_a_full_capture() {
+        let chunks: &[&str] = &[
+            "hello \x1b[31mred\x1b[0m world\r\n",
+            "\u{0E02}",
+            "\u{0E36}",
+            "\u{0E49}\u{0E19} thai\r\n",
+            "\x1b[2;3Hoverwrite",
+            "\x1b[K",
+            "\x1b[5;1H\x1b[44m bg \x1b[0m",
+            "\u{26A0}\u{FE0F} warn\r\n",
+            "line\r\nline\r\nline\r\nline\r\nline\r\nline\r\nline\r\nline\r\n",
+            "\x1b[1;1Hspinner \u{273B}",
+            "\x1b[1;9H\u{2736}",
+            "\x1b[?1049h\x1b[2J\x1b[1;1Halt screen",
+            "\x1b[3;3Hmore",
+            "\x1b[?1049l",
+            "tail",
+        ];
+        let size = TerminalSize::default();
+        let mut term = term_with(40, 6, 100, "");
+        let mut snap = GridSnapshot::new(&mut term, size);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        snap.refresh(&mut term, size);
+        for chunk in chunks {
+            parser.advance(&mut term, chunk.as_bytes());
+            snap.refresh(&mut term, size);
+            let mut full = RenderableContent::default();
+            full.capture_cells(term.grid());
+            assert_eq!(visible(snap.content()), visible(&full), "after {chunk:?}");
+        }
+        // Scrolled back into history: the viewport moves, so it must recapture.
+        term.scroll_display(alacritty_terminal::grid::Scroll::Delta(3));
+        snap.refresh(&mut term, size);
+        let mut full = RenderableContent::default();
+        full.capture_cells(term.grid());
+        assert_eq!(visible(snap.content()), visible(&full), "scrolled back");
+
+        assert!(snap.partial_refreshes >= 5, "partial path exercised: {}", snap.partial_refreshes);
+    }
+
     #[test]
     fn snapshot_matches_display_iter() {
         assert_matches_display_iter(&term_with(COLS, LINES, 100, &dense_ansi()), "dense");
@@ -610,6 +774,17 @@ mod perf {
         }
         samples.sort();
         let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize];
+        // pTerminal perf delta: `refresh` above now patches only damaged rows
+        // (here just the cursor row — nothing new was written), so also time
+        // the full capture a scroll or resize still pays, row hashing included.
+        let mut full: Vec<Duration> = (0..iters)
+            .map(|_| {
+                let t = Instant::now();
+                snapshot.content_mut().capture_cells(term.grid());
+                t.elapsed()
+            })
+            .collect();
+        full.sort();
         let content = snapshot.content();
         let cells = content.cells().count();
         let bytes = content.buffer_bytes();
@@ -620,10 +795,12 @@ mod perf {
             .count();
         println!(
             "{name}: cells={cells} buffer={bytes}B source_arc_cells={arcs} \
-             median={:.1}us p95={:.1}us min={:.1}us (n={iters})",
+             damage-patched median={:.1}us p95={:.1}us min={:.1}us; \
+             full capture median={:.1}us (n={iters})",
             at(0.5).as_secs_f64() * 1e6,
             at(0.95).as_secs_f64() * 1e6,
             samples[0].as_secs_f64() * 1e6,
+            full[full.len() / 2].as_secs_f64() * 1e6,
         );
     }
 
