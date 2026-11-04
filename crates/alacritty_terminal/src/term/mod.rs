@@ -988,6 +988,95 @@ impl<T> Term<T> {
         self.damage_cursor();
     }
 
+    /// pTerminal delta: the cell holding the most recently printed character
+    /// on the cursor's line — the same cell upstream attaches zero-width
+    /// characters to — or `None` at the start of a line.
+    fn previous_cluster(&self) -> Option<Point> {
+        let mut column = self.grid.cursor.point.column;
+        if !self.grid.cursor.input_needs_wrap {
+            if column.0 == 0 {
+                return None;
+            }
+            column.0 -= 1;
+        }
+        let line = self.grid.cursor.point.line;
+        if self.grid[line][column].flags.contains(Flags::WIDE_CHAR_SPACER) && column.0 > 0 {
+            column.0 -= 1;
+        }
+        Some(Point::new(line, column))
+    }
+
+    /// pTerminal delta: keep the grid's cell boundaries identical to ConPTY's
+    /// when it measures by grapheme cluster (`PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES`,
+    /// set in `tty/windows/conpty.rs`). Windows Terminal's rule
+    /// (`src/types/CodepointWidthDetector.cpp`) is that a cluster is as wide
+    /// as the sum of its codepoints' widths, capped at 2, with VS16 counting
+    /// as 2. Ghostty's mode 2027 does the same. Upstream alacritty instead
+    /// gives every non-zero-width codepoint its own cell, so an emoji with
+    /// VS16 took 1 cell where ConPTY used 2, and a ZWJ family took 6, which
+    /// shifted the rest of the line and drew text over itself.
+    ///
+    /// Handles the cases that differ: VS16 (U+FE0F) widening the cluster, an
+    /// emoji modifier (skin tone) joining its base, an Extended_Pictographic
+    /// codepoint joining after a ZWJ, and a second regional indicator joining
+    /// the first (a flag). Every other zero-width codepoint keeps the
+    /// upstream path. Returns `true` when `c` was consumed.
+    ///
+    /// A cluster that would need to widen in the last column stays narrow
+    /// rather than wrap; that is the one case where the grid may still be a
+    /// cell short of ConPTY.
+    fn join_grapheme(&mut self, c: char, width: usize) -> bool {
+        let joins_as = match c {
+            '\u{FE0F}' => Some(2),
+            '\u{1F3FB}'..='\u{1F3FF}' | '\u{1F1E6}'..='\u{1F1FF}' => Some(width),
+            _ if width > 0 && is_extended_pictographic(c) => Some(width),
+            _ => None,
+        };
+        let Some(join_width) = joins_as else { return false };
+        let Some(point) = self.previous_cluster() else { return false };
+
+        let cell = &self.grid[point.line][point.column];
+        let base = cell.c;
+        let zerowidth = cell.zerowidth().unwrap_or(&[]);
+        let joins = match c {
+            '\u{FE0F}' => true,
+            '\u{1F3FB}'..='\u{1F3FF}' => is_extended_pictographic(base),
+            '\u{1F1E6}'..='\u{1F1FF}' => {
+                is_regional_indicator(base)
+                    && !zerowidth.iter().copied().any(is_regional_indicator)
+            },
+            _ => zerowidth.last() == Some(&'\u{200D}') && is_extended_pictographic(base),
+        };
+        if !joins {
+            return false;
+        }
+
+        self.grid[point.line][point.column].push_zerowidth(c);
+        let wide = self.grid[point.line][point.column].flags.contains(Flags::WIDE_CHAR);
+        if wide || join_width == 0 {
+            return true;
+        }
+
+        // Widen a narrow cluster to 2 cells, the cap. The cursor sits on the
+        // cell right after it; that cell becomes its spacer, exactly as the
+        // wide-character path below lays one out.
+        let columns = self.columns();
+        if self.grid.cursor.input_needs_wrap || point.column.0 + 1 >= columns {
+            return true;
+        }
+        self.grid[point.line][point.column].flags.insert(Flags::WIDE_CHAR);
+        self.grid.cursor.template.flags.insert(Flags::WIDE_CHAR_SPACER);
+        self.write_at_cursor(' ');
+        self.grid.cursor.template.flags.remove(Flags::WIDE_CHAR_SPACER);
+        self.damage.damage_line(point.line.0 as usize, point.column.0, point.column.0 + 1);
+        if self.grid.cursor.point.column + 1 < columns {
+            self.grid.cursor.point.column += 1;
+        } else {
+            self.grid.cursor.input_needs_wrap = true;
+        }
+        true
+    }
+
     /// Write `c` to the cell at the cursor position.
     #[inline(always)]
     fn write_at_cursor(&mut self, c: char) {
@@ -1074,6 +1163,11 @@ impl<T: EventListener> Handler for Term<T> {
             Some(width) => width,
             None => return,
         };
+
+        // pTerminal delta: grapheme joining. See `join_grapheme`.
+        if self.join_grapheme(c, width) {
+            return;
+        }
 
         // Handle zero-width characters.
         if width == 0 {
@@ -2513,6 +2607,32 @@ pub mod test {
     }
 }
 
+/// pTerminal delta: regional indicator symbols, which pair up into flags.
+fn is_regional_indicator(c: char) -> bool {
+    matches!(c, '\u{1F1E6}'..='\u{1F1FF}')
+}
+
+/// pTerminal delta: an approximation of Unicode's Extended_Pictographic
+/// property, covering the blocks emoji are drawn from. Used only to decide
+/// whether a codepoint after a ZWJ, or a skin-tone modifier, continues an
+/// emoji cluster.
+fn is_extended_pictographic(c: char) -> bool {
+    matches!(c,
+        '\u{00A9}' | '\u{00AE}' | '\u{203C}' | '\u{2049}' | '\u{2122}' | '\u{2139}'
+        | '\u{2194}'..='\u{21AA}'
+        | '\u{231A}'..='\u{23FF}'
+        | '\u{24C2}'
+        | '\u{25AA}'..='\u{25FE}'
+        | '\u{2600}'..='\u{27BF}'
+        | '\u{2934}' | '\u{2935}'
+        | '\u{2B05}'..='\u{2B55}'
+        | '\u{3030}' | '\u{303D}' | '\u{3297}' | '\u{3299}'
+        | '\u{1F000}'..='\u{1F1E5}'
+        | '\u{1F200}'..='\u{1F3FA}'
+        | '\u{1F400}'..='\u{1FAFF}'
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2920,6 +3040,55 @@ mod tests {
 
         assert_eq!(term.history_size(), 0);
         assert_eq!(term.grid.cursor.point, Point::new(Line(19), Column(0)));
+    }
+
+    /// Feeds `text` to a fresh 20x3 terminal and returns the cursor column.
+    fn cursor_after(text: &str) -> (Term<VoidListener>, usize) {
+        let size = TermSize::new(20, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        for c in text.chars() {
+            term.input(c);
+        }
+        let col = term.grid.cursor.point.column.0;
+        (term, col)
+    }
+
+    /// pTerminal delta: grapheme clusters take the cells ConPTY's grapheme
+    /// measurement gives them — sum of widths, capped at 2.
+    #[test]
+    fn grapheme_clusters_match_conpty_widths() {
+        // Warning sign + VS16: one 2-cell cluster, then 'x'.
+        let (term, col) = cursor_after("\u{26A0}\u{FE0F}x");
+        assert_eq!(col, 3);
+        assert!(term.grid[Line(0)][Column(0)].flags.contains(Flags::WIDE_CHAR));
+        assert!(term.grid[Line(0)][Column(1)].flags.contains(Flags::WIDE_CHAR_SPACER));
+        assert_eq!(term.grid[Line(0)][Column(2)].c, 'x');
+
+        // Man ZWJ woman ZWJ girl: one 2-cell cluster, not 6.
+        let (term, col) = cursor_after("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}x");
+        assert_eq!(col, 3);
+        assert_eq!(term.grid[Line(0)][Column(0)].c, '\u{1F468}');
+        assert_eq!(term.grid[Line(0)][Column(2)].c, 'x');
+
+        // Thumbs up + skin tone: 2 cells, not 4.
+        let (_, col) = cursor_after("\u{1F44D}\u{1F3FD}x");
+        assert_eq!(col, 3);
+
+        // Flag: two regional indicators make one 2-cell cluster; a third
+        // starts a new one.
+        let (term, col) = cursor_after("\u{1F1F9}\u{1F1ED}x");
+        assert_eq!(col, 3);
+        assert_eq!(term.grid[Line(0)][Column(2)].c, 'x');
+    }
+
+    /// Thai is untouched: marks stay zero-width on their base, SARA AM keeps
+    /// its own cell (ConPTY: 1 + 1 = 2 cells for the cluster too).
+    #[test]
+    fn thai_widths_are_unchanged_by_grapheme_joining() {
+        let (_, col) = cursor_after("\u{0E02}\u{0E36}\u{0E49}\u{0E19}");
+        assert_eq!(col, 2);
+        let (_, col) = cursor_after("\u{0E17}\u{0E33}");
+        assert_eq!(col, 2);
     }
 
     /// pTerminal delta: with `resize_pull_scrollback` off (ConPTY), growing
