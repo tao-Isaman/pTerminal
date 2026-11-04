@@ -29,6 +29,13 @@ SetupIconFile=..\assets\icon.ico
 Source: "..\target\release\pterminal.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; hooks locate pterm_hook.exe NEXT TO pterminal.exe (src/hooks.rs) — both ship.
 Source: "..\target\release\pterm_hook.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Windows Terminal's ConPTY (MIT), fetched, hash-pinned and signature-checked by
+; the release workflow into installer\conpty. pterminal.exe loads conpty.dll
+; only from its own directory, and conpty.dll starts OpenConsole.exe from there.
+; Without them (a local dev installer) terminals fall back to the inbox ConPTY.
+Source: "conpty\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "conpty\OpenConsole.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\pTerminal"; Filename: "{app}\pterminal.exe"

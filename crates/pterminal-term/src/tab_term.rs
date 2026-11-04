@@ -398,6 +398,32 @@ mod tests {
         assert_eq!(term.exited(), Some(3));
     }
 
+    /// Which ConPTY terminals run on. The release workflow runs the suite a
+    /// second time with the Windows Terminal `conpty.dll` and `OpenConsole.exe`
+    /// next to the test binaries and `PTERMINAL_EXPECT_CONPTY_DLL=1`; there this
+    /// proves the bundled ConPTY is the one actually loaded (with the
+    /// grapheme-width flag) and that a command runs and exits through it.
+    /// Everywhere else it pins the inbox fallback.
+    #[test]
+    fn conpty_in_use_matches_what_ships_beside_the_binary() {
+        let ctx = egui::Context::default();
+        let mut term = TabTerm::spawn(
+            &ctx,
+            2,
+            "cmd.exe",
+            &["/c".to_string(), "echo \u{26A0}\u{FE0F} \u{0E02}\u{0E36}\u{0E49} & exit 5".to_string()],
+            Path::new("C:\\"),
+        )
+        .expect("spawn cmd.exe");
+        assert!(wait_for(|| {
+            term.poll();
+            term.exited().is_some()
+        }));
+        assert_eq!(term.exited(), Some(5));
+        let expected = std::env::var("PTERMINAL_EXPECT_CONPTY_DLL").is_ok_and(|v| v == "1");
+        assert_eq!(crate::using_conpty_dll(), expected, "bundled conpty.dll in use");
+    }
+
     #[test]
     #[ignore = "requires an installed Codex CLI; only runs --help in ConPTY"]
     fn installed_codex_runs_in_embedded_terminal() {

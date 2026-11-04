@@ -63,14 +63,28 @@ struct ConptyApi {
 /// knows this flag; the inbox ConPTY gets 0.
 const PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES: u32 = 0x08;
 
+/// pTerminal delta: set once a pseudoconsole has been created through the
+/// app-directory `conpty.dll`, so the app and its tests can tell which ConPTY
+/// is in use (see [`using_conpty_dll`]).
+static USED_CONPTY_DLL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// pTerminal delta: whether the last pseudoconsole was created through the
+/// `conpty.dll` shipped next to the executable rather than the inbox ConPTY.
+/// `false` until the first terminal is spawned.
+pub fn using_conpty_dll() -> bool {
+    USED_CONPTY_DLL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl ConptyApi {
     fn new() -> Self {
         match Self::load_conpty() {
             Some(conpty) => {
                 info!("Using conpty.dll for pseudoconsole");
+                USED_CONPTY_DLL.store(true, std::sync::atomic::Ordering::Relaxed);
                 conpty
             },
             None => {
+                USED_CONPTY_DLL.store(false, std::sync::atomic::Ordering::Relaxed);
                 // Cannot load conpty.dll - use the standard Windows API.
                 info!("Using Windows API for pseudoconsole");
                 Self {

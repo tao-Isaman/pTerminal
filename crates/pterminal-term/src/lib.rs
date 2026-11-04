@@ -169,4 +169,8 @@ pub use bindings::{Binding, BindingAction, InputKind, KeyboardBinding};
 pub use font::{FontSettings, TerminalFont};
 pub use theme::{ColorPalette, TerminalTheme};
 pub use shaping::set_mark_shaping_font;
+/// Whether terminals run on the Windows Terminal `conpty.dll` shipped next to
+/// the executable (`true`) or on the inbox ConPTY. Meaningful once the first
+/// terminal has been spawned.
+pub use alacritty_terminal::tty::windows::using_conpty_dll;
 pub use view::TerminalView;
