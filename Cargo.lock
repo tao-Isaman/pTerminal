@@ -2660,6 +2660,7 @@ dependencies = [
  "pterminal-core",
  "rustybuzz",
  "tempfile",
+ "tiny-skia",
 ]
 
 [[package]]

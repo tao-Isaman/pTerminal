@@ -108,7 +108,7 @@ The plan for the project, in order:
 |  4  | Codex CLI as a first-class provider                               |   ⚠️   |
 |  5  | Correct rendering of Thai, symbols, emoji widths and box drawing  |   ✅   |
 |  6  | Competitive performance                                           |   ✅   |
-|  7  | CJK font fallback and colour emoji                                |   ❌   |
+|  7  | CJK font fallback and colour emoji                                |   ✅   |
 
 Additional details for each step:
 
@@ -170,9 +170,16 @@ row changed.
 
 #### CJK Font Fallback and Colour Emoji
 
-Not done yet. Chinese, Japanese and Korean characters have no fallback font
-and render as replacement boxes. Emoji are drawn in a single colour, and a ZWJ
-sequence such as a family shows only its first emoji. Double-line box
+Chinese, Japanese and Korean fall back to the CJK fonts that ship with
+Windows. Han characters are drawn in the style of your Windows locale: Yu
+Gothic for Japanese, Microsoft JhengHei for Traditional Chinese, Malgun Gothic
+for Korean and Microsoft YaHei otherwise, with Malgun Gothic always added for
+Hangul.
+
+Emoji are drawn in colour from Segoe UI Emoji's own colour layers, including
+Windows 11's gradients. ZWJ sequences, skin tones and keycaps are shaped as
+one emoji, so a family or a profession shows as a single picture. Flags stay
+as letters, because Segoe UI Emoji has no flag pictures. Double-line box
 characters such as `═` and `╔` are still drawn from the font.
 
 ## Troubleshooting
