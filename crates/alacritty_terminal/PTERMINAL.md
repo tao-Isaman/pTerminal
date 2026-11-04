@@ -10,3 +10,10 @@ the crate hard-codes. Every change is marked `pTerminal delta` in the source.
    and does not move its cursor when the console grows, so pulling history
    into view desynchronised every later absolute cursor move.
 
+2. **ConPTY flags and DLL loading** (`tty/windows/conpty.rs`). The Windows
+   Terminal `conpty.dll` is loaded only from the executable's own directory
+   (`LOAD_LIBRARY_SEARCH_APPLICATION_DIR`), never via the current directory
+   or PATH. When it is loaded, `CreatePseudoConsole` gets
+   `PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES` so ConPTY measures text by grapheme
+   cluster; if a DLL rejects the flag the call is retried without it instead
+   of panicking. The inbox ConPTY still gets 0.
