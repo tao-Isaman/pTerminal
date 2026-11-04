@@ -386,11 +386,11 @@ impl PtApp {
         cc.egui_ctx.set_visuals(crate::ui::brand_visuals());
         cc.egui_ctx.set_theme(eframe::egui::ThemePreference::Dark);
 
-        // Step 1b: Thai glyph fallback. egui's bundled fonts cover no Thai,
-        // so Thai text (terminal output, tab titles, shared.md) renders as
-        // boxes without this. Loaded from the OS at runtime — pTerminal
-        // still ships no font files. See `install_thai_fallback`.
-        crate::ui::install_thai_fallback(&cc.egui_ctx);
+        // Step 1b: system glyph fallbacks. egui's bundled fonts cover no
+        // Thai and miss several symbols Claude Code draws, so those render
+        // as boxes without this. Loaded from the OS at runtime — pTerminal
+        // still ships no font files. See `system_font_definitions`.
+        crate::ui::install_system_font_fallbacks(&cc.egui_ctx);
 
         let base = state::default_base();
         let (st, corrupt_msg) = state::load(&base);

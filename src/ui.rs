@@ -1000,29 +1000,47 @@ pub(crate) fn brand_visuals() -> egui::Visuals {
     v
 }
 
-/// Append a Thai-capable Windows system font as the *lowest-priority*
-/// fallback in both egui font families. Bundled fonts keep first priority,
-/// so Latin/UI text and the status-marker glyphs are untouched; only code
-/// points the bundled fonts lack (Thai) fall through to it. No candidate
-/// font on disk → no-op, exactly today's behavior.
+/// Install [`system_font_definitions`] on the app's egui context.
+pub(crate) fn install_system_font_fallbacks(ctx: &egui::Context) {
+    ctx.set_fonts(system_font_definitions());
+}
+
+/// egui's bundled fonts plus two Windows system fonts appended as the
+/// *lowest-priority* fallbacks in both families, in this order:
+///
+/// 1. a Thai-capable font ([`thai_font_bytes`]) — egui bundles no Thai;
+/// 2. Segoe UI Symbol ([`symbol_font_bytes`]) — egui's bundled fonts lack
+///    glyphs Claude Code draws on every screen: the `⎿` tool-result elbow,
+///    the `✻ ✶ ✢ ✽` spinner frames, `✗` and `⧉`. Without it each rendered
+///    as a replacement box (measured in a probe against the real font
+///    stack), which read as garbled output.
+///
+/// Bundled fonts keep first priority, so Latin/UI text and the status-marker
+/// glyphs are untouched; only code points they lack fall through. Either
+/// font missing on disk is skipped on its own. Fallback glyphs are
+/// proportional and often wider than a terminal cell; the terminal shrinks
+/// those to fit (`pterminal-term`'s `glyph_fit_scale`). pTerminal still ships
+/// no font files.
 ///
 /// ponytail: no complex text shaping — Thai combining marks render by
 /// zero-width overstrike, fine for normal text; revisit only if stacked-mark
 /// positioning misrenders badly enough to matter.
-pub(crate) fn install_thai_fallback(ctx: &egui::Context) {
-    let Some(bytes) = thai_font_bytes() else { return };
+pub(crate) fn system_font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
-    fonts
-        .font_data
-        .insert("thai-fallback".into(), egui::FontData::from_owned(bytes).into());
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push("thai-fallback".into());
+    for (name, bytes) in [("thai-fallback", thai_font_bytes()), ("symbol-fallback", symbol_font_bytes())] {
+        let Some(bytes) = bytes else { continue };
+        fonts.font_data.insert(name.into(), egui::FontData::from_owned(bytes).into());
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(name.into());
+        }
     }
-    ctx.set_fonts(fonts);
+    fonts
+}
+
+/// Segoe UI Symbol ships with every Windows install since 7 (~2.5 MB).
+pub(crate) fn symbol_font_bytes() -> Option<Vec<u8>> {
+    let dir = PathBuf::from(std::env::var_os("WINDIR")?).join("Fonts");
+    std::fs::read(dir.join("seguisym.ttf")).ok()
 }
 
 /// Leelawadee UI is Windows' standard Thai UI font (shipped since 8.1);
@@ -1126,6 +1144,24 @@ mod tests {
     /// pTerminal is Windows-only and both Thai font candidates ship with the
     /// OS, so resolution must succeed here. If this fails, Thai silently
     /// regresses to boxes — nothing else in the suite would notice.
+    #[test]
+    fn symbol_font_resolves_on_windows() {
+        let bytes = crate::ui::symbol_font_bytes().expect("Segoe UI Symbol not found");
+        assert_eq!(&bytes[..4], b"\x00\x01\x00\x00", "not a TrueType font");
+    }
+
+    /// The glyphs Claude Code draws that egui's bundled fonts lack must
+    /// resolve through the system fallbacks in the terminal's (monospace)
+    /// family — otherwise they render as replacement boxes.
+    #[test]
+    fn claude_code_and_thai_glyphs_resolve_in_the_monospace_family() {
+        let fonts = egui::epaint::text::Fonts::new(1.0, 8 * 1024, system_font_definitions());
+        let mono = egui::FontId::monospace(14.0);
+        for c in ['\u{23BF}', '\u{273B}', '\u{2736}', '\u{2722}', '\u{273D}', '\u{2717}', '\u{29C9}', '\u{0E02}'] {
+            assert!(fonts.has_glyphs(&mono, &c.to_string()), "U+{:04X} {c} has no glyph", c as u32);
+        }
+    }
+
     #[test]
     fn thai_font_resolves_on_windows() {
         let bytes = crate::ui::thai_font_bytes().expect("no Thai-capable system font found");
