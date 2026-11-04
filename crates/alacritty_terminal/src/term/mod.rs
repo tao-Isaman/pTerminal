@@ -351,6 +351,11 @@ pub struct Config {
 
     /// OSC52 support mode.
     pub osc52: Osc52,
+
+    /// pTerminal delta: whether growing the window pulls lines back out of
+    /// scrollback into view (upstream behaviour, `true`). Set `false` for a
+    /// terminal fed by Windows ConPTY; see [`Grid::resize_with`].
+    pub resize_pull_scrollback: bool,
 }
 
 impl Default for Config {
@@ -362,6 +367,7 @@ impl Default for Config {
             vi_mode_cursor_style: Default::default(),
             kitty_keyboard: Default::default(),
             osc52: Default::default(),
+            resize_pull_scrollback: true,
         }
     }
 }
@@ -667,15 +673,18 @@ impl<T> Term<T> {
         debug!("New num_cols is {num_cols} and num_lines is {num_lines}");
 
         // Move vi mode cursor with the content.
-        let history_size = self.history_size();
+        // pTerminal delta: no history is pulled in when that is turned off.
+        let history_size =
+            if self.config.resize_pull_scrollback { self.history_size() } else { 0 };
         let mut delta = num_lines as i32 - old_lines as i32;
         let min_delta = cmp::min(0, num_lines as i32 - self.grid.cursor.point.line.0 - 1);
         delta = cmp::min(cmp::max(delta, min_delta), history_size as i32);
         self.vi_mode_cursor.point.line += delta;
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
-        self.grid.resize(!is_alt, num_lines, num_cols);
-        self.inactive_grid.resize(is_alt, num_lines, num_cols);
+        let pull = self.config.resize_pull_scrollback;
+        self.grid.resize_with(!is_alt, num_lines, num_cols, pull);
+        self.inactive_grid.resize_with(is_alt, num_lines, num_cols, pull);
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -2911,6 +2920,33 @@ mod tests {
 
         assert_eq!(term.history_size(), 0);
         assert_eq!(term.grid.cursor.point, Point::new(Line(19), Column(0)));
+    }
+
+    /// pTerminal delta: with `resize_pull_scrollback` off (ConPTY), growing
+    /// the window keeps the cursor and the top row where they were and keeps
+    /// the history intact, instead of pulling history rows into view.
+    #[test]
+    fn grow_lines_without_pulling_scrollback_keeps_cursor_and_rows() {
+        let mut size = TermSize::new(100, 10);
+        let config = Config { resize_pull_scrollback: false, ..Config::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+
+        // 10 lines of scrollback, then mark the current top visible row.
+        for _ in 0..19 {
+            term.newline();
+        }
+        term.grid[Line(0)][Column(0)].c = 'T';
+        term.grid[Line(9)][Column(0)].c = 'B';
+        assert_eq!(term.history_size(), 10);
+
+        size.screen_lines = 30;
+        term.resize(size);
+
+        assert_eq!(term.grid.cursor.point, Point::new(Line(9), Column(0)));
+        assert_eq!(term.grid[Line(0)][Column(0)].c, 'T');
+        assert_eq!(term.grid[Line(9)][Column(0)].c, 'B');
+        assert_eq!(term.grid[Line(10)][Column(0)].c, ' ', "new rows are blank, at the bottom");
+        assert_eq!(term.history_size(), 10, "history is not consumed");
     }
 
     #[test]
