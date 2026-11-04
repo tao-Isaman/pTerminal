@@ -1000,8 +1000,14 @@ pub(crate) fn brand_visuals() -> egui::Visuals {
     v
 }
 
-/// Install [`system_font_definitions`] on the app's egui context.
+/// Install [`system_font_definitions`] on the app's egui context, and hand
+/// the same Thai font to the terminal's mark shaper so Thai vowels and tone
+/// marks are placed by the font's own tables (`pterminal_term::shaping`).
+/// Leaked once: the shaper borrows it for the life of the process.
 pub(crate) fn install_system_font_fallbacks(ctx: &egui::Context) {
+    if let Some(bytes) = thai_font_bytes() {
+        pterminal_term::set_mark_shaping_font(Box::leak(bytes.into_boxed_slice()));
+    }
     ctx.set_fonts(system_font_definitions());
 }
 
