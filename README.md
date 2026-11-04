@@ -57,6 +57,10 @@ and [notification documentation](https://learn.chatgpt.com/docs/config-file/conf
   Windows system font Leelawadee UI (or Tahoma), loaded from `%WINDIR%\Fonts` at runtime —
   pTerminal still ships no font files. Combining marks are drawn by overstrike (egui does
   no complex text shaping), which reads fine for normal Thai text.
+- **Symbols** egui's fonts lack (Claude Code's tool-result elbow and spinner frames, among
+  others) fall back to the Windows system font Segoe UI Symbol. Any fallback glyph wider than
+  its terminal cell is shrunk to fit, so wide symbols and wide Thai letters no longer draw
+  over their neighbours.
 - **Resource monitor**: per-tab CPU/RAM on hover, per-workspace in the sidebar, totals in the status bar.
 - **Dark theme**: pTerminal always runs dark (`ThemePreference::Dark`, pinned at startup so it
   doesn't drift to the OS light theme on the first real frame). There is no light mode and no

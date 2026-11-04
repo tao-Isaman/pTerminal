@@ -135,6 +135,38 @@ fn thai_mark_stack_slots(marks: &[char]) -> Vec<u8> {
 // if a future Windows font update changes the band.
 const THAI_MARK_LIFT_EM: f32 = 0.20;
 
+/// pTerminal delta (glyph fit): how far a glyph may exceed the cells it
+/// occupies before it is shrunk to fit. The bundled monospace font itself
+/// advances past its cell: 8.28pt against 8pt at 100% (ratio 1.035) and
+/// 8.534pt at 200% scaling (1.067, see the run-coalescing notes below). The
+/// threshold sits above both, so primary-font glyphs are never touched and
+/// the per-cell path stays pixel-identical for them at every scale
+/// (`dense_screen_renders_identically_at_every_scale`). Everything it lets
+/// through overflows by under 0.8pt; the glyphs this fixes overflow by 4–6pt.
+const GLYPH_FIT_TOLERANCE: f32 = 1.10;
+
+/// pTerminal delta (glyph fit): the font-size multiplier that makes a glyph
+/// `glyph_width` wide fit `span` (the cell width, doubled for a wide char).
+/// `1.0` unless the glyph overflows by more than [`GLYPH_FIT_TOLERANCE`].
+///
+/// Why: fallback fonts are proportional. Measured at 14pt against an 8pt
+/// cell, Claude Code's own UI glyphs draw 13–14pt wide (the `⏺` message
+/// bullet, the `⏵⏸` mode icons, `✔ ⚠ ✳`, and — once Segoe UI Symbol fills
+/// them in — the `⎿` tool-result elbow and the `✻ ✶ ✢ ✽` spinner frames),
+/// and the wide Thai consonants `ฒ ญ ณ` draw 12pt. Centred in an 8pt cell
+/// they spilled ~3pt into BOTH neighbours, which is the "text drawn on top
+/// of other text" users reported. Ghostty solves the same problem with its
+/// `.fit` glyph constraint for symbol glyphs (`src/font/Glyph.zig`); this is
+/// the egui equivalent: shrink the font for that one cell until the glyph
+/// fits. A shrunk glyph is centred vertically by the caller.
+fn glyph_fit_scale(glyph_width: f32, span: f32) -> f32 {
+    if glyph_width > span * GLYPH_FIT_TOLERANCE && glyph_width > 0.0 {
+        span / glyph_width
+    } else {
+        1.0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // pTerminal perf delta (glyph-run coalescing)
 //
@@ -181,7 +213,7 @@ const THAI_MARK_LIFT_EM: f32 = 0.20;
 //     taken on trust: `run_coalescing_tests` paints real grids both ways and
 //     compares every glyph's absolute position and colour.
 //
-//  3. Fallback fonts do not share the advance. `install_thai_fallback`
+//  3. Fallback fonts do not share the advance. `system_font_definitions`
 //     appends a PROPORTIONAL system font (Leelawadee UI/Tahoma) to the
 //     monospace family, so a Thai or CJK glyph resolved through it advances
 //     by its own width, not the cell's. Runs are therefore restricted to
@@ -807,6 +839,18 @@ fn emit_grid_shapes(
             // base glyph's right edge — mark outlines hang back over
             // the base via negative bearings, measured zero-advance in
             // `thai_font_probe`).
+            // Glyph fit: shrink a fallback glyph wider than its cell span
+            // (see `glyph_fit_scale`), marks included so they stay on their
+            // base, and centre it vertically in the row it no longer fills.
+            let fit = glyph_fit_scale(fonts.glyph_width(font_id, cell.c), cell_width);
+            let (cell_font, y) = if fit < 1.0 {
+                let f = egui::FontId::new(font_id.size * fit, font_id.family.clone());
+                let dy = (fonts.row_height(font_id) - fonts.row_height(&f)) / 2.0;
+                (f, y + dy)
+            } else {
+                (font_id.clone(), y)
+            };
+            let font_id = &cell_font;
             let mut text = cell.c.to_string();
             let mut lifted: Vec<(char, u8)> = Vec::new();
             if let Some(zerowidth) = cell.zerowidth() {
@@ -2487,6 +2531,27 @@ mod thai_composer_probe {
 /// have to come out of the same code path the app uses, or the comparison
 /// proves nothing about the app.
 #[cfg(test)]
+mod glyph_fit_tests {
+    use super::*;
+
+    #[test]
+    fn primary_font_glyphs_are_never_scaled() {
+        // Hack at 14pt: 8.28pt advance in an 8pt cell.
+        assert_eq!(glyph_fit_scale(8.28, 8.0), 1.0);
+        assert_eq!(glyph_fit_scale(6.5, 8.0), 1.0);
+        assert_eq!(glyph_fit_scale(0.0, 8.0), 1.0);
+    }
+
+    #[test]
+    fn overflowing_glyphs_shrink_to_exactly_their_span() {
+        let s = glyph_fit_scale(13.0, 8.0); // ⏺ measured 13pt
+        assert!((13.0 * s - 8.0).abs() < 1e-4, "{s}");
+        // A wide cell gets twice the room: 13.98pt emoji fits 16pt untouched.
+        assert_eq!(glyph_fit_scale(13.98, 16.0), 1.0);
+    }
+}
+
+#[cfg(test)]
 mod run_coalescing_tests {
     use super::*;
     use alacritty_terminal::event::{Event, EventListener};
@@ -2701,6 +2766,33 @@ mod run_coalescing_tests {
     }
 
     /// Paints `content` twice and returns `(per_cell_shapes, run_shapes)`.
+    /// Claude Code's UI glyphs that the default fallback fonts draw wider
+    /// than one cell (measured: `⏺ ⏵ ⏸` 13pt, `✔ ⚠ ✳` 14pt, cell 8pt) must
+    /// be painted no wider than their cell and inside their row, on both
+    /// paint paths, so they can no longer overlap their neighbours.
+    #[test]
+    fn overflowing_symbol_glyphs_are_fitted_inside_their_cell() {
+        let content = render_content("x\u{23FA}y\u{2714}z\u{26A0}w\u{23F5}\u{23F8}v\u{2733}");
+        let (per_cell, runs) = paint_both(&content, 1.0);
+        for shapes in [&per_cell, &runs] {
+            let mut checked = 0;
+            for shape in shapes.iter() {
+                let Shape::Text(t) = shape else { continue };
+                let chars: String = t.galley.rows.iter().flat_map(|r| r.glyphs.iter().map(|g| g.chr)).collect();
+                if !chars.chars().any(|c| "\u{23FA}\u{2714}\u{26A0}\u{23F5}\u{23F8}\u{2733}".contains(c)) {
+                    continue;
+                }
+                checked += 1;
+                let w = t.galley.rect.width();
+                assert!(w <= CELL_W as f32 + 0.5, "{chars:?} drawn {w}pt wide in a {CELL_W}pt cell");
+                let top = t.pos.y + t.galley.rect.min.y;
+                let bottom = t.pos.y + t.galley.rect.max.y;
+                assert!(top >= -0.01 && bottom <= CELL_H as f32 + 0.5, "{chars:?} spans y {top}..{bottom}");
+            }
+            assert_eq!(checked, 6, "every symbol must have been painted");
+        }
+    }
+
     fn paint_both(
         content: &RenderableContent,
         ppp: f32,
