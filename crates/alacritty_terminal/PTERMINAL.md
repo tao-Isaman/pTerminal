@@ -17,3 +17,10 @@ the crate hard-codes. Every change is marked `pTerminal delta` in the source.
    `PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES` so ConPTY measures text by grapheme
    cluster; if a DLL rejects the flag the call is retried without it instead
    of panicking. The inbox ConPTY still gets 0.
+3. **Grapheme cluster widths** (`term/mod.rs`, `join_grapheme`). Mirrors
+   ConPTY's `PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES` measurement (Windows
+   Terminal `CodepointWidthDetector.cpp`: a cluster is the sum of its
+   codepoints' widths, capped at 2, VS16 counting 2) and Ghostty's mode 2027:
+   VS16 widens its cluster to 2 cells, a skin-tone modifier joins its base, an
+   Extended_Pictographic codepoint after a ZWJ joins the cluster, and a
+   second regional indicator joins the first. Thai is unchanged.
