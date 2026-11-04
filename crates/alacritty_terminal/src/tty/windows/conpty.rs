@@ -10,7 +10,9 @@ use windows_sys::Win32::Foundation::{HANDLE, S_OK};
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
 };
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LoadLibraryExW,
+};
 use windows_sys::core::{HRESULT, PWSTR};
 use windows_sys::{s, w};
 
@@ -46,7 +48,20 @@ struct ConptyApi {
     create: CreatePseudoConsoleFn,
     resize: ResizePseudoConsoleFn,
     close: ClosePseudoConsoleFn,
+    /// pTerminal delta: `CreatePseudoConsole` flags this implementation is
+    /// known to accept.
+    flags: u32,
 }
+
+/// pTerminal delta: `PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES` from the Windows
+/// Terminal project's `conpty.h` (MIT). Makes ConPTY measure text by grapheme
+/// cluster: a cluster's width is the sum of its codepoints' widths capped at
+/// 2, and VS16 counts as 2. That is the measurement modern TUIs assume (an
+/// emoji with VS16, a ZWJ family or a skin-tone emoji is one 2-cell
+/// cluster), and the grid mirrors it in `Term::input` so the two never
+/// disagree about where a cell is. Only the Windows Terminal `conpty.dll`
+/// knows this flag; the inbox ConPTY gets 0.
+const PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES: u32 = 0x08;
 
 impl ConptyApi {
     fn new() -> Self {
@@ -62,6 +77,7 @@ impl ConptyApi {
                     create: CreatePseudoConsole,
                     resize: ResizePseudoConsole,
                     close: ClosePseudoConsole,
+                    flags: 0,
                 }
             },
         }
@@ -71,7 +87,15 @@ impl ConptyApi {
     fn load_conpty() -> Option<Self> {
         type LoadedFn = unsafe extern "system" fn() -> isize;
         unsafe {
-            let hmodule = LoadLibraryW(w!("conpty.dll"));
+            // pTerminal delta: only ever load the conpty.dll shipped next to
+            // the executable — never one found through the current directory
+            // or PATH, which is both a DLL-planting risk and a way to pick up
+            // a version whose behaviour pTerminal was not tested against.
+            let hmodule = LoadLibraryExW(
+                w!("conpty.dll"),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_APPLICATION_DIR,
+            );
             if hmodule.is_null() {
                 return None;
             }
@@ -83,6 +107,7 @@ impl ConptyApi {
                 create: mem::transmute::<LoadedFn, CreatePseudoConsoleFn>(create_fn),
                 resize: mem::transmute::<LoadedFn, ResizePseudoConsoleFn>(resize_fn),
                 close: mem::transmute::<LoadedFn, ClosePseudoConsoleFn>(close_fn),
+                flags: PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES,
             })
         }
     }
@@ -119,15 +144,18 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let (conin_pty_handle, conin) = miow::pipe::anonymous(0)?;
 
     // Create the Pseudo Console, using the pipes.
-    let result = unsafe {
-        (api.create)(
-            window_size.into(),
-            conin_pty_handle.into_raw_handle() as HANDLE,
-            conout_pty_handle.into_raw_handle() as HANDLE,
-            0,
-            &mut pty_handle as *mut _,
-        )
+    // pTerminal delta: pass the implementation's flags, and if a conpty.dll
+    // ever rejects them fall back to the flag-free call rather than panic.
+    let conin_raw = conin_pty_handle.into_raw_handle() as HANDLE;
+    let conout_raw = conout_pty_handle.into_raw_handle() as HANDLE;
+    let create = |flags: u32, out: &mut HPCON| unsafe {
+        (api.create)(window_size.into(), conin_raw, conout_raw, flags, out as *mut _)
     };
+    let mut result = create(api.flags, &mut pty_handle);
+    if result != S_OK && api.flags != 0 {
+        info!("CreatePseudoConsole rejected flags {:#x}; retrying without", api.flags);
+        result = create(0, &mut pty_handle);
+    }
 
     assert_eq!(result, S_OK);
 
