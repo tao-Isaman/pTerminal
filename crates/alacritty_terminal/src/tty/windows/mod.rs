@@ -12,6 +12,7 @@ use crate::tty::{ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
 mod blocking;
 mod child;
 mod conpty;
+pub use conpty::using_conpty_dll;
 
 use blocking::{UnblockedReader, UnblockedWriter};
 use conpty::Conpty as Backend;

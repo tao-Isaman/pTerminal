@@ -2,3 +2,5 @@
 .superpowers/
 .pterminal/
 installer/Output/
+# Fetched by the release workflow (Windows Terminal ConPTY), never committed.
+installer/conpty/

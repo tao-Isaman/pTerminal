@@ -61,6 +61,17 @@ and [notification documentation](https://learn.chatgpt.com/docs/config-file/conf
   others) fall back to the Windows system font Segoe UI Symbol. Any fallback glyph wider than
   its terminal cell is shrunk to fit, so wide symbols and wide Thai letters no longer draw
   over their neighbours.
+- **Thai vowels and tone marks** are placed by the Thai font's own OpenType tables (shaped
+  with rustybuzz), so a tone on an upper vowel sits above it and marks on ป ฝ ฟ clear the
+  tall stem. Without the font it falls back to overstrike.
+- **Box drawing, block elements and braille** are drawn as geometry snapped to device
+  pixels, so borders and blocks tile without seams between cells or rows.
+- **ConPTY**: the installer ships Windows Terminal's `conpty.dll` and `OpenConsole.exe`
+  (MIT, see `THIRD-PARTY-NOTICES.txt`), loaded only from pTerminal's own folder. It measures
+  text by grapheme cluster, and the terminal grid lays out emoji clusters (VS16, skin tones,
+  ZWJ sequences, flags) the same way, so lines no longer drift. A window that grows taller
+  no longer pulls scrollback into view, which desynchronised ConPTY's cursor and left
+  duplicated rows. Built from source without those two files, it uses the inbox ConPTY.
 - **Resource monitor**: per-tab CPU/RAM on hover, per-workspace in the sidebar, totals in the status bar.
 - **Dark theme**: pTerminal always runs dark (`ThemePreference::Dark`, pinned at startup so it
   doesn't drift to the OS light theme on the first real frame). There is no light mode and no
