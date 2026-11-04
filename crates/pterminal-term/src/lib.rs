@@ -150,6 +150,7 @@
 mod backend;
 mod bindings;
 mod font;
+mod shaping;
 // pTerminal's own per-tab wrapper (not upstream code) — see the crate doc.
 mod tab_term;
 mod theme;
@@ -166,4 +167,5 @@ pub use types::Size;
 pub use bindings::{Binding, BindingAction, InputKind, KeyboardBinding};
 pub use font::{FontSettings, TerminalFont};
 pub use theme::{ColorPalette, TerminalTheme};
+pub use shaping::set_mark_shaping_font;
 pub use view::TerminalView;

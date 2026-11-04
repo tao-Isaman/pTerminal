@@ -826,72 +826,159 @@ fn emit_grid_shapes(
                 // Was `swap(&mut fg, &mut bg)`; only `fg` is read below.
                 fg = bg;
             }
-
-            // Combining marks (e.g. Thai upper/lower vowels and tone
-            // marks) are zero-width chars alacritty stores next to the
-            // base char — append them so they overstrike it instead of
-            // being silently dropped. Marks whose stack slot is >0 (a
-            // tone sitting ON an upper vowel — egui does no GPOS
-            // shaping, and the fallback fonts' default positions
-            // collide, see `thai_mark_stack_slots`) are pulled out and
-            // drawn separately, lifted one mark-band per slot, anchored
-            // at the pen position they would have had in-string (the
-            // base glyph's right edge — mark outlines hang back over
-            // the base via negative bearings, measured zero-advance in
-            // `thai_font_probe`).
-            // Glyph fit: shrink a fallback glyph wider than its cell span
-            // (see `glyph_fit_scale`), marks included so they stay on their
-            // base, and centre it vertically in the row it no longer fills.
-            let fit = glyph_fit_scale(fonts.glyph_width(font_id, cell.c), cell_width);
-            let (cell_font, y) = if fit < 1.0 {
-                let f = egui::FontId::new(font_id.size * fit, font_id.family.clone());
-                let dy = (fonts.row_height(font_id) - fonts.row_height(&f)) / 2.0;
-                (f, y + dy)
-            } else {
-                (font_id.clone(), y)
-            };
-            let font_id = &cell_font;
-            let mut text = cell.c.to_string();
-            let mut lifted: Vec<(char, u8)> = Vec::new();
-            if let Some(zerowidth) = cell.zerowidth() {
-                for (&m, slot) in
-                    zerowidth.iter().zip(thai_mark_stack_slots(zerowidth))
-                {
-                    if slot == 0 {
-                        text.push(m);
-                    } else {
-                        lifted.push((m, slot));
-                    }
-                }
-            }
-            let center_x = x + (cell_width / 2.0);
-            shapes.push(Shape::text(
+            paint_cell_text(
                 fonts,
-                Pos2 { x: center_x, y },
-                Align2::CENTER_TOP,
-                text,
-                font_id.clone(),
+                font_id,
+                cell.c,
+                cell.zerowidth().unwrap_or(&[]),
+                x + (cell_width / 2.0),
+                y,
+                cell_width,
                 fg,
-            ));
-            if !lifted.is_empty() {
-                let base_advance = fonts.glyph_width(font_id, cell.c);
-                let pen_x = center_x + base_advance / 2.0;
-                let lift = font_id.size * THAI_MARK_LIFT_EM;
-                for (m, slot) in lifted {
-                    shapes.push(Shape::text(
-                        fonts,
-                        Pos2 { x: pen_x, y: y - lift * slot as f32 },
-                        Align2::LEFT_TOP,
-                        m,
-                        font_id.clone(),
-                        fg,
-                    ));
-                }
-            }
+                shapes,
+            );
         }
     }
 
     flush_pending(&mut run, &mut run_text, run_painter, shapes);
+}
+
+/// pTerminal delta: Thai combining marks — upper and lower vowels and tone
+/// marks (U+0E31, U+0E34–U+0E3A, U+0E47–U+0E4E).
+fn is_thai_mark(c: char) -> bool {
+    matches!(c, '\u{0E31}' | '\u{0E34}'..='\u{0E3A}' | '\u{0E47}'..='\u{0E4E}')
+}
+
+/// pTerminal delta: the zero-width characters of a cell that are actually
+/// drawn. The grid now keeps a whole emoji cluster in one cell (the vendored
+/// alacritty's `join_grapheme`), but egui has no emoji ZWJ ligatures and no
+/// colour/text variants, so the joiners are dropped here: VS15/VS16, a ZWJ
+/// together with the codepoint it joins, and skin-tone modifiers. Drawing
+/// them would put two or three glyphs side by side in space meant for one
+/// cluster. Everything else (combining marks, a flag's second regional
+/// indicator) is kept.
+fn drawable_zerowidth(zerowidth: &[char]) -> Vec<char> {
+    let mut out = Vec::with_capacity(zerowidth.len());
+    let mut after_zwj = false;
+    for &c in zerowidth {
+        if std::mem::take(&mut after_zwj) {
+            continue;
+        }
+        match c {
+            '\u{200D}' => after_zwj = true,
+            '\u{FE0E}' | '\u{FE0F}' | '\u{1F3FB}'..='\u{1F3FF}' => {},
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// pTerminal delta: draws one cell's glyph cluster (`base` plus its
+/// zero-width characters) centred on `center_x`, within `span` points.
+///
+/// 1. Joiners egui cannot render are dropped (`drawable_zerowidth`).
+/// 2. The cluster is shrunk to fit its cells if it is wider
+///    (`glyph_fit_scale`), and re-centred vertically.
+/// 3. Thai marks are placed where the font's own shaping tables put them
+///    (`crate::shaping`), converted from font units to points by the ratio of
+///    the base glyph's egui advance to its font advance. Without a shaping
+///    font, or for a cluster the font cannot map one glyph per character,
+///    marks fall back to overstrike with a fixed lift per stack slot
+///    (`thai_mark_stack_slots`).
+#[allow(clippy::too_many_arguments)]
+fn paint_cell_text(
+    fonts: &egui::epaint::text::Fonts,
+    font_id: &egui::FontId,
+    base: char,
+    zerowidth: &[char],
+    center_x: f32,
+    y: f32,
+    span: f32,
+    fg: egui::Color32,
+    shapes: &mut Vec<Shape>,
+) {
+    let marks = drawable_zerowidth(zerowidth);
+
+    let drawn_width = fonts.glyph_width(font_id, base)
+        + marks.iter().map(|&m| fonts.glyph_width(font_id, m)).sum::<f32>();
+    let fit = glyph_fit_scale(drawn_width, span);
+    let (cell_font, y) = if fit < 1.0 {
+        let f = egui::FontId::new(font_id.size * fit, font_id.family.clone());
+        let dy = (fonts.row_height(font_id) - fonts.row_height(&f)) / 2.0;
+        (f, y + dy)
+    } else {
+        (font_id.clone(), y)
+    };
+    let font_id = &cell_font;
+
+    if marks.iter().copied().any(is_thai_mark) {
+        let cluster: String = std::iter::once(base).chain(marks.iter().copied()).collect();
+        let base_w = fonts.glyph_width(font_id, base);
+        if let Some(shaped) = crate::shaping::shape_cluster(&cluster)
+            .filter(|sc| sc.base_advance > 0.0 && base_w > 0.0)
+        {
+            let k = base_w / shaped.base_advance;
+            let origin_x = center_x - base_w / 2.0;
+            shapes.push(Shape::text(
+                fonts,
+                Pos2 { x: center_x, y },
+                Align2::CENTER_TOP,
+                base.to_string(),
+                font_id.clone(),
+                fg,
+            ));
+            for (m, mx, my) in shaped.marks {
+                shapes.push(Shape::text(
+                    fonts,
+                    Pos2 { x: origin_x + mx * k, y: y - my * k },
+                    Align2::LEFT_TOP,
+                    m.to_string(),
+                    font_id.clone(),
+                    fg,
+                ));
+            }
+            return;
+        }
+    }
+
+    // Overstrike fallback: marks are appended so they draw over the base;
+    // marks whose stack slot is >0 (a tone on an upper vowel) are drawn
+    // separately, lifted one mark-band per slot, anchored at the pen
+    // position they would have had in-string (the base glyph's right edge —
+    // mark outlines hang back over the base via negative bearings, measured
+    // zero-advance in `thai_font_probe`).
+    let mut text = base.to_string();
+    let mut lifted: Vec<(char, u8)> = Vec::new();
+    for (&m, slot) in marks.iter().zip(thai_mark_stack_slots(&marks)) {
+        if slot == 0 {
+            text.push(m);
+        } else {
+            lifted.push((m, slot));
+        }
+    }
+    shapes.push(Shape::text(
+        fonts,
+        Pos2 { x: center_x, y },
+        Align2::CENTER_TOP,
+        text,
+        font_id.clone(),
+        fg,
+    ));
+    if !lifted.is_empty() {
+        let base_advance = fonts.glyph_width(font_id, base);
+        let pen_x = center_x + base_advance / 2.0;
+        let lift = font_id.size * THAI_MARK_LIFT_EM;
+        for (m, slot) in lifted {
+            shapes.push(Shape::text(
+                fonts,
+                Pos2 { x: pen_x, y: y - lift * slot as f32 },
+                Align2::LEFT_TOP,
+                m,
+                font_id.clone(),
+                fg,
+            ));
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2535,6 +2622,17 @@ mod glyph_fit_tests {
     use super::*;
 
     #[test]
+    fn emoji_joiners_are_not_drawn_but_marks_and_flags_are() {
+        // VS16, skin tone, ZWJ + the emoji it joins: all dropped.
+        assert!(drawable_zerowidth(&['\u{FE0F}']).is_empty());
+        assert!(drawable_zerowidth(&['\u{1F3FD}']).is_empty());
+        assert!(drawable_zerowidth(&['\u{200D}', '\u{1F469}', '\u{200D}', '\u{1F467}']).is_empty());
+        // Thai marks and a flag's second regional indicator: kept.
+        assert_eq!(drawable_zerowidth(&['\u{0E36}', '\u{0E49}']), vec!['\u{0E36}', '\u{0E49}']);
+        assert_eq!(drawable_zerowidth(&['\u{1F1ED}']), vec!['\u{1F1ED}']);
+    }
+
+    #[test]
     fn primary_font_glyphs_are_never_scaled() {
         // Hack at 14pt: 8.28pt advance in an 8pt cell.
         assert_eq!(glyph_fit_scale(8.28, 8.0), 1.0);
@@ -2790,6 +2888,48 @@ mod run_coalescing_tests {
                 assert!(top >= -0.01 && bottom <= CELL_H as f32 + 0.5, "{chars:?} spans y {top}..{bottom}");
             }
             assert_eq!(checked, 6, "every symbol must have been painted");
+        }
+    }
+
+    /// Thai marks on a tall consonant are drawn where the font's shaping
+    /// tables put them — shifted left, clear of ป's stem — not at the
+    /// overstrike position (the base glyph's right edge) the old renderer
+    /// always used.
+    #[test]
+    fn thai_marks_on_a_tall_consonant_are_placed_by_the_font() {
+        let thai = std::fs::read(r"C:\Windows\Fonts\LeelawUI.ttf").expect("Leelawadee UI");
+        crate::shaping::set_mark_shaping_font(Box::leak(thai.clone().into_boxed_slice()));
+        let mut defs = egui::FontDefinitions::default();
+        defs.font_data.insert("thai".into(), egui::FontData::from_owned(thai).into());
+        defs.families.entry(egui::FontFamily::Monospace).or_default().push("thai".into());
+        let fonts = egui::epaint::text::Fonts::new(1.0, 8 * 1024, defs);
+        let font_id = font_id();
+        let theme = &*DEFAULT_THEME;
+        let global_bg = theme.get_color(Color::Named(NamedColor::Background));
+        let mouse = TerminalGridPoint::new(Line(0), Column(0));
+
+        let content = render_content("\u{0E1B}\u{0E35}\u{0E48}");
+        let mut shapes = Vec::new();
+        emit_grid_shapes(&content, theme, &font_id, &fonts, Pos2::ZERO, global_bg, mouse, None, &mut shapes);
+
+        let mut base_right = None;
+        let mut mark_x = Vec::new();
+        for shape in &shapes {
+            let Shape::Text(t) = shape else { continue };
+            for row in &t.galley.rows {
+                for g in &row.glyphs {
+                    match g.chr {
+                        '\u{0E1B}' => base_right = Some(t.pos.x + g.pos.x + g.advance_width),
+                        '\u{0E35}' | '\u{0E48}' => mark_x.push(t.pos.x + g.pos.x),
+                        _ => {},
+                    }
+                }
+            }
+        }
+        let base_right = base_right.expect("base drawn");
+        assert_eq!(mark_x.len(), 2, "both marks drawn");
+        for x in mark_x {
+            assert!(x < base_right - 1.0, "mark at {x} not moved left of the overstrike pen {base_right}");
         }
     }
 

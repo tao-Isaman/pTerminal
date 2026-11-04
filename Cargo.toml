@@ -27,6 +27,7 @@ members = ["crates/pterminal-core", "crates/pterminal-term", "crates/alacritty_t
 [workspace.dependencies]
 alacritty_terminal = { path = "crates/alacritty_terminal", version = "0.25.1" }
 anyhow = "1.0.104"
+rustybuzz = "0.20.1"
 arboard = "3.6.1"
 dirs = "6.0.0"
 egui = "0.31.1"
