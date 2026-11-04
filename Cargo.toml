@@ -17,7 +17,7 @@ default-run = "pterminal"
 # `crates/pterminal-term` the embedded terminal (vendored egui_term +
 # `TabTerm`), and this package the egui/eframe app on top of both.
 [workspace]
-members = ["crates/pterminal-core", "crates/pterminal-term"]
+members = ["crates/pterminal-core", "crates/pterminal-term", "crates/alacritty_terminal"]
 
 # Every third-party version is pinned exactly once, here; the member crates
 # say `.workspace = true`. egui is pinned to 0.31.x because
@@ -25,7 +25,7 @@ members = ["crates/pterminal-core", "crates/pterminal-term"]
 # against egui 0.31, and eframe below is pinned to match â€” `cargo tree -i
 # egui` must keep showing exactly one egui version.
 [workspace.dependencies]
-alacritty_terminal = "0.25.1"
+alacritty_terminal = { path = "crates/alacritty_terminal", version = "0.25.1" }
 anyhow = "1.0.104"
 arboard = "3.6.1"
 dirs = "6.0.0"

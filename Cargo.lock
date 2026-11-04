@@ -141,8 +141,6 @@ dependencies = [
 [[package]]
 name = "alacritty_terminal"
 version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46319972e74179d707445f64aaa2893bbf6a111de3a9af29b7eb382f8b39e282"
 dependencies = [
  "base64",
  "bitflags 2.13.1",
@@ -157,6 +155,7 @@ dependencies = [
  "rustix 1.1.4",
  "rustix-openpty",
  "serde",
+ "serde_json",
  "signal-hook",
  "unicode-width 0.2.2",
  "vte",
