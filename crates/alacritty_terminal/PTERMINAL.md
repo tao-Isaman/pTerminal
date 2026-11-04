@@ -24,3 +24,8 @@ the crate hard-codes. Every change is marked `pTerminal delta` in the source.
    VS16 widens its cluster to 2 cells, a skin-tone modifier joins its base, an
    Extended_Pictographic codepoint after a ZWJ joins the cluster, and a
    second regional indicator joins the first. Thai is unchanged.
+4. **Child-exit wake race** (`tty/windows/child.rs`). A child that exited
+   before the event loop registered interest was never reported: its exit
+   was queued with nothing to wake the loop. The inbox ConPTY masked this by
+   closing its pipe on exit; Windows Terminal's ConPTY does not. `register`
+   now posts the wake itself when the exit already happened.

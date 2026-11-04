@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::io::Error;
 use std::num::NonZeroU32;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use polling::os::iocp::{CompletionPacket, PollerIocpExt};
@@ -25,6 +25,8 @@ struct ChildExitSender {
     sender: mpsc::Sender<ChildEvent>,
     interest: Arc<Mutex<Option<Interest>>>,
     child_handle: AtomicPtr<c_void>,
+    /// pTerminal delta: set once the exit callback has run. See `register`.
+    exited: Arc<AtomicBool>,
 }
 
 /// WinAPI callback to run when child process exits.
@@ -40,6 +42,7 @@ extern "system" fn child_exit_callback(ctx: *mut c_void, timed_out: BOOLEAN) {
     let status = unsafe { GetExitCodeProcess(child_handle, &mut exit_code) };
     let exit_code = if status == FALSE { None } else { Some(exit_code as i32) };
     event_tx.sender.send(ChildEvent::Exited(exit_code)).ok();
+    event_tx.exited.store(true, Ordering::SeqCst);
 
     let interest = event_tx.interest.lock().unwrap();
     if let Some(interest) = interest.as_ref() {
@@ -51,6 +54,7 @@ pub struct ChildExitWatcher {
     wait_handle: AtomicPtr<c_void>,
     event_rx: mpsc::Receiver<ChildEvent>,
     interest: Arc<Mutex<Option<Interest>>>,
+    exited: Arc<AtomicBool>,
     child_handle: AtomicPtr<c_void>,
     pid: Option<NonZeroU32>,
 }
@@ -61,10 +65,12 @@ impl ChildExitWatcher {
 
         let mut wait_handle: HANDLE = ptr::null_mut();
         let interest = Arc::new(Mutex::new(None));
+        let exited = Arc::new(AtomicBool::new(false));
         let sender_ref = Box::new(ChildExitSender {
             sender: event_tx,
             interest: interest.clone(),
             child_handle: AtomicPtr::from(child_handle),
+            exited: exited.clone(),
         });
 
         let success = unsafe {
@@ -85,6 +91,7 @@ impl ChildExitWatcher {
             Ok(ChildExitWatcher {
                 event_rx,
                 interest,
+                exited,
                 pid,
                 child_handle: AtomicPtr::from(child_handle),
                 wait_handle: AtomicPtr::from(wait_handle),
@@ -96,8 +103,22 @@ impl ChildExitWatcher {
         &self.event_rx
     }
 
+    /// pTerminal delta: a child that exited before the event loop registered
+    /// interest left its exit event queued with nothing to wake the loop:
+    /// the callback found no interest to post to. The inbox ConPTY hid this by
+    /// closing its output pipe when the child exited, which woke the loop
+    /// anyway; Windows Terminal's ConPTY keeps the pipe open until the
+    /// pseudoconsole is closed, so a command that finished within
+    /// milliseconds was never reported as exited. Both sides now check under
+    /// the same lock — the callback sets `exited` before taking it — so
+    /// either the callback sees the interest or this sees the exit, and the
+    /// loop is always woken.
     pub fn register(&self, poller: &Arc<Poller>, event: Event) {
-        *self.interest.lock().unwrap() = Some(Interest { poller: poller.clone(), event });
+        let mut interest = self.interest.lock().unwrap();
+        if self.exited.load(Ordering::SeqCst) {
+            poller.post(CompletionPacket::new(event)).ok();
+        }
+        *interest = Some(Interest { poller: poller.clone(), event });
     }
 
     pub fn deregister(&self) {
@@ -158,5 +179,31 @@ mod tests {
         assert_eq!(events.iter().next().unwrap().key, PTY_CHILD_EVENT_TOKEN);
         // Verify that at least one `ChildEvent::Exited` was received.
         assert_eq!(child_exit_watcher.event_rx().try_recv(), Ok(ChildEvent::Exited(Some(1))));
+    }
+
+    /// pTerminal delta: a child that has already exited when the event loop
+    /// registers interest must still wake it.
+    #[test]
+    pub fn event_is_emitted_when_child_exited_before_register() {
+        const WAIT_TIMEOUT: Duration = Duration::from_millis(500);
+
+        let poller = Arc::new(Poller::new().unwrap());
+
+        let mut child = Command::new("cmd.exe").args(["/c", "exit", "4"]).spawn().unwrap();
+        let child_exit_watcher = ChildExitWatcher::new(child.as_raw_handle() as HANDLE).unwrap();
+        child.wait().unwrap();
+        // Let the wait-thread callback run before interest exists.
+        std::thread::sleep(Duration::from_millis(100));
+
+        child_exit_watcher.register(&poller, Event::readable(PTY_CHILD_EVENT_TOKEN));
+
+        let mut events = polling::Events::new();
+        poller.wait(&mut events, Some(WAIT_TIMEOUT)).unwrap();
+        assert_eq!(
+            events.iter().next().map(|e| e.key),
+            Some(PTY_CHILD_EVENT_TOKEN),
+            "the event loop was never woken for an exit that preceded register"
+        );
+        assert_eq!(child_exit_watcher.event_rx().try_recv(), Ok(ChildEvent::Exited(Some(4))));
     }
 }
