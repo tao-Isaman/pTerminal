@@ -654,6 +654,12 @@ fn serve_one(mut stream: TcpStream, link: &Link) {
         }
     };
     let _ = write_response(&mut stream, &response);
+    // Graceful close: closing a socket that still has unread bytes makes Windows send a
+    // reset, and the client can lose the response it was about to read (os error 10054).
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut sink = [0u8; 1024];
+    while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
 }
 
 fn read_request(stream: &mut TcpStream, peer: &str) -> anyhow::Result<Request> {
@@ -789,8 +795,18 @@ pub fn call(base: &str, token: &str, method: &str, path_and_query: &str, body: O
     s.set_read_timeout(Some(Duration::from_secs(15)))?;
     let body = body.unwrap_or("");
     write!(s, "{method} {path_and_query} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
-    let mut raw = String::new();
-    s.read_to_string(&mut raw)?;
+    // Read to EOF; a reset after a complete response is still a complete response.
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset && !buf.is_empty() => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let raw = String::from_utf8_lossy(&buf).into_owned();
     let (head, resp_body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
     let status = head.split(' ').nth(1).and_then(|c| c.parse().ok()).ok_or_else(|| anyhow::anyhow!("not an HTTP response"))?;
     Ok((status, resp_body.to_string()))
