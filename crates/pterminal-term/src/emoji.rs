@@ -40,8 +40,10 @@ const CACHE_CAP: usize = 1024;
 fn font_bytes() -> Option<&'static [u8]> {
     static BYTES: OnceLock<Option<&'static [u8]>> = OnceLock::new();
     *BYTES.get_or_init(|| {
-        let dir = std::path::PathBuf::from(std::env::var_os("WINDIR")?).join("Fonts");
-        let bytes = std::fs::read(dir.join("seguiemj.ttf")).ok()?;
+        // Segoe UI Emoji on Windows; Linux has no COLR emoji font listed, so
+        // emoji there fall back to the symbol font (see `platform::font_names::emoji`).
+        let path = pterminal_core::platform::find_font(pterminal_core::platform::font_names::emoji())?;
+        let bytes = std::fs::read(path).ok()?;
         Some(&*Box::leak(bytes.into_boxed_slice()))
     })
 }
@@ -488,7 +490,7 @@ fn gradient_or_solid(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

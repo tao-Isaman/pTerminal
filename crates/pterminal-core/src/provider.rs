@@ -601,7 +601,7 @@ mod tests {
         assert_eq!(launch.program, crate::platform::npm_cli("claude").program);
         assert_eq!(
             after_claude_prefix(&launch.args),
-            vec!["--settings".to_string(), expected_settings(7), "do the thing quoted".into()
+            vec!["--settings".to_string(), expected_settings(7), "do the thing quoted".into()]
         );
     }
 
@@ -615,7 +615,7 @@ mod tests {
         assert_eq!(launch.program, crate::platform::npm_cli("claude").program);
         assert_eq!(
             after_claude_prefix(&launch.args),
-            vec!["--settings".to_string(), expected_settings(7), "--resume".into(), "sess-abc".into()
+            vec!["--settings".to_string(), expected_settings(7), "--resume".into(), "sess-abc".into()]
         );
     }
 
@@ -631,7 +631,7 @@ mod tests {
         assert_eq!(launch.program, crate::platform::npm_cli("claude").program);
         assert_eq!(
             after_claude_prefix(&launch.args),
-            vec!["--settings".to_string(), expected_settings(7)
+            vec!["--settings".to_string(), expected_settings(7)]
         );
     }
 

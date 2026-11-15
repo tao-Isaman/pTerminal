@@ -121,7 +121,7 @@ pub(crate) fn shape_with(face: &rustybuzz::Face<'_>, text: &str) -> Option<Shape
     Some(ShapedCluster { base_advance: positions[0].x_advance as f32, marks })
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))] // measured against Leelawadee UI
 mod tests {
     use super::*;
 

@@ -167,8 +167,18 @@ pub fn status_from_events(contents: &str) -> AgentStatus {
 }
 
 fn append_event_cmd(event: &str, file: &Path) -> String {
-    // ponytail: `echo X>>` with no space before >> so the line has no trailing space
-    format!("cmd /c echo {event}>>\"{}\"", file.display())
+    if cfg!(windows) {
+        // ponytail: `echo X>>` with no space before >> so the line has no trailing space
+        format!("cmd /c echo {event}>>\"{}\"", file.display())
+    } else {
+        // Claude Code runs hook commands with `sh` on Unix
+        format!("echo {event} >> {}", sh_quote(&file.to_string_lossy()))
+    }
+}
+
+/// `s` as one single-quoted `sh` word (`'` written as `'\''`).
+pub(crate) fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Locates `pterm_hook.exe` next to the running executable, if it's there.
@@ -178,7 +188,7 @@ fn append_event_cmd(event: &str, file: &Path) -> String {
 /// `cargo build` places both binaries in the same `target/debug/` directory.
 pub fn pterm_hook_exe() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let candidate = exe.parent()?.join("pterm_hook.exe");
+    let candidate = exe.parent()?.join(format!("pterm_hook{}", crate::platform::EXE_SUFFIX));
     candidate.exists().then_some(candidate)
 }
 
@@ -192,7 +202,8 @@ pub fn pterm_hook_exe() -> Option<PathBuf> {
 /// tool descriptions — never a hard failure to set hooks up at all).
 fn event_command(event: &str, file: &Path, helper: Option<&Path>) -> String {
     match helper {
-        Some(exe) => format!("\"{}\" {event} \"{}\"", exe.display(), file.display()),
+        Some(exe) if cfg!(windows) => format!("\"{}\" {event} \"{}\"", exe.display(), file.display()),
+        Some(exe) => format!("{} {event} {}", sh_quote(&exe.to_string_lossy()), sh_quote(&file.to_string_lossy())),
         None => append_event_cmd(event, file),
     }
 }
@@ -240,14 +251,22 @@ fn hook_group(cmds: &[String], matcher: Option<&str>) -> serde_json::Value {
 /// where the shared coordination files live.
 fn session_start_inject(setup: &HookSetup) -> String {
     let mut segments = Vec::new();
+    let show = |p: &Path| {
+        if cfg!(windows) { format!("type \"{}\"", p.display()) } else { format!("cat {}", sh_quote(&p.to_string_lossy())) }
+    };
     if let Some(md) = setup.shared_md {
-        segments.push(format!("type \"{}\"", md.display()));
+        segments.push(show(md));
     }
     if let Some(readme) = setup.agent_readme {
-        segments.push(format!("type \"{}\"", readme.display()));
+        segments.push(show(readme));
     }
+    // the `echo You are agent "` tail is how `is_our_command` recognizes this command
     segments.push(format!("echo You are agent \"{}\".", setup.agent_name));
-    format!("cmd /c {}", segments.join(" & echo. & "))
+    if cfg!(windows) {
+        format!("cmd /c {}", segments.join(" & echo. & "))
+    } else {
+        segments.join("; echo; ")
+    }
 }
 
 /// Parameters for [`hook_settings`] / [`write_tab_settings`]. `tab_id`

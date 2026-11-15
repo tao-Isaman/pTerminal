@@ -456,7 +456,9 @@ impl PtApp {
             selected_child: None,
             pending_submit: Vec::new(),
             // once per launch; every failure mode is a silent no-op
-            update_check: Some(crate::update::spawn_update_check(APP_VERSION)),
+            // The updater downloads and runs the Windows installer; Linux builds
+            // are installed from a tarball or `cargo install` and do not self-update.
+            update_check: cfg!(windows).then(|| crate::update::spawn_update_check(APP_VERSION)),
             update_available: None,
             update_download: None,
             history,
