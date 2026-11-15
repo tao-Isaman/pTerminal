@@ -476,7 +476,9 @@ mod tests {
         assert_eq!(app.pending_submit.len(), 1, "a drain in the same frame must NOT flush a not-yet-due Enter");
         let delays: Vec<Duration> = seen.lock().unwrap().clone();
         assert!(
-            delays.iter().any(|d| *d > Duration::ZERO && *d <= SUBMIT_DELAY),
+            // any wake-up sooner than the heartbeat. Not `> ZERO`: egui subtracts the predicted
+            // frame time, so on a slow runner where the Enter is already (almost) due it is "now".
+            delays.iter().any(|d| *d <= SUBMIT_DELAY),
             "a queued Enter must schedule its own wake-up, not wait for the 500ms heartbeat: {delays:?}",
         );
 
