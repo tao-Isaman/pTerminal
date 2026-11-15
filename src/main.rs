@@ -7,6 +7,7 @@ mod events;
 mod handoff;
 mod orchestrator;
 mod persist;
+mod remote_ui;
 mod resume;
 mod tabs;
 mod term;
@@ -28,6 +29,11 @@ use pterminal_core::{
 
 fn main() -> eframe::Result<()> {
     let argv: Vec<String> = std::env::args().collect();
+    // `pterminal remote …`: talk to another machine's pTerminal over the
+    // tailnet (pterminal_core::remote). A CLI only; never starts the GUI.
+    if argv.get(1).map(String::as_str) == Some("remote") {
+        std::process::exit(pterminal_core::remote::cli(&argv[2..]));
+    }
     match commands::parse_args(&argv) {
         Some(Err(usage)) => {
             eprintln!("{usage}");

@@ -70,6 +70,7 @@ pub(crate) fn lock_orchestrator_dir() -> std::sync::MutexGuard<'static, ()> {
 pub(crate) fn bare_app(base: PathBuf, workspaces: Vec<WsRt>, active_ws: usize) -> PtApp {
     let (_tx, sampler_rx) = std::sync::mpsc::channel();
     PtApp {
+        remote: crate::remote_ui::RemoteRt::load(&base),
         base,
         workspaces,
         active_ws,

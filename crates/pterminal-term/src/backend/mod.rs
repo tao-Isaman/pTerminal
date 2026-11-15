@@ -246,6 +246,35 @@ impl TerminalBackend {
         self.snapshot.content()
     }
 
+    /// pTerminal delta (remote link): the visible screen as plain text,
+    /// one string per row, top to bottom, trailing blanks trimmed. Read-only:
+    /// it locks the grid briefly and never touches the PTY.
+    pub fn screen_lines(&self) -> Vec<String> {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        let term = self.term.lock();
+        let grid = term.grid();
+        let (rows, cols) = (grid.screen_lines(), grid.columns());
+        (0..rows)
+            .map(|r| {
+                let row = &grid[Line(r as i32)];
+                let mut s = String::with_capacity(cols);
+                for c in 0..cols {
+                    let cell = &row[Column(c)];
+                    if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                        continue;
+                    }
+                    s.push(cell.c);
+                    if let Some(z) = cell.zerowidth() {
+                        s.extend(z);
+                    }
+                }
+                s.trim_end().to_string()
+            })
+            .collect()
+    }
+
     /// pTerminal delta (background-tab size sync): the `(layout, font)` of
     /// the last APPLIED resize — the pair a peer terminal must be fed to
     /// reproduce this grid. The never-resized default state reports a zero

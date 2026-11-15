@@ -301,6 +301,11 @@ impl TabTerm {
 
     /// Clears the visible screen AND scrollback — the context menu's
     /// "Clear".
+    /// The visible screen as text lines (remote link's read-only tail).
+    pub fn screen_lines(&self) -> Vec<String> {
+        self.backend.screen_lines()
+    }
+
     pub fn clear_screen(&mut self) {
         self.backend.process_command(BackendCommand::ClearScreen);
     }
