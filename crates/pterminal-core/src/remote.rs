@@ -22,7 +22,7 @@
 //! response, so every rule here is tested without a socket.
 
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 /// Settings the boss controls. Off, read-only, by default.
@@ -337,6 +337,7 @@ pub fn write_audit(path: &Path, e: &AuditEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv6Addr;
 
     fn cfg(enabled: bool, allow: bool) -> RemoteConfig {
         RemoteConfig { enabled, allow_messages: allow, bind: "100.101.102.103".parse().unwrap(), port: 47_400 }
