@@ -164,6 +164,10 @@ pub(crate) fn render(face: &rustybuzz::Face<'_>, cluster: &str, w: u32, h: u32) 
         .zip(output.glyph_positions())
         .map(|(i, p)| (GlyphId(i.glyph_id as u16), p.x_advance, p.x_offset, p.y_offset))
         .collect();
+    if glyphs.len() == 1 && glyphs[0].0.0 != 0 && !face.is_color_glyph(glyphs[0].0) {
+        // Bitmap colour fonts (CBDT, e.g. Noto Color Emoji on Linux) carry a PNG per glyph
+        return render_bitmap(face, glyphs[0].0, w, h);
+    }
     if glyphs.is_empty() || glyphs.iter().any(|g| g.0.0 == 0 || !face.is_color_glyph(g.0)) {
         return None;
     }
@@ -196,6 +200,22 @@ pub(crate) fn render(face: &rustybuzz::Face<'_>, cluster: &str, w: u32, h: u32) 
     }
     let pixmap = painter.layers.pop()?;
     Some(egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], pixmap.data()))
+}
+
+/// A CBDT/sbix glyph: its largest embedded PNG, scaled to fit `w`×`h` and centred.
+fn render_bitmap(face: &rustybuzz::Face<'_>, glyph: GlyphId, w: u32, h: u32) -> Option<egui::ColorImage> {
+    let img = face.glyph_raster_image(glyph, u16::MAX)?;
+    if img.format != ttf_parser::RasterImageFormat::PNG {
+        return None;
+    }
+    let src = sk::Pixmap::decode_png(img.data).ok()?;
+    let scale = (w as f32 / src.width() as f32).min(h as f32 / src.height() as f32);
+    let (dw, dh) = (src.width() as f32 * scale, src.height() as f32 * scale);
+    let mut out = sk::Pixmap::new(w, h)?;
+    let paint = sk::PixmapPaint { quality: sk::FilterQuality::Bicubic, ..Default::default() };
+    let t = sk::Transform::from_row(scale, 0.0, 0.0, scale, (w as f32 - dw) / 2.0, (h as f32 - dh) / 2.0);
+    out.draw_pixmap(0, 0, src.as_ref(), &paint, t, None);
+    Some(egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], out.data()))
 }
 
 /// tiny-skia behind ttf-parser's COLR painter interface.
@@ -572,3 +592,19 @@ mod tests {
     }
 }
 
+
+#[cfg(all(test, not(windows)))]
+mod linux_tests {
+    use super::*;
+
+    /// Noto Color Emoji (CBDT bitmaps) renders through `render_bitmap`.
+    #[test]
+    fn noto_color_emoji_renders_in_colour() {
+        let bytes = font_bytes().expect("Noto Color Emoji (fonts-noto-color-emoji) is installed");
+        let face = rustybuzz::Face::from_slice(bytes, 0).unwrap();
+        let img = render(&face, "\u{1F600}", 32, 32).expect("😀 renders");
+        let colours: std::collections::HashSet<[u8; 4]> = img.pixels.iter().map(|p| p.to_array()).collect();
+        assert!(colours.len() > 8, "expected a colour image, got {} distinct colours", colours.len());
+        assert!(render(&face, "A", 32, 32).is_none(), "plain text is not drawn as an emoji");
+    }
+}
