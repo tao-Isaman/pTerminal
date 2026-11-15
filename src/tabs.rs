@@ -600,18 +600,27 @@ mod tests {
     /// strip" and would spawn fine.)
     #[test]
     fn a_failed_resume_spawn_keeps_the_saved_tab_as_a_placeholder() {
-        use std::os::windows::fs::OpenOptionsExt;
         let ctx = eframe::egui::Context::default();
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().to_path_buf();
         std::fs::create_dir_all(repo.join(".claude")).expect("mkdir .claude");
-        let _lock = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .share_mode(0)
-            .open(repo.join(".claude").join("settings.local.json"))
-            .expect("open settings.local.json exclusively");
+        // Windows: hold the file open with no share mode (a sharing violation
+        // for every other opener). Unix has no mandatory locks, so the same
+        // "I/O error other than missing" comes from a directory where the file
+        // should be.
+        #[cfg(windows)]
+        let _lock = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .share_mode(0)
+                .open(repo.join(".claude").join("settings.local.json"))
+                .expect("open settings.local.json exclusively")
+        };
+        #[cfg(not(windows))]
+        std::fs::create_dir_all(repo.join(".claude").join("settings.local.json")).expect("mkdir in place of the file");
 
         let wt = state::WorktreeInfo { path: PathBuf::from("D:\\wt\\gone"), branch: "pt/gone".into() };
         let saved = state::SavedTab {

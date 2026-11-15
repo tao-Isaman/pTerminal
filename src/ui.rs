@@ -4,6 +4,7 @@
 //! depend on. Pure rendering — the event pump (`drain_events`), shortcuts,
 //! and dialog logic stay in their own modules.
 
+use pterminal_core::platform;
 use crate::app::{CloseWsDraft, NewTabDraft, PtApp, close_draft_for};
 use crate::editor::{CloseEditorDraft, remove_editor};
 use crate::hooks::AgentStatus;
@@ -1053,22 +1054,35 @@ pub(crate) fn system_font_definitions() -> egui::FontDefinitions {
     fonts
 }
 
-/// A font file from the Windows fonts folder.
+/// A font file found by name in the platform's font folders
+/// (`%WINDIR%\\Fonts` on Windows; `~/.local/share/fonts`, `/usr/share/fonts`, …
+/// elsewhere — see `pterminal_core::platform::font_dirs`).
 fn font_file(file: &str) -> Option<Vec<u8>> {
-    let dir = PathBuf::from(std::env::var_os("WINDIR")?).join("Fonts");
-    std::fs::read(dir.join(file)).ok()
+    std::fs::read(platform::find_font(&[file])?).ok()
 }
 
-/// The CJK fallback font files for a user whose Windows locale is `locale`
-/// (a BCP-47 name such as `ja-JP`), those present on disk only.
+/// The CJK fallback font files for a user whose locale is `locale` (a
+/// BCP-47 name such as `ja-JP`), those present on disk only.
 ///
-/// Chinese, Japanese and Korean share the unified Han ideographs but draw
-/// many of them differently, so the Han font follows the locale: Yu Gothic
-/// for Japanese, Microsoft JhengHei for Traditional Chinese, Malgun Gothic
-/// for Korean, and Microsoft YaHei otherwise. Each covers Han, kana and CJK
-/// punctuation. Only Malgun Gothic has Hangul, so it follows as a second
-/// fallback whenever it is not already the first.
+/// Windows: Chinese, Japanese and Korean share the unified Han ideographs
+/// but draw many of them differently, so the Han font follows the locale:
+/// Yu Gothic for Japanese, Microsoft JhengHei for Traditional Chinese,
+/// Malgun Gothic for Korean, and Microsoft YaHei otherwise. Each covers Han,
+/// kana and CJK punctuation. Only Malgun Gothic has Hangul, so it follows as
+/// a second fallback whenever it is not already the first.
+///
+/// Linux: one Noto Sans CJK collection covers all four (and Hangul); WenQuanYi
+/// and Droid Sans Fallback stand in on systems without Noto.
 pub(crate) fn cjk_font_files(locale: &str) -> Vec<&'static str> {
+    cjk_font_files_with(locale, |f| platform::find_font(&[f]).is_some())
+}
+
+fn cjk_font_files_with(locale: &str, present: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    if !cfg!(windows) {
+        let all: &[&'static str] = &["NotoSansCJK-Regular.ttc", "NotoSansCJKjp-Regular.otf", "NotoSansCJKsc-Regular.otf",
+            "wqy-microhei.ttc", "wqy-zenhei.ttc", "DroidSansFallbackFull.ttf"];
+        return all.iter().copied().filter(|f| present(f)).take(1).collect();
+    }
     let lang = locale.to_ascii_lowercase();
     let han: &[&'static str] = if lang.starts_with("ja") {
         &["YuGothR.ttc", "msgothic.ttc", "msyh.ttc"]
@@ -1079,49 +1093,31 @@ pub(crate) fn cjk_font_files(locale: &str) -> Vec<&'static str> {
     } else {
         &["msyh.ttc", "msjh.ttc", "YuGothR.ttc"]
     };
-    let present = |f: &&str| {
-        std::env::var_os("WINDIR")
-            .is_some_and(|w| PathBuf::from(w).join("Fonts").join(f).is_file())
-    };
-    let mut out: Vec<&'static str> = han.iter().copied().filter(present).take(1).collect();
-    if out.first() != Some(&"malgun.ttf") && present(&"malgun.ttf") {
+    let mut out: Vec<&'static str> = han.iter().copied().filter(|f| present(f)).take(1).collect();
+    if out.first() != Some(&"malgun.ttf") && present("malgun.ttf") {
         out.push("malgun.ttf");
     }
     out
 }
 
-/// The user's Windows locale name, such as `en-US` or `ja-JP`; empty if it
-/// cannot be read.
+/// The user's locale name, such as `en-US` or `ja-JP`; empty if unknown.
 pub(crate) fn user_locale_name() -> String {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetUserDefaultLocaleName(name: *mut u16, len: i32) -> i32;
-    }
-    let mut buf = [0u16; 85]; // LOCALE_NAME_MAX_LENGTH
-    // SAFETY: `buf` is a valid, writable buffer of exactly the length passed.
-    let n = unsafe { GetUserDefaultLocaleName(buf.as_mut_ptr(), buf.len() as i32) };
-    if n <= 1 {
-        return String::new();
-    }
-    String::from_utf16_lossy(&buf[..n as usize - 1])
+    platform::user_locale_name()
 }
 
-/// Segoe UI Symbol ships with every Windows install since 7 (~2.5 MB).
+/// Symbols egui lacks (Claude Code's `⎿ ✻ ✶ ✢ ✽ ✗ ⧉`): Segoe UI Symbol on
+/// Windows, Noto Sans Symbols 2 / DejaVu Sans on Linux.
 pub(crate) fn symbol_font_bytes() -> Option<Vec<u8>> {
-    let dir = PathBuf::from(std::env::var_os("WINDIR")?).join("Fonts");
-    std::fs::read(dir.join("seguisym.ttf")).ok()
+    std::fs::read(platform::find_font(platform::font_names::symbols())?).ok()
 }
 
-/// Leelawadee UI is Windows' standard Thai UI font (shipped since 8.1);
-/// Tahoma also covers Thai and exists on effectively every install.
+/// A Thai UI font: Leelawadee UI / Tahoma on Windows, Noto Sans Thai (or
+/// TLWG Loma / Garuda) on Linux.
 pub(crate) fn thai_font_bytes() -> Option<Vec<u8>> {
-    let dir = PathBuf::from(std::env::var_os("WINDIR")?).join("Fonts");
-    ["LeelawUI.ttf", "tahoma.ttf"]
-        .into_iter()
-        .find_map(|f| std::fs::read(dir.join(f)).ok())
+    std::fs::read(platform::find_font(platform::font_names::thai())?).ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod thai_font_probe {
     /// Reference measurement (run with `--nocapture`), not a pass/fail
     /// gate: prints the unshaped (no-GPOS) metrics of Thai combining marks
@@ -1214,7 +1210,7 @@ mod tests {
     /// OS, so resolution must succeed here. If this fails, Thai silently
     /// regresses to boxes — nothing else in the suite would notice.
     #[test]
-    fn symbol_font_resolves_on_windows() {
+    fn symbol_font_resolves() {
         let bytes = crate::ui::symbol_font_bytes().expect("Segoe UI Symbol not found");
         assert_eq!(&bytes[..4], b"\x00\x01\x00\x00", "not a TrueType font");
     }
@@ -1243,6 +1239,15 @@ mod tests {
     }
 
     /// The Han font follows the locale, and Hangul is always covered.
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_cjk_font_is_the_first_present_collection() {
+        let present = |f: &str| f == "wqy-microhei.ttc" || f == "DroidSansFallbackFull.ttf";
+        assert_eq!(super::cjk_font_files_with("ja-JP", present), ["wqy-microhei.ttc"]);
+        assert!(super::cjk_font_files_with("ja-JP", |_| false).is_empty());
+    }
+
+    #[cfg(windows)]
     #[test]
     fn cjk_font_order_follows_the_locale() {
         assert_eq!(cjk_font_files("ja-JP"), ["YuGothR.ttc", "malgun.ttf"]);
@@ -1254,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn thai_font_resolves_on_windows() {
+    fn thai_font_resolves() {
         let bytes = crate::ui::thai_font_bytes().expect("no Thai-capable system font found");
         // sfnt magics (ttf/ttc/otf) — proves we read a real font file.
         let magic = &bytes[..4];

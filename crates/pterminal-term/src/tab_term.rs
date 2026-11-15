@@ -348,6 +348,24 @@ mod tests {
 
     const TIMEOUT: Duration = Duration::from_secs(15);
 
+    /// An interactive shell that stays alive waiting for input.
+    fn interactive() -> (&'static str, Vec<String>) {
+        if cfg!(windows) { ("cmd.exe", vec![]) } else { ("/bin/sh", vec![]) }
+    }
+
+    /// The platform shell running one command line and exiting (`cmd /c` vs `sh -c`).
+    fn one_line(windows: &str, unix: &str) -> (&'static str, Vec<String>) {
+        if cfg!(windows) {
+            ("cmd.exe", vec!["/c".to_string(), windows.to_string()])
+        } else {
+            ("/bin/sh", vec!["-c".to_string(), unix.to_string()])
+        }
+    }
+
+    fn root() -> &'static Path {
+        Path::new(if cfg!(windows) { "C:\\" } else { "/" })
+    }
+
     /// Waits for `cond` to hold, polling every 10 ms. `false` on timeout.
     fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + TIMEOUT;
@@ -379,14 +397,8 @@ mod tests {
     #[test]
     fn poll_alone_reports_child_exit() {
         let ctx = egui::Context::default();
-        let mut term = TabTerm::spawn(
-            &ctx,
-            1,
-            "cmd.exe",
-            &["/c".to_string(), "echo hi & exit 3".to_string()],
-            Path::new("C:\\"),
-        )
-        .expect("spawn cmd.exe");
+        let (program, args) = one_line("echo hi & exit 3", "echo hi; exit 3");
+        let mut term = TabTerm::spawn(&ctx, 1, program, &args, root()).expect("spawn shell");
 
         assert!(
             wait_for(|| {
@@ -404,6 +416,7 @@ mod tests {
     /// proves the bundled ConPTY is the one actually loaded (with the
     /// grapheme-width flag) and that a command runs and exits through it.
     /// Everywhere else it pins the inbox fallback.
+    #[cfg(windows)]
     #[test]
     fn conpty_in_use_matches_what_ships_beside_the_binary() {
         let ctx = egui::Context::default();
@@ -594,13 +607,13 @@ mod tests {
 
         // `ping` prints one line a second: enough events to observe, few enough
         // that the child is not flooding the emulator.
-        let args: Vec<String> = ["-n", "30", "127.0.0.1"]
-            .iter()
-            .map(|a| a.to_string())
-            .collect();
-        let mut term =
-            TabTerm::spawn(&ctx, 3, "ping.exe", &args, Path::new("C:\\"))
-                .expect("spawn ping.exe");
+        // (Unix: a shell loop printing once a second does the same.)
+        let (program, args) = if cfg!(windows) {
+            ("ping.exe", ["-n", "30", "127.0.0.1"].iter().map(|a| a.to_string()).collect::<Vec<_>>())
+        } else {
+            ("/bin/sh", vec!["-c".to_string(), "for i in $(seq 30); do echo tick $i; sleep 1; done".to_string()])
+        };
+        let mut term = TabTerm::spawn(&ctx, 3, program, &args, root()).expect("spawn ticker");
 
         term.set_visible(false);
         settle(&ctx);
@@ -642,8 +655,9 @@ mod tests {
     #[test]
     fn forwarding_thread_ends_when_terminal_is_dropped() {
         let ctx = egui::Context::default();
-        let term = TabTerm::spawn(&ctx, 2, "cmd.exe", &[], Path::new("C:\\"))
-            .expect("spawn cmd.exe");
+        let (sh, args) = interactive();
+        let term = TabTerm::spawn(&ctx, 2, sh, &args, root())
+            .expect("spawn shell");
 
         let visible = Arc::clone(&term.visible);
         assert!(
@@ -668,8 +682,9 @@ mod tests {
     #[test]
     fn write_input_reaches_pty() {
         let ctx = egui::Context::default();
-        let mut term = TabTerm::spawn(&ctx, 4, "cmd.exe", &[], Path::new("C:\\"))
-            .expect("spawn cmd.exe");
+        let (sh, args) = interactive();
+        let mut term = TabTerm::spawn(&ctx, 4, sh, &args, root())
+            .expect("spawn shell");
 
         term.write_input("exit 7\r");
 
@@ -693,7 +708,7 @@ mod tests {
         use alacritty_terminal::grid::Dimensions;
         let ctx = egui::Context::default();
         let mut term =
-            TabTerm::spawn(&ctx, 957, "cmd.exe", &[], Path::new("C:\\")).expect("spawn");
+            TabTerm::spawn(&ctx, 957, interactive().0, &[], root()).expect("spawn");
         assert!(term.applied_size().is_none(), "fresh spawn must not be a sync source");
 
         let layout = crate::Size::new(800.0, 340.0);
@@ -717,9 +732,8 @@ mod tests {
     #[test]
     fn output_within_follows_pty_events() {
         let ctx = egui::Context::default();
-        let mut term = TabTerm::spawn(&ctx, 90_601, "cmd.exe",
-            &["/c".to_string(), "echo".to_string(), "sampler-probe".to_string()],
-            &std::env::current_dir().unwrap()).unwrap();
+        let (program, args) = one_line("echo sampler-probe", "echo sampler-probe");
+        let mut term = TabTerm::spawn(&ctx, 90_601, program, &args, &std::env::current_dir().unwrap()).unwrap();
         // Nothing polled yet: no event has been observed, so not busy.
         assert!(!term.output_within(Duration::from_secs(60)));
         assert!(wait_for(|| { term.poll(); term.exited().is_some() }));

@@ -411,14 +411,15 @@ pub fn spawn_agent(
     }
 }
 
-/// Spawns a plain shell tab (`powershell.exe`) rooted at `cwd`. No worktree,
+/// Spawns a plain shell tab (`platform::shell`: PowerShell on Windows, `$SHELL` elsewhere) rooted at `cwd`. No worktree,
 /// no hooks, no status tracking beyond `AgentStatus::Unknown`.
 pub fn spawn_shell(
     ctx: &eframe::egui::Context,
     id: u64,
     cwd: &Path,
 ) -> anyhow::Result<Tab> {
-    let term = TabTerm::spawn(ctx, id, "powershell.exe", &[], cwd)?;
+    let sh = pterminal_core::platform::shell();
+    let term = TabTerm::spawn(ctx, id, &sh.program, &sh.args, cwd)?;
     Ok(Tab {
         agent_ctx: Default::default(),
         id,
@@ -489,12 +490,8 @@ pub fn spawn_dead_tab(
     repo_root: &Path,
     reason: String,
 ) -> anyhow::Result<Tab> {
-    let args: Vec<String> =
-        ["/c", "echo", "pTerminal", "placeholder", "tab", "-", "see", "banner", "above", "&", "exit", "1"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-    let term = TabTerm::spawn(ctx, saved.tab_id, "cmd.exe", &args, repo_root)?;
+    let banner = pterminal_core::platform::fail_banner(&["pTerminal", "placeholder", "tab", "-", "see", "banner", "above"]);
+    let term = TabTerm::spawn(ctx, saved.tab_id, &banner.program, &banner.args, repo_root)?;
     Ok(Tab {
         agent_ctx: Default::default(),
         id: saved.tab_id,
@@ -691,7 +688,10 @@ impl Tab {
                 )?;
                 TabTerm::spawn(ctx, self.id, &launch.program, &launch.args, &self.cwd)?
             }
-            TabKind::Shell => TabTerm::spawn(ctx, self.id, "powershell.exe", &[], &self.cwd)?,
+            TabKind::Shell => {
+                let sh = pterminal_core::platform::shell();
+                TabTerm::spawn(ctx, self.id, &sh.program, &sh.args, &self.cwd)?
+            }
         };
         self.term = term;
         self.status = AgentStatus::Unknown;

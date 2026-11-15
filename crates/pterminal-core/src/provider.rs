@@ -147,7 +147,7 @@ impl AgentProvider {
                     agent_name: spec.title,
                     hook_helper: spec.hook_helper,
                 })?;
-                "cmd.exe".to_string()
+                crate::platform::npm_cli("claude").program
             }
             Self::Codex => codex_executable()?.to_string_lossy().into_owned(),
         };
@@ -298,12 +298,10 @@ fn relaunch_spec<'a>(
 }
 
 pub fn claude_args(settings: &Path, prompt: &str, resume: Option<&str>) -> Vec<String> {
-    let mut args: Vec<String> = vec![
-        "/c".into(),
-        "claude".into(),
-        "--settings".into(),
-        settings.to_string_lossy().into_owned(),
-    ];
+    // `cmd.exe /c claude` on Windows (npm shim), `claude` itself elsewhere:
+    // the program comes from `platform::npm_cli`, these are what follow it.
+    let mut args: Vec<String> = crate::platform::npm_cli("claude").args;
+    args.extend(["--settings".into(), settings.to_string_lossy().into_owned()]);
     match resume {
         Some(sid) => {
             args.push("--resume".into());
@@ -328,13 +326,14 @@ pub fn codex_executable() -> anyhow::Result<PathBuf> {
 
 fn find_codex(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     for dir in paths {
-        let native = dir.join("codex.exe");
+        let native = dir.join(crate::platform::codex_exe_name());
         if native.is_file() {
             return Some(native);
         }
         // Both the older bundled-vendor and current optional npm platform
         // package layouts. Never search outside the Codex package itself.
-        if dir.join("codex.cmd").is_file() || dir.join("codex.ps1").is_file() {
+        // npm's shims: `codex.cmd`/`codex.ps1` on Windows, a `codex` symlink elsewhere
+        if dir.join("codex.cmd").is_file() || dir.join("codex.ps1").is_file() || (cfg!(unix) && dir.join("codex").is_file()) {
             if let Some(exe) = find_native(&dir.join("node_modules/@openai/codex"), 9) {
                 return Some(exe);
             }
@@ -354,7 +353,7 @@ fn find_native(dir: &Path, depth: usize) -> Option<PathBuf> {
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let ty = entry.file_type().ok()?;
-        if ty.is_file() && entry.file_name() == "codex.exe" {
+        if ty.is_file() && entry.file_name().to_string_lossy() == crate::platform::codex_exe_name() {
             return Some(entry.path());
         }
         if ty.is_dir() {
@@ -431,6 +430,7 @@ pub fn codex_args(
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     #[ignore = "requires an installed Codex CLI; no login or model request"]
     fn installed_codex_accepts_launch_config() {
@@ -468,6 +468,16 @@ mod tests {
         let args = codex_args(1, "agent", None, None, prompt, None, None);
         assert_eq!(&args[args.len() - 2..], ["--", prompt]);
     }
+    #[cfg(unix)]
+    #[test]
+    fn finds_codex_on_path_on_unix() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(find_codex([root.path().into()]).is_none());
+        std::fs::write(root.path().join("codex"), "").unwrap();
+        assert_eq!(find_codex([root.path().into()]), Some(root.path().join("codex")));
+    }
+
+    #[cfg(windows)]
     #[test]
     fn finds_native_and_npm_installations() {
         let root = tempfile::tempdir().unwrap();
@@ -493,24 +503,32 @@ mod tests {
     // `claude`. `SETTINGS` stands in for that path so the rest of each
     // expectation still reads as the literal capture it was.
 
+    /// The Claude argv after this platform's npm prefix (`/c claude` on
+    /// Windows, nothing elsewhere), asserting the prefix is there.
+    fn after_claude_prefix(args: &[String]) -> Vec<String> {
+        let prefix = crate::platform::npm_cli("claude").args;
+        assert!(args.starts_with(&prefix), "argv {args:?} lacks the npm prefix {prefix:?}");
+        args[prefix.len()..].to_vec()
+    }
+
     const SETTINGS: &str = "C:\\t\\pterminal\\tab-7.settings.json";
 
     #[test]
     fn claude_args_prompt_path_strips_quotes_unchanged() {
         let args = claude_args(Path::new(SETTINGS), "say \"hi\" now", None);
-        assert_eq!(args, vec!["/c", "claude", "--settings", SETTINGS, "say hi now"]);
+        assert_eq!(after_claude_prefix(&args), vec!["--settings", SETTINGS, "say hi now"]);
     }
 
     #[test]
     fn claude_args_empty_prompt_omits_trailing_arg() {
         let args = claude_args(Path::new(SETTINGS), "", None);
-        assert_eq!(args, vec!["/c", "claude", "--settings", SETTINGS]);
+        assert_eq!(after_claude_prefix(&args), vec!["--settings", SETTINGS]);
     }
 
     #[test]
     fn claude_args_resume_ignores_prompt() {
         let args = claude_args(Path::new(SETTINGS), "ignored prompt entirely", Some("sess-123"));
-        assert_eq!(args, vec!["/c", "claude", "--settings", SETTINGS, "--resume", "sess-123"]);
+        assert_eq!(after_claude_prefix(&args), vec!["--settings", SETTINGS, "--resume", "sess-123"]);
     }
 
     // --- A3: the abstraction ------------------------------------------------
@@ -580,10 +598,10 @@ mod tests {
         let launch = AgentProvider::Claude
             .launch(&spec7(&context, "do the thing \"quoted\"", None, dir.path()))
             .unwrap();
-        assert_eq!(launch.program, "cmd.exe");
+        assert_eq!(launch.program, crate::platform::npm_cli("claude").program);
         assert_eq!(
-            launch.args,
-            vec!["/c".to_string(), "claude".into(), "--settings".into(), expected_settings(7), "do the thing quoted".into()]
+            after_claude_prefix(&launch.args),
+            vec!["--settings".to_string(), expected_settings(7), "do the thing quoted".into()
         );
     }
 
@@ -594,10 +612,10 @@ mod tests {
         let launch = AgentProvider::Claude
             .launch(&spec7(&context, "ignored", Some("sess-abc"), dir.path()))
             .unwrap();
-        assert_eq!(launch.program, "cmd.exe");
+        assert_eq!(launch.program, crate::platform::npm_cli("claude").program);
         assert_eq!(
-            launch.args,
-            vec!["/c".to_string(), "claude".into(), "--settings".into(), expected_settings(7), "--resume".into(), "sess-abc".into()]
+            after_claude_prefix(&launch.args),
+            vec!["--settings".to_string(), expected_settings(7), "--resume".into(), "sess-abc".into()
         );
     }
 
@@ -610,10 +628,10 @@ mod tests {
         let launch = AgentProvider::Claude
             .relaunch(7, "fix \"login\"", &ctx(), Some(Path::new(HELPER)), dir.path(), None)
             .unwrap();
-        assert_eq!(launch.program, "cmd.exe");
+        assert_eq!(launch.program, crate::platform::npm_cli("claude").program);
         assert_eq!(
-            launch.args,
-            vec!["/c".to_string(), "claude".into(), "--settings".into(), expected_settings(7)]
+            after_claude_prefix(&launch.args),
+            vec!["--settings".to_string(), expected_settings(7)
         );
     }
 
@@ -626,13 +644,11 @@ mod tests {
         let launch = AgentProvider::Claude
             .relaunch(7, "fix \"login\"", &ctx(), Some(Path::new(HELPER)), dir.path(), Some("sess-crashed"))
             .unwrap();
-        assert_eq!(launch.program, "cmd.exe");
+        assert_eq!(launch.program, crate::platform::npm_cli("claude").program);
         assert_eq!(
-            launch.args,
+            after_claude_prefix(&launch.args),
             vec![
-                "/c".to_string(),
-                "claude".into(),
-                "--settings".into(),
+                "--settings".to_string(),
                 expected_settings(7),
                 "--resume".into(),
                 "sess-crashed".into()

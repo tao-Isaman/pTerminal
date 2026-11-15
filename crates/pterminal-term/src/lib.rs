@@ -173,5 +173,11 @@ pub use shaping::set_mark_shaping_font;
 /// Whether terminals run on the Windows Terminal `conpty.dll` shipped next to
 /// the executable (`true`) or on the inbox ConPTY. Meaningful once the first
 /// terminal has been spawned.
+#[cfg(windows)]
 pub use alacritty_terminal::tty::windows::using_conpty_dll;
+/// Unix has no ConPTY: terminals always run on the system PTY.
+#[cfg(not(windows))]
+pub fn using_conpty_dll() -> bool {
+    false
+}
 pub use view::TerminalView;

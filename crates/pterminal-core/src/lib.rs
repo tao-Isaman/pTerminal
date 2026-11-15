@@ -31,6 +31,7 @@ pub mod history;
 pub mod hooks;
 pub mod messages;
 pub mod orchestrator_model;
+pub mod platform;
 pub mod provider;
 pub mod resources;
 pub mod shared_ctx;
