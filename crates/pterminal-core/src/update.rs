@@ -64,9 +64,6 @@ fn is_newer(remote: &str, local: &str) -> bool {
     }
 }
 
-/// The update check reads `/releases/latest`, which never returns a pre-release.
-const UPDATE_ENDPOINT_IS_LATEST: bool = true;
-
 /// `x.y.z` or `x.y.z-<pre>` (e.g. `0.2.0-rc1`). A pre-release sorts below
 /// its release (`0.2.0-rc1` < `0.2.0`), and pre-releases of one version
 /// compare by their text, so an rc build is offered the final release.
@@ -137,7 +134,6 @@ pub fn spawn_update_check(local_version: &str) -> Receiver<UpdateInfo> {
     std::thread::spawn(move || {
         let url =
             format!("https://api.github.com/repos/{OWNER}/{REPO}/releases/latest");
-        const _: () = assert!(UPDATE_ENDPOINT_IS_LATEST);
         let Ok(out) = curl_cmd(&["-s", "--max-time", "10", &url]).output() else {
             return;
         };
@@ -218,7 +214,8 @@ mod tests {
         let wf = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.github/workflows/release.yml")).unwrap();
         assert!(wf.contains("--prerelease"), "release.yml lost the --prerelease flag");
         assert!(wf.contains("-match '-'"), "release.yml no longer keys --prerelease on a suffixed tag");
-        assert!(UPDATE_ENDPOINT_IS_LATEST, "the update check must read /releases/latest");
+        let src = include_str!("update.rs");
+        assert!(src.contains("/releases/latest\");"), "the update check must read /releases/latest, which skips pre-releases");
         assert!(!is_newer("1.2", "0.1.0")); // two parts
         assert!(!is_newer("1.2.3.4", "0.1.0")); // four parts
         assert!(!is_newer("", "0.1.0"));
