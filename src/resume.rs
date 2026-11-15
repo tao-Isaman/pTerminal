@@ -270,6 +270,7 @@ mod tests {
     use super::*;
     use crate::state;
     use crate::test_support::{app_with_tabs, exit_and_drain};
+    #[cfg(windows)] // only the Windows-only casing test builds a PathBuf
     use std::path::PathBuf;
 
     // ---- paths_match (Task 2's find-workspace comparison) ----
