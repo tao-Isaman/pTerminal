@@ -140,6 +140,8 @@ pub struct CloseWsDraft {
 
 pub struct PtApp {
     pub base: PathBuf,
+    /// The remote link (off by default; see `remote_ui`).
+    pub remote: crate::remote_ui::RemoteRt,
     pub workspaces: Vec<WsRt>,
     pub active_ws: usize,
     pub next_tab_id: u64,
@@ -427,6 +429,7 @@ impl PtApp {
         // relaxes the cadence on the first quiet frame.
         let sampler_control = SamplerControl::new(SAMPLE_FAST);
         let mut app = PtApp {
+            remote: crate::remote_ui::RemoteRt::load(&base),
             base,
             workspaces,
             active_ws: 0,
@@ -658,6 +661,8 @@ impl eframe::App for PtApp {
 
         self.drain_events(ctx);
         self.shortcuts(ctx);
+        self.remote_publish();
+        self.remote_ui(ctx);
 
         // Guard mouse-driven draft stacking: a dialog (error / new-tab /
         // close tab / close workspace) already owns the decision in flight,
@@ -740,6 +745,7 @@ impl eframe::App for PtApp {
     /// here touches the GL context.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.flush_persist();
+        self.remote.shutdown();
     }
 }
 

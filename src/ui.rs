@@ -158,6 +158,11 @@ impl PtApp {
             if ui.button("+ workspace").clicked() {
                 self.add_workspace();
             }
+            // Remote link (off by default): settings, pairing token, audit log.
+            let on = self.remote.link.cfg.lock().unwrap().enabled;
+            if ui.button(if on { "Remote link: on" } else { "Remote link" }).clicked() {
+                self.remote.show = !self.remote.show;
+            }
         });
     }
 

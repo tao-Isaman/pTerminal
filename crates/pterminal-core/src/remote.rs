@@ -525,3 +525,484 @@ mod tests {
         assert_eq!(pick_tailscale_ip(&ips[..1]), None);
     }
 }
+
+// --- transport: a tiny HTTP/1.1 server and client (std only) -----------------
+//
+// One request per connection, JSON in and out, bounded sizes and a read
+// timeout. The tailnet (WireGuard) encrypts the hop; the pairing token is
+// what authenticates.
+
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+const MAX_HEADER_LINES: usize = 40;
+const MAX_LINE: usize = 8 * 1024;
+const MAX_BODY: usize = 64 * 1024;
+/// How many audit entries the UI keeps in memory.
+pub const RECENT_AUDIT: usize = 200;
+
+/// State shared by the UI thread (writes config, snapshot) and the server
+/// thread (reads them, appends audit entries).
+pub struct Link {
+    pub cfg: Mutex<RemoteConfig>,
+    /// SHA-256 of the current pairing token, or `None` until one is made.
+    pub token_hash: Mutex<Option<String>>,
+    /// What a peer is called in delivered messages (`remote:<name>`).
+    pub peer_name: Mutex<String>,
+    pub snapshot: Mutex<Snapshot>,
+    pub recent: Mutex<VecDeque<AuditEntry>>,
+    pub audit_file: PathBuf,
+    stop: AtomicBool,
+}
+
+impl Link {
+    pub fn new(cfg: RemoteConfig, token_hash: Option<String>, peer_name: String, audit_file: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            cfg: Mutex::new(cfg),
+            token_hash: Mutex::new(token_hash),
+            peer_name: Mutex::new(peer_name),
+            snapshot: Mutex::new(Snapshot::default()),
+            recent: Mutex::new(VecDeque::new()),
+            audit_file,
+            stop: AtomicBool::new(false),
+        })
+    }
+
+    fn record(&self, e: AuditEntry) {
+        write_audit(&self.audit_file, &e);
+        let mut r = self.recent.lock().unwrap();
+        r.push_back(e);
+        while r.len() > RECENT_AUDIT {
+            r.pop_front();
+        }
+    }
+}
+
+/// A running listener. Dropping it does not stop it; call [`Server::stop`].
+pub struct Server {
+    link: Arc<Link>,
+    addr: SocketAddr,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Server {
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Stops accepting, wakes the accept loop and waits for it.
+    pub fn stop(mut self) {
+        self.link.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(300));
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Binds (after [`RemoteConfig::check`]) and serves on a background thread.
+pub fn start(link: Arc<Link>) -> anyhow::Result<Server> {
+    let cfg = link.cfg.lock().unwrap().clone();
+    cfg.check().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let listener = TcpListener::bind((cfg.bind, cfg.port))?;
+    let addr = listener.local_addr()?;
+    link.stop.store(false, Ordering::SeqCst);
+    let l2 = Arc::clone(&link);
+    let thread = std::thread::Builder::new().name("remote-link".into()).spawn(move || {
+        for conn in listener.incoming() {
+            if l2.stop.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Ok(stream) = conn {
+                serve_one(stream, &l2);
+            }
+        }
+    })?;
+    Ok(Server { link, addr, thread: Some(thread) })
+}
+
+fn serve_one(mut stream: TcpStream, link: &Link) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let peer = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let now = utc_now();
+    let response = match read_request(&mut stream, &peer) {
+        Ok(req) => {
+            let cfg = link.cfg.lock().unwrap().clone();
+            let hash = link.token_hash.lock().unwrap().clone();
+            let peer_name = link.peer_name.lock().unwrap().clone();
+            let snap = link.snapshot.lock().unwrap().clone();
+            let mut out = handle(&req, &cfg, hash.as_deref(), &snap, &now, &peer_name);
+            if let Some(a) = &out.append {
+                if let Err(e) = apply(a) {
+                    out.response = err(500, "could not queue the message");
+                    out.audit.status = 500;
+                    out.audit.note = format!("{} — append failed: {e}", out.audit.note);
+                }
+            }
+            link.record(out.audit);
+            out.response
+        }
+        Err(e) => {
+            link.record(AuditEntry { at: now, peer, method: "?".into(), path: "?".into(), status: 400, note: format!("bad request: {e}") });
+            err(400, "bad request")
+        }
+    };
+    let _ = write_response(&mut stream, &response);
+}
+
+fn read_request(stream: &mut TcpStream, peer: &str) -> anyhow::Result<Request> {
+    let mut r = BufReader::new(stream.try_clone()?);
+    let line = read_line(&mut r)?;
+    let mut parts = line.split(' ');
+    let (m, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    let method = match m {
+        "GET" => Method::Get,
+        "POST" => Method::Post,
+        other => Method::Other(other.to_string()),
+    };
+    let mut token = None;
+    let mut len = 0usize;
+    for _ in 0..MAX_HEADER_LINES {
+        let h = read_line(&mut r)?;
+        if h.is_empty() {
+            break;
+        }
+        let Some((k, v)) = h.split_once(':') else { continue };
+        let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
+        if k == "authorization" {
+            token = v.strip_prefix("Bearer ").map(|t| t.trim().to_string());
+        } else if k == "content-length" {
+            len = v.parse().map_err(|_| anyhow::anyhow!("bad content-length"))?;
+        }
+    }
+    anyhow::ensure!(len <= MAX_BODY, "body too large");
+    let mut body = vec![0; len];
+    r.read_exact(&mut body)?;
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    Ok(Request { method, path: path.to_string(), query: parse_query(query), token, body, peer: peer.to_string() })
+}
+
+fn read_line(r: &mut impl BufRead) -> anyhow::Result<String> {
+    let mut buf = Vec::new();
+    r.by_ref().take(MAX_LINE as u64).read_until(b'\n', &mut buf)?;
+    anyhow::ensure!(buf.ends_with(b"\n"), "line too long or connection closed");
+    Ok(String::from_utf8_lossy(&buf).trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// `a=1&b=x%20y` → pairs, percent- and `+`-decoded.
+pub fn parse_query(q: &str) -> Vec<(String, String)> {
+    q.split('&').filter(|p| !p.is_empty()).map(|p| {
+        let (k, v) = p.split_once('=').unwrap_or((p, ""));
+        (pct_decode(k), pct_decode(v))
+    }).collect()
+}
+
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |j: usize| b.get(j).and_then(|c| (*c as char).to_digit(16));
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' => match (hex(i + 1), hex(i + 2)) {
+                (Some(h), Some(l)) => {
+                    out.push((h * 16 + l) as u8);
+                    i += 2;
+                }
+                _ => out.push(b'%'),
+            },
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Percent-encodes everything but unreserved characters.
+pub fn pct_encode(s: &str) -> String {
+    s.bytes().map(|c| match c {
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (c as char).to_string(),
+        _ => format!("%{c:02X}"),
+    }).collect()
+}
+
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        202 => "Accepted",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        503 => "Service Unavailable",
+        _ => "Error",
+    }
+}
+
+fn write_response(w: &mut impl Write, r: &Response) -> std::io::Result<()> {
+    write!(w, "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", r.status, reason(r.status), r.json.len(), r.json)?;
+    w.flush()
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` for now, without a date crate.
+pub fn utc_now() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // civil-from-days (Howard Hinnant)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+// --- the client the Linux CLI uses --------------------------------------------
+
+/// Where this machine keeps the peer it talks to: `{ "url", "token" }`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PeerConfig {
+    pub url: String,
+    pub token: String,
+}
+
+/// One request to a peer at `base` (`http://100.x.y.z:47400`). Returns the
+/// status and body.
+pub fn call(base: &str, token: &str, method: &str, path_and_query: &str, body: Option<&str>) -> anyhow::Result<(u16, String)> {
+    let host = base.strip_prefix("http://").ok_or_else(|| anyhow::anyhow!("the peer URL must start with http:// (the tailnet encrypts the hop)"))?;
+    let host = host.trim_end_matches('/');
+    let addr: SocketAddr = host.parse().map_err(|_| anyhow::anyhow!("the peer URL needs an IP:port, got {host}"))?;
+    anyhow::ensure!(is_tailscale(addr.ip()) || addr.ip().is_loopback(), "refusing to send the token to {} (not a Tailscale or loopback address)", addr.ip());
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    s.set_read_timeout(Some(Duration::from_secs(15)))?;
+    let body = body.unwrap_or("");
+    write!(s, "{method} {path_and_query} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
+    let mut raw = String::new();
+    s.read_to_string(&mut raw)?;
+    let (head, resp_body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+    let status = head.split(' ').nth(1).and_then(|c| c.parse().ok()).ok_or_else(|| anyhow::anyhow!("not an HTTP response"))?;
+    Ok((status, resp_body.to_string()))
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    fn link(dir: &Path, allow: bool) -> Arc<Link> {
+        let cfg = RemoteConfig { enabled: true, allow_messages: allow, bind: IpAddr::V4(Ipv4Addr::LOCALHOST), port: 0 };
+        let l = Link::new(cfg, Some(token_hash("ptr_t")), "zerem".into(), audit_path(dir));
+        *l.snapshot.lock().unwrap() = Snapshot {
+            workspaces: vec![WsSnap {
+                name: "web".into(),
+                repo: dir.to_path_buf(),
+                orchestrator: false,
+                tabs: vec![TabSnap { title: "builder".into(), kind: "agent".into(), status: "idle".into(), tail: vec!["ok".into()] }],
+            }],
+        };
+        l
+    }
+
+    #[test]
+    fn end_to_end_over_a_real_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = link(dir.path(), true);
+        let server = start(Arc::clone(&l)).unwrap();
+        let base = format!("http://{}", server.addr());
+        let (st, body) = call(&base, "ptr_t", "GET", "/v1/workspaces", None).unwrap();
+        assert_eq!(st, 200, "{body}");
+        assert!(body.contains("builder"));
+        let (st, _) = call(&base, "wrong", "GET", "/v1/workspaces", None).unwrap();
+        assert_eq!(st, 401);
+        let (st, body) = call(&base, "ptr_t", "GET", &format!("/v1/tail?ws=web&tab={}", pct_encode("builder")), None).unwrap();
+        assert_eq!(st, 200, "{body}");
+        let (st, _) = call(&base, "ptr_t", "POST", "/v1/message", Some(r#"{"ws":"web","to":"builder","text":"สวัสดี"}"#)).unwrap();
+        assert_eq!(st, 202);
+        let got = crate::messages::read_new(&crate::shared_ctx::messages_path(dir.path()), 0).unwrap();
+        assert_eq!(got.messages[0].text, "สวัสดี");
+        assert_eq!(l.recent.lock().unwrap().len(), 4, "every request is audited");
+        assert!(std::fs::read_to_string(audit_path(dir.path())).unwrap().lines().count() >= 4);
+        server.stop();
+    }
+
+    #[test]
+    fn start_refuses_all_interfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = link(dir.path(), false);
+        l.cfg.lock().unwrap().bind = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        assert!(start(l).is_err());
+    }
+
+    #[test]
+    fn client_never_sends_the_token_off_the_tailnet() {
+        let e = call("http://192.168.1.5:47400", "ptr_t", "GET", "/v1/workspaces", None).unwrap_err();
+        assert!(e.to_string().contains("refusing"));
+        assert!(call("https://100.64.0.1:47400", "t", "GET", "/", None).is_err());
+    }
+
+    #[test]
+    fn query_decoding() {
+        assert_eq!(parse_query("ws=my%20app&tab=a+b&x"), vec![("ws".into(), "my app".into()), ("tab".into(), "a b".into()), ("x".into(), "".into())]);
+        assert_eq!(pct_decode(&pct_encode("งาน/ทดสอบ 1")), "งาน/ทดสอบ 1");
+        assert_eq!(pct_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn utc_now_is_iso8601() {
+        let t = utc_now();
+        assert_eq!(t.len(), 20);
+        assert!(t.ends_with('Z') && t.as_bytes()[10] == b'T');
+    }
+}
+
+// --- `pterminal remote …` (the CLI a peer such as Zerem's Linux box runs) ------
+
+pub const CLI_USAGE: &str = "usage:
+  pterminal remote pair <http://100.x.y.z:47400> <token>   save the peer (file is private to you)
+  pterminal remote ls                                     workspaces, tabs and status
+  pterminal remote tail <workspace> <tab> [lines]         last output of one tab
+  pterminal remote context <workspace>                    the workspace's shared.md
+  pterminal remote send <workspace> <agent|orchestrator|all> <text…>   message an agent
+The peer can also be given as PTERMINAL_REMOTE_URL + PTERMINAL_REMOTE_TOKEN.";
+
+/// Where the peer is saved: `<config dir>/pterminal/remote-peer.json`.
+pub fn peer_file() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(std::env::temp_dir).join("pterminal").join("remote-peer.json")
+}
+
+/// Saves the peer, readable only by this user on Unix.
+pub fn save_peer(path: &Path, peer: &PeerConfig) -> anyhow::Result<()> {
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let text = serde_json::to_string_pretty(peer)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+        f.write_all(text.as_bytes())?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+/// The peer from the environment, else the saved file. On Unix a file others
+/// can read is refused rather than used.
+pub fn load_peer(path: &Path) -> anyhow::Result<PeerConfig> {
+    if let (Ok(url), Ok(token)) = (std::env::var("PTERMINAL_REMOTE_URL"), std::env::var("PTERMINAL_REMOTE_TOKEN")) {
+        return Ok(PeerConfig { url, token });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).map_err(|_| anyhow::anyhow!("no peer saved; run `pterminal remote pair <url> <token>` first"))?.permissions().mode();
+        anyhow::ensure!(mode & 0o077 == 0, "{} is readable by others; run: chmod 600 {}", path.display(), path.display());
+    }
+    Ok(serde_json::from_str(&std::fs::read_to_string(path).map_err(|_| anyhow::anyhow!("no peer saved; run `pterminal remote pair <url> <token>` first"))?)?)
+}
+
+/// Runs `pterminal remote <args…>`; prints to stdout/stderr and returns the
+/// process exit code.
+pub fn cli(args: &[String]) -> i32 {
+    match cli_inner(args, &peer_file()) {
+        Ok(out) => {
+            println!("{out}");
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+fn cli_inner(args: &[String], peer_path: &Path) -> anyhow::Result<String> {
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    if let ["pair", url, token] = a.as_slice() {
+        let peer = PeerConfig { url: url.to_string(), token: token.to_string() };
+        let (st, body) = call(&peer.url, &peer.token, "GET", "/v1/workspaces", None)?;
+        anyhow::ensure!(st == 200, "the peer answered {st}: {body}");
+        save_peer(peer_path, &peer)?;
+        return Ok(format!("paired with {} (saved to {})", peer.url, peer_path.display()));
+    }
+    let peer = load_peer(peer_path)?;
+    let get = |pq: &str| -> anyhow::Result<serde_json::Value> {
+        let (st, body) = call(&peer.url, &peer.token, "GET", pq, None)?;
+        anyhow::ensure!(st == 200, "{st}: {body}");
+        Ok(serde_json::from_str(&body)?)
+    };
+    match a.as_slice() {
+        ["ls"] => {
+            let v = get("/v1/workspaces")?;
+            let mut out = String::new();
+            for ws in v["workspaces"].as_array().into_iter().flatten() {
+                out += &format!("{}{}\n", ws["name"].as_str().unwrap_or("?"), if ws["orchestrator"] == true { "  (orchestrator)" } else { "" });
+                for t in ws["tabs"].as_array().into_iter().flatten() {
+                    out += &format!("  {:<24} {:<6} {}\n", t["title"].as_str().unwrap_or("?"), t["kind"].as_str().unwrap_or(""), t["status"].as_str().unwrap_or(""));
+                }
+            }
+            Ok(out.trim_end().to_string())
+        }
+        ["tail", ws, tab, rest @ ..] => {
+            let lines = rest.first().copied().unwrap_or("40");
+            let v = get(&format!("/v1/tail?ws={}&tab={}&lines={}", pct_encode(ws), pct_encode(tab), pct_encode(lines)))?;
+            Ok(v["lines"].as_array().into_iter().flatten().filter_map(|l| l.as_str()).collect::<Vec<_>>().join("\n"))
+        }
+        ["context", ws] => Ok(get(&format!("/v1/context?ws={}", pct_encode(ws)))?["shared_md"].as_str().unwrap_or("").to_string()),
+        ["send", ws, to, text @ ..] if !text.is_empty() => {
+            let body = serde_json::json!({ "ws": ws, "to": to, "text": text.join(" ") }).to_string();
+            let (st, resp) = call(&peer.url, &peer.token, "POST", "/v1/message", Some(&body))?;
+            anyhow::ensure!(st == 202, "{st}: {resp}");
+            Ok(format!("queued for {ws}/{to}"))
+        }
+        _ => anyhow::bail!("{CLI_USAGE}"),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn pair_ls_tail_send_against_a_local_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RemoteConfig { enabled: true, allow_messages: true, bind: IpAddr::V4(Ipv4Addr::LOCALHOST), port: 0 };
+        let l = Link::new(cfg, Some(token_hash("ptr_cli")), "zerem".into(), audit_path(dir.path()));
+        *l.snapshot.lock().unwrap() = Snapshot {
+            workspaces: vec![WsSnap { name: "web app".into(), repo: dir.path().into(), orchestrator: false, tabs: vec![
+                TabSnap { title: "builder".into(), kind: "agent".into(), status: "working".into(), tail: vec!["a".into(), "b".into()] },
+            ] }],
+        };
+        let server = start(Arc::clone(&l)).unwrap();
+        let url = format!("http://{}", server.addr());
+        let peer = dir.path().join("peer.json");
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        assert!(cli_inner(&s(&["pair", &url, "ptr_wrong"]), &peer).is_err(), "a wrong token is not saved");
+        assert!(!peer.exists());
+        cli_inner(&s(&["pair", &url, "ptr_cli"]), &peer).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&peer).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert!(cli_inner(&s(&["ls"]), &peer).unwrap().contains("builder"));
+        assert_eq!(cli_inner(&s(&["tail", "web app", "builder", "1"]), &peer).unwrap(), "b");
+        assert!(cli_inner(&s(&["send", "web app", "builder", "fix", "it"]), &peer).unwrap().contains("queued"));
+        assert!(cli_inner(&s(&["exec", "rm"]), &peer).is_err());
+        server.stop();
+    }
+}
