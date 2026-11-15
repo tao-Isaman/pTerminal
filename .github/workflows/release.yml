@@ -76,7 +76,40 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # A tag with a suffix (v0.2.0-rc1) is a PRE-release: GitHub's
+          # /releases/latest never returns one, so installed copies do not
+          # auto-update to it; the boss installs it by hand when ready.
+          $pre = @()
+          if ($env:GITHUB_REF_NAME -match '-') { $pre = @('--prerelease') }
           gh release create $env:GITHUB_REF_NAME `
             "installer\Output\pTerminal-setup.exe" `
             --title "pTerminal $env:GITHUB_REF_NAME" `
-            --generate-notes
+            --generate-notes @pre
+
+  # Linux build, attached to the same release once the Windows job has made it.
+  # A tarball of the two binaries; Linux copies do not self-update.
+  linux:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q pkg-config libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev \
+            libfontconfig-dev libfreetype-dev libdbus-1-dev libudev-dev
+      - name: test
+        run: cargo test --workspace
+      - name: build
+        run: cargo build --release
+      - name: package and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          name="pTerminal-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir -p "$name"
+          cp target/release/pterminal target/release/pterm_hook README.md THIRD-PARTY-NOTICES.txt "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256"

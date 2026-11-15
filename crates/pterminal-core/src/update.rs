@@ -50,21 +50,41 @@ fn curl_cmd(args: &[&str]) -> Command {
 /// is never "newer" — a malformed tag must not trigger an update notice.
 fn is_newer(remote: &str, local: &str) -> bool {
     match (parse_semver(remote), parse_semver(local)) {
-        (Some(r), Some(l)) => r > l,
+        (Some((rm, rn, rp, rpre)), Some((lm, ln, lp, lpre))) => match (rm, rn, rp).cmp(&(lm, ln, lp)) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            // same x.y.z: a release beats its pre-release; two pre-releases by text
+            std::cmp::Ordering::Equal => match (rpre, lpre) {
+                (None, Some(_)) => true,
+                (Some(r), Some(l)) => r > l,
+                _ => false,
+            },
+        },
         _ => false,
     }
 }
 
-fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+/// The update check reads `/releases/latest`, which never returns a pre-release.
+const UPDATE_ENDPOINT_IS_LATEST: bool = true;
+
+/// `x.y.z` or `x.y.z-<pre>` (e.g. `0.2.0-rc1`). A pre-release sorts below
+/// its release (`0.2.0-rc1` < `0.2.0`), and pre-releases of one version
+/// compare by their text, so an rc build is offered the final release.
+fn parse_semver(s: &str) -> Option<(u64, u64, u64, Option<String>)> {
     let s = s.trim().trim_start_matches('v');
-    let mut parts = s.split('.');
+    let (core, pre) = match s.split_once('-') {
+        Some((c, p)) if !p.is_empty() => (c, Some(p.to_string())),
+        Some(_) => return None,
+        None => (s, None),
+    };
+    let mut parts = core.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     let patch = parts.next()?.parse().ok()?;
     if parts.next().is_some() {
         return None;
     }
-    Some((major, minor, patch))
+    Some((major, minor, patch, pre))
 }
 
 /// Pulls `(tag_name, installer download url)` out of a GitHub
@@ -117,6 +137,7 @@ pub fn spawn_update_check(local_version: &str) -> Receiver<UpdateInfo> {
     std::thread::spawn(move || {
         let url =
             format!("https://api.github.com/repos/{OWNER}/{REPO}/releases/latest");
+        const _: () = assert!(UPDATE_ENDPOINT_IS_LATEST);
         let Ok(out) = curl_cmd(&["-s", "--max-time", "10", &url]).output() else {
             return;
         };
@@ -181,6 +202,23 @@ mod tests {
     #[test]
     fn malformed_versions_are_never_newer() {
         assert!(!is_newer("banana", "0.1.0"));
+        // pre-releases (the Linux port ships as v0.2.0-rc1 first)
+        assert!(is_newer("0.2.0", "0.2.0-rc1"), "an rc build is offered the final release");
+        assert!(is_newer("0.2.0-rc2", "0.2.0-rc1"));
+        assert!(!is_newer("0.2.0-rc1", "0.2.0"));
+        assert!(is_newer("0.2.0-rc1", "0.1.31"));
+        assert!(!is_newer("0.2.0-", "0.1.0"));
+    }
+
+    /// Guardrail: an `-rc` tag must publish as a PRE-release, or every
+    /// installed copy would auto-update to an untested build overnight
+    /// (`/releases/latest`, which the update check reads, skips pre-releases).
+    #[test]
+    fn suffixed_tags_publish_as_prereleases() {
+        let wf = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.github/workflows/release.yml")).unwrap();
+        assert!(wf.contains("--prerelease"), "release.yml lost the --prerelease flag");
+        assert!(wf.contains("-match '-'"), "release.yml no longer keys --prerelease on a suffixed tag");
+        assert!(UPDATE_ENDPOINT_IS_LATEST, "the update check must read /releases/latest");
         assert!(!is_newer("1.2", "0.1.0")); // two parts
         assert!(!is_newer("1.2.3.4", "0.1.0")); // four parts
         assert!(!is_newer("", "0.1.0"));
