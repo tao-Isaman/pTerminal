@@ -116,8 +116,17 @@ impl History {
 /// continuation row of a wrapped command — the feature silently turns
 /// off rather than guessing. ponytail: single-row commands only; stitch
 /// WRAPLINE rows if wrapped-command history ever matters.
+///
+/// Unix: bash ends its prompt in `$ ` (`# ` as root), zsh in `% `, fish in
+/// `> `. The prompt comes first on the row, so the EARLIEST of those markers
+/// is its end, for the same reason as above.
 pub fn typed_prefix(row_left_of_cursor: &str) -> Option<&str> {
-    row_left_of_cursor.find("> ").map(|i| &row_left_of_cursor[i + 2..])
+    typed_prefix_for(row_left_of_cursor, cfg!(windows))
+}
+
+fn typed_prefix_for(row: &str, windows: bool) -> Option<&str> {
+    let markers: &[&str] = if windows { &["> "] } else { &["$ ", "# ", "% ", "> "] };
+    markers.iter().filter_map(|m| row.find(m)).min().map(|i| &row[i + 2..])
 }
 
 /// The ghost's visible remainder: `suggestion` minus `prefix` chars
@@ -134,6 +143,18 @@ pub fn ghost_suffix<'a>(suggestion: &'a str, prefix: &str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unix_prompts_end_at_the_first_prompt_marker() {
+        assert_eq!(typed_prefix_for("isaman@box:~/work$ git st", false), Some("git st"));
+        assert_eq!(typed_prefix_for("root@box:/# apt up", false), Some("apt up"));
+        assert_eq!(typed_prefix_for("box% ls -la", false), Some("ls -la"));
+        assert_eq!(typed_prefix_for("~/w> cargo", false), Some("cargo"));
+        assert_eq!(typed_prefix_for("~$ echo cost $ 5 # note > out", false), Some("echo cost $ 5 # note > out"));
+        assert_eq!(typed_prefix_for("no prompt here", false), None);
+        // Windows keeps its single rule: `$ ` is ordinary text there
+        assert_eq!(typed_prefix_for("PS C:\\x> echo $ x", true), Some("echo $ x"));
+    }
 
     #[test]
     fn commit_dedupes_moves_to_newest_and_caps() {

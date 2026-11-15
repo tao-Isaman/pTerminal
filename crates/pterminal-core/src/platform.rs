@@ -140,11 +140,10 @@ pub mod font_names {
     pub fn math() -> &'static [&'static str] {
         if cfg!(windows) { &[] } else { &["NotoSansMath-Regular.ttf"] }
     }
-    /// Colour emoji with COLR layers (what `pterminal-term`'s emoji renderer
-    /// reads). Linux's Noto Color Emoji is bitmap (CBDT), not COLR, so it is
-    /// not listed: emoji fall back to the symbol font there.
+    /// Colour emoji: Segoe UI Emoji (COLR layers) on Windows, Noto Color Emoji
+    /// (CBDT bitmaps) on Linux; `pterminal-term`'s emoji renderer draws both.
     pub fn emoji() -> &'static [&'static str] {
-        if cfg!(windows) { &["seguiemj.ttf"] } else { &[] }
+        if cfg!(windows) { &["seguiemj.ttf"] } else { &["NotoColorEmoji.ttf"] }
     }
 }
 
