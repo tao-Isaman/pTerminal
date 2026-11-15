@@ -39,6 +39,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sysinfo = "0.38.4"
 tempfile = "3.27.0"
+# Remote link (pterminal-core::remote): pairing-token randomness and its stored hash.
+getrandom = "0.3.4"
+sha2 = "0.10"
 pterminal-core = { path = "crates/pterminal-core" }
 pterminal-term = { path = "crates/pterminal-term" }
 
