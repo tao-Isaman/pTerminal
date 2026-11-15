@@ -1039,6 +1039,8 @@ pub(crate) fn system_font_definitions() -> egui::FontDefinitions {
     let mut fallbacks = vec![
         ("thai-fallback".to_string(), thai_font_bytes()),
         ("symbol-fallback".to_string(), symbol_font_bytes()),
+        // Linux only (an empty name list on Windows, so nothing is added there).
+        ("math-fallback".to_string(), math_font_bytes()),
     ];
     for file in cjk_font_files(&user_locale_name()) {
         fallbacks.push((format!("cjk-{file}"), font_file(file)));
@@ -1109,6 +1111,12 @@ pub(crate) fn user_locale_name() -> String {
 /// Windows, Noto Sans Symbols 2 / DejaVu Sans on Linux.
 pub(crate) fn symbol_font_bytes() -> Option<Vec<u8>> {
     std::fs::read(platform::find_font(platform::font_names::symbols())?).ok()
+}
+
+/// Noto Sans Math on Linux for the symbols the symbol font lacks; never
+/// anything on Windows (see `platform::font_names::math`).
+fn math_font_bytes() -> Option<Vec<u8>> {
+    std::fs::read(platform::find_font(platform::font_names::math())?).ok()
 }
 
 /// A Thai UI font: Leelawadee UI / Tahoma on Windows, Noto Sans Thai (or

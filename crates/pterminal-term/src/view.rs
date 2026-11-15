@@ -2556,14 +2556,15 @@ mod shift_enter_event_path_tests {
             ctx.clone(),
             tx,
             BackendSettings {
-                shell: "cmd.exe".to_string(),
+                // Unix: a plain `sh`, whose tty echo shows the typed marker
+                shell: if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.to_string(),
                 args: vec![],
                 working_directory: Some(dir),
                 scrolling_history: 200,
             },
             Arc::new(AtomicBool::new(true)),
         )
-        .expect("spawn cmd.exe");
+        .expect("spawn the test shell");
 
         // frame 1: no events — establishes widget focus
         drive_frame(&ctx, &mut backend, vec![]);
@@ -3085,6 +3086,9 @@ mod run_coalescing_tests {
 
     /// Wide emoji cells become one textured rectangle each, exactly their
     /// two cells; VS15 keeps a character in text presentation.
+    // Windows-only: the textures come from Segoe UI Emoji's COLR layers;
+    // Linux has no COLR emoji font (`platform::font_names::emoji` is empty).
+    #[cfg(windows)]
     #[test]
     fn colour_emoji_are_drawn_as_textures_and_text_stays_text() {
         let ctx = egui::Context::default();
@@ -3129,6 +3133,8 @@ mod run_coalescing_tests {
     /// tables put them — shifted left, clear of ป's stem — not at the
     /// overstrike position (the base glyph's right edge) the old renderer
     /// always used.
+    // Windows-only: measured against Leelawadee UI, like `shaping`'s tests.
+    #[cfg(windows)]
     #[test]
     fn thai_marks_on_a_tall_consonant_are_placed_by_the_font() {
         let thai = std::fs::read(r"C:\Windows\Fonts\LeelawUI.ttf").expect("Leelawadee UI");

@@ -239,15 +239,19 @@ mod tests {
         assert_eq!(cmd.dir, std::env::current_dir().unwrap());
     }
 
+    // An absolute path on the platform under test (`C:\…` is relative on Unix).
+    const SOME_PATH: &str = if cfg!(windows) { "C:\\some\\path" } else { "/some/path" };
+    const ABSOLUTE_PATH: &str = if cfg!(windows) { "C:\\absolute\\path" } else { "/absolute/path" };
+
     #[test]
     fn resume_with_dir_uses_given_dir() {
         let args = vec![
             "pterminal".into(), "resume".into(),
             "--id".into(), "abc123".into(),
-            "--dir".into(), "C:\\some\\path".into(),
+            "--dir".into(), SOME_PATH.into(),
         ];
         let cmd = parse_args(&args).expect("Some").expect("Ok");
-        assert_eq!(cmd.dir, PathBuf::from("C:\\some\\path"));
+        assert_eq!(cmd.dir, PathBuf::from(SOME_PATH));
     }
 
     #[test]
@@ -329,10 +333,10 @@ mod tests {
         let args = vec![
             "pterminal".into(), "resume".into(),
             "--id".into(), "abc123".into(),
-            "--dir".into(), "C:\\absolute\\path".into(),
+            "--dir".into(), ABSOLUTE_PATH.into(),
         ];
         let cmd = parse_args(&args).expect("Some").expect("Ok");
-        assert_eq!(cmd.dir, PathBuf::from("C:\\absolute\\path"));
+        assert_eq!(cmd.dir, PathBuf::from(ABSOLUTE_PATH));
     }
 
     #[test]

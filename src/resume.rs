@@ -295,6 +295,9 @@ mod tests {
         assert!(!paths_match(a.path(), b.path()));
     }
 
+    // Windows-only: Linux filesystems are case-sensitive, so the two casings
+    // are genuinely different (missing) paths there.
+    #[cfg(windows)]
     #[test]
     fn paths_match_is_case_insensitive_via_canonicalize() {
         // Windows' filesystem is case-insensitive, but `PathBuf`'s
@@ -307,6 +310,20 @@ mod tests {
         let upper = PathBuf::from(dir.path().to_string_lossy().to_uppercase());
         assert_ne!(lower, upper, "test assumption: raw PathBuf equality must be case-sensitive");
         assert!(paths_match(&lower, &upper));
+    }
+
+    /// The Unix counterpart of the casing test: two spellings of one
+    /// directory (here via a symlink) match because both canonicalize.
+    #[cfg(unix)]
+    #[test]
+    fn paths_match_resolves_a_symlink_via_canonicalize() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert_ne!(real, link);
+        assert!(paths_match(&real, &link));
     }
 
     #[test]

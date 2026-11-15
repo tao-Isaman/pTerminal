@@ -401,22 +401,30 @@ mod tests {
     /// only the context-menu wiring around `SelectAll`/`ClearScreen`
     /// (`term.rs`'s `TabTerm::ui`) needs a live egui frame and is
     /// live-verified instead.
+    ///
+    /// On Unix the child is `/bin/sh` with its prompt pinned to `$ ` (via
+    /// `env`, so a CI runner's own `PS1` cannot change what the tests see).
     fn spawn_backend(id: u64) -> TerminalBackend {
         let ctx = egui::Context::default();
         let (tx, _rx) = mpsc::channel();
+        let (shell, args): (&str, Vec<String>) = if cfg!(windows) {
+            ("cmd.exe", vec![])
+        } else {
+            ("/usr/bin/env", vec!["PS1=$ ".into(), "/bin/sh".into()])
+        };
         TerminalBackend::new(
             id,
             ctx,
             tx,
             BackendSettings {
-                shell: "cmd.exe".to_string(),
-                args: vec![],
+                shell: shell.to_string(),
+                args,
                 working_directory: None,
                 scrolling_history: 1000,
             },
             Arc::new(AtomicBool::new(true)),
         )
-        .expect("spawn cmd.exe")
+        .expect("spawn the test shell")
     }
 
     /// Polls `sync()` until the FULL grid (not just the visible viewport)
@@ -490,9 +498,12 @@ mod tests {
         // right now". (Numeric suffixes deliberately aren't used to name
         // an "early" line to assert on: "marker-1" is a substring of
         // "marker-10".."marker-19", so it wouldn't prove anything.)
-        backend.process_command(BackendCommand::Write(
-            b"for /l %i in (1,1,80) do @echo pterminal-flood-%i\r".to_vec(),
-        ));
+        let flood: &[u8] = if cfg!(windows) {
+            b"for /l %i in (1,1,80) do @echo pterminal-flood-%i\r"
+        } else {
+            b"i=1; while [ $i -le 80 ]; do echo pterminal-flood-$i; i=$((i+1)); done\r"
+        };
+        backend.process_command(BackendCommand::Write(flood.to_vec()));
         assert!(
             grid_contains(&mut backend, "pterminal-flood-80"),
             "the loop's last line never reached the grid"
@@ -647,7 +658,12 @@ mod tests {
         assert!(!has_right, "nothing should sit right of the cursor");
         // the prompt (`C:\...>`) must still be part of the row text, so
         // history::typed_prefix can find its "> " marker
-        assert!(left.contains('>'), "prompt marker missing from {left:?}");
+        if cfg!(windows) {
+            assert!(left.contains('>'), "prompt marker missing from {left:?}");
+        } else {
+            // the Unix test shell's prompt is pinned to `$ ` (spawn_backend)
+            assert!(left.contains("$ "), "prompt missing from {left:?}");
+        }
     }
 
     /// Regression test for the `Grid::iter_from` off-by-one caught during

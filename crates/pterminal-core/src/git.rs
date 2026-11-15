@@ -282,10 +282,18 @@ mod tests {
 
     #[test]
     fn worktree_dir_is_sibling() {
-        assert_eq!(
-            worktree_dir(Path::new("D:\\projectx"), "fix-auth"),
-            Path::new("D:\\projectx-wt\\fix-auth")
-        );
+        if cfg!(windows) {
+            assert_eq!(
+                worktree_dir(Path::new("D:\\projectx"), "fix-auth"),
+                Path::new("D:\\projectx-wt\\fix-auth")
+            );
+        } else {
+            // `D:\projectx` is one relative component on Unix; use a Unix path.
+            assert_eq!(
+                worktree_dir(Path::new("/src/projectx"), "fix-auth"),
+                Path::new("/src/projectx-wt/fix-auth")
+            );
+        }
     }
 
     #[test]

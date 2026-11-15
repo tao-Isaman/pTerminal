@@ -387,7 +387,8 @@ pub fn forget_checkout_hooks(cwd: &Path) -> anyhow::Result<()> {
     let file = cwd.join(".claude").join("settings.local.json");
     let text = match std::fs::read_to_string(&file) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // A `.claude` that is a file: Windows reports NotFound, Unix ENOTDIR.
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Ok(()),
         Err(e) => return Err(anyhow::Error::new(e).context(format!("reading {}", file.display()))),
     };
     let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else { return Ok(()) };
@@ -529,15 +530,25 @@ mod tests {
     /// binary any more.
     #[test]
     fn hook_settings_use_the_given_helper_or_the_echo_fallback() {
-        let with = hook_settings(&setup(5, "a", Some(Path::new("C:\\Program Files\\pTerminal\\pterm_hook.exe"))));
+        let helper = if cfg!(windows) { "C:\\Program Files\\pTerminal\\pterm_hook.exe" } else { "/opt/pTerminal/pterm_hook" };
+        let with = hook_settings(&setup(5, "a", Some(Path::new(helper))));
         let stop = with["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert_eq!(
-            stop,
-            format!("\"C:\\Program Files\\pTerminal\\pterm_hook.exe\" Stop \"{}\"", events_file(5).display())
-        );
+        if cfg!(windows) {
+            assert_eq!(
+                stop,
+                format!("\"C:\\Program Files\\pTerminal\\pterm_hook.exe\" Stop \"{}\"", events_file(5).display())
+            );
+        } else {
+            // Unix: Claude Code runs hooks with `sh`, so the words are sh-quoted.
+            assert_eq!(stop, format!("'/opt/pTerminal/pterm_hook' Stop '{}'", events_file(5).display()));
+        }
         let without = hook_settings(&setup(5, "a", None));
         let stop = without["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert_eq!(stop, format!("cmd /c echo Stop>>\"{}\"", events_file(5).display()));
+        if cfg!(windows) {
+            assert_eq!(stop, format!("cmd /c echo Stop>>\"{}\"", events_file(5).display()));
+        } else {
+            assert_eq!(stop, format!("echo Stop >> '{}'", events_file(5).display()));
+        }
     }
 
     #[test]
@@ -560,8 +571,12 @@ mod tests {
 
     #[test]
     fn session_start_injects_shared_context_and_readme() {
-        let shared = Path::new("D:\\repo\\.pterminal\\shared.md");
-        let readme = Path::new("D:\\repo\\.pterminal\\README-agents.md");
+        // Absolute paths on the platform under test; Windows keeps the original literals.
+        let (shared, readme) = if cfg!(windows) {
+            (Path::new("D:\\repo\\.pterminal\\shared.md"), Path::new("D:\\repo\\.pterminal\\README-agents.md"))
+        } else {
+            (Path::new("/repo/.pterminal/shared.md"), Path::new("/repo/.pterminal/README-agents.md"))
+        };
         let v = hook_settings(&HookSetup {
             tab_id: 2,
             shared_md: Some(shared),
@@ -572,10 +587,17 @@ mod tests {
         let cmds = v["hooks"]["SessionStart"][0]["hooks"].as_array().unwrap();
         assert_eq!(cmds.len(), 2); // inject + event append
         let inject = cmds[0]["command"].as_str().unwrap();
-        assert_eq!(
-            inject,
-            "cmd /c type \"D:\\repo\\.pterminal\\shared.md\" & echo. & type \"D:\\repo\\.pterminal\\README-agents.md\" & echo. & echo You are agent \"bravo\"."
-        );
+        if cfg!(windows) {
+            assert_eq!(
+                inject,
+                "cmd /c type \"D:\\repo\\.pterminal\\shared.md\" & echo. & type \"D:\\repo\\.pterminal\\README-agents.md\" & echo. & echo You are agent \"bravo\"."
+            );
+        } else {
+            assert_eq!(
+                inject,
+                "cat '/repo/.pterminal/shared.md'; echo; cat '/repo/.pterminal/README-agents.md'; echo; echo You are agent \"bravo\"."
+            );
+        }
         assert!(cmds[1]["command"].as_str().unwrap().contains("SessionStart"));
     }
 
@@ -586,7 +608,11 @@ mod tests {
         // always present since agent_name isn't optional.
         let v = hook_settings(&setup(3, "solo", None));
         let inject = v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert_eq!(inject, "cmd /c echo You are agent \"solo\".");
+        if cfg!(windows) {
+            assert_eq!(inject, "cmd /c echo You are agent \"solo\".");
+        } else {
+            assert_eq!(inject, "echo You are agent \"solo\".");
+        }
     }
 
     // --- A4: the migration off the per-checkout file ---------------------

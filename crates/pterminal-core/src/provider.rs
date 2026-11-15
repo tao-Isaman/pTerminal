@@ -543,14 +543,21 @@ mod tests {
     // `--settings <hooks::tab_settings_file(7)>` and nothing else. Codex's
     // are untouched.
 
+    // The fixture paths are absolute on the platform under test: a `D:\\`
+    // path has no parent on Unix, which would change the argv for reasons
+    // that have nothing to do with the launch logic. Windows keeps the
+    // original literals.
+    const REPO_DOT_PTERMINAL: &str = if cfg!(windows) { "D:\\repo\\.pterminal" } else { "/repo/.pterminal" };
+
     fn ctx() -> AgentContext {
+        let dir = Path::new(REPO_DOT_PTERMINAL);
         AgentContext {
-            shared_md: Some(PathBuf::from("D:\\repo\\.pterminal\\shared.md")),
-            agent_readme: Some(PathBuf::from("D:\\repo\\.pterminal\\README-agents.md")),
+            shared_md: Some(dir.join("shared.md")),
+            agent_readme: Some(dir.join("README-agents.md")),
         }
     }
 
-    const HELPER: &str = "C:\\Program Files\\pTerminal\\pterm_hook.exe";
+    const HELPER: &str = if cfg!(windows) { "C:\\Program Files\\pTerminal\\pterm_hook.exe" } else { "/opt/pTerminal/pterm_hook" };
 
     /// A `LaunchSpec` for tab 7 with every field the argv tests vary
     /// defaulted; `cwd` is a fresh temp dir so a Claude `launch` (which
@@ -574,7 +581,8 @@ mod tests {
     /// re-derive the value under test with the code under test).
     fn expected_notify(id: u64) -> String {
         let events = hooks::events_file(id).to_string_lossy().replace('\\', "\\\\");
-        format!("notify=[\"C:\\\\Program Files\\\\pTerminal\\\\pterm_hook.exe\",\"CodexNotify\",\"{events}\"]")
+        let helper = HELPER.replace('\\', "\\\\");
+        format!("notify=[\"{helper}\",\"CodexNotify\",\"{events}\"]")
     }
 
     /// The `--settings` value for tab 7: the machine's temp dir plus the
@@ -583,13 +591,22 @@ mod tests {
     /// the value under test with the code under test.
     fn expected_settings(id: u64) -> String {
         let path = hooks::tab_settings_file(id).to_string_lossy().into_owned();
-        let tail = format!("\\pterminal\\tab-{id}.settings.json");
+        let sep = std::path::MAIN_SEPARATOR;
+        let tail = format!("{sep}pterminal{sep}tab-{id}.settings.json");
         assert!(path.ends_with(&tail), "{path}");
         assert!(path.starts_with(&std::env::temp_dir().to_string_lossy().into_owned()), "{path}");
         path
     }
 
+    #[cfg(windows)]
     const CODEX_DEV_INSTRUCTIONS: &str = "developer_instructions=\"You are the pTerminal agent named fix \\\"login\\\".\\nRead D:\\\\repo\\\\.pterminal\\\\shared.md for shared context and coordination instructions.\\nRead D:\\\\repo\\\\.pterminal\\\\README-agents.md for shared context and coordination instructions.\\n\"";
+    #[cfg(not(windows))]
+    const CODEX_DEV_INSTRUCTIONS: &str = "developer_instructions=\"You are the pTerminal agent named fix \\\"login\\\".\\nRead /repo/.pterminal/shared.md for shared context and coordination instructions.\\nRead /repo/.pterminal/README-agents.md for shared context and coordination instructions.\\n\"";
+    const CODEX_WRITABLE_ROOTS: &str = if cfg!(windows) {
+        "sandbox_workspace_write.writable_roots=[\"D:\\\\repo\\\\.pterminal\"]"
+    } else {
+        "sandbox_workspace_write.writable_roots=[\"/repo/.pterminal\"]"
+    };
 
     #[test]
     fn claude_launch_fresh_with_prompt_matches_old_spawn_agent() {
@@ -664,7 +681,7 @@ mod tests {
             vec![
                 "--no-alt-screen".to_string(),
                 "-c".into(),
-                "sandbox_workspace_write.writable_roots=[\"D:\\\\repo\\\\.pterminal\"]".into(),
+                CODEX_WRITABLE_ROOTS.into(),
                 "-c".into(),
                 CODEX_DEV_INSTRUCTIONS.into(),
                 "-c".into(),
@@ -683,7 +700,7 @@ mod tests {
             vec![
                 "--no-alt-screen".to_string(),
                 "-c".into(),
-                "sandbox_workspace_write.writable_roots=[\"D:\\\\repo\\\\.pterminal\"]".into(),
+                CODEX_WRITABLE_ROOTS.into(),
                 "-c".into(),
                 CODEX_DEV_INSTRUCTIONS.into(),
                 "-c".into(),
@@ -705,7 +722,7 @@ mod tests {
             vec![
                 "--no-alt-screen".to_string(),
                 "-c".into(),
-                "sandbox_workspace_write.writable_roots=[\"D:\\\\repo\\\\.pterminal\"]".into(),
+                CODEX_WRITABLE_ROOTS.into(),
                 "-c".into(),
                 CODEX_DEV_INSTRUCTIONS.into(),
                 "-c".into(),
@@ -810,17 +827,28 @@ mod tests {
         let id = 990_107;
         let spec = LaunchSpec { tab_id: id, ..spec7(&context, "go", None, dir.path()) };
         let launch = AgentProvider::Claude.launch(&spec).unwrap();
-        let named = PathBuf::from(&launch.args[3]);
+        let named = PathBuf::from(&after_claude_prefix(&launch.args)[1]);
         assert_eq!(named, hooks::tab_settings_file(id));
         let text = std::fs::read_to_string(&named).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         let inject = v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert_eq!(
-            inject,
-            "cmd /c type \"D:\\repo\\.pterminal\\shared.md\" & echo. & type \"D:\\repo\\.pterminal\\README-agents.md\" & echo. & echo You are agent \"fix \"login\"\"."
-        );
+        if cfg!(windows) {
+            assert_eq!(
+                inject,
+                "cmd /c type \"D:\\repo\\.pterminal\\shared.md\" & echo. & type \"D:\\repo\\.pterminal\\README-agents.md\" & echo. & echo You are agent \"fix \"login\"\"."
+            );
+        } else {
+            assert_eq!(
+                inject,
+                "cat '/repo/.pterminal/shared.md'; echo; cat '/repo/.pterminal/README-agents.md'; echo; echo You are agent \"fix \"login\"\"."
+            );
+        }
         let stop = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert_eq!(stop, format!("\"{HELPER}\" Stop \"{}\"", hooks::events_file(id).display()));
+        if cfg!(windows) {
+            assert_eq!(stop, format!("\"{HELPER}\" Stop \"{}\"", hooks::events_file(id).display()));
+        } else {
+            assert_eq!(stop, format!("'{HELPER}' Stop '{}'", hooks::events_file(id).display()));
+        }
         assert!(!dir.path().join(".claude").exists(), "a launch must not write into the checkout");
         let _ = std::fs::remove_file(named);
     }

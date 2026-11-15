@@ -134,6 +134,12 @@ pub mod font_names {
             &["NotoSansSymbols2-Regular.ttf", "DejaVuSans.ttf"]
         }
     }
+    /// A second symbol fallback, Linux only: Noto Sans Symbols 2 and DejaVu
+    /// Sans both lack U+29C9 `⧉` (Claude Code's "open in editor" mark), which
+    /// Noto Sans Math has. Segoe UI Symbol covers it on Windows.
+    pub fn math() -> &'static [&'static str] {
+        if cfg!(windows) { &[] } else { &["NotoSansMath-Regular.ttf"] }
+    }
     /// Colour emoji with COLR layers (what `pterminal-term`'s emoji renderer
     /// reads). Linux's Noto Color Emoji is bitmap (CBDT), not COLR, so it is
     /// not listed: emoji fall back to the symbol font there.
@@ -191,6 +197,8 @@ mod tests {
         }
     }
 
+    // Unix-only: `/usr/bin/zsh` is not an absolute path on Windows (no drive).
+    #[cfg(unix)]
     #[test]
     fn unix_shell_comes_from_shell_env_or_bash() {
         assert_eq!(shell_from_env(Some("/usr/bin/zsh".into())).program, "/usr/bin/zsh");
