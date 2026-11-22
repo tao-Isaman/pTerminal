@@ -16,6 +16,22 @@ use crate::term::{self, SpawnSpec, TabKind};
 use crate::{git, shared_ctx};
 use eframe::egui;
 
+/// Expands a leading `~` / `~/…` to the user's home dir for a path typed in
+/// the new-tab dialog; any other string is taken verbatim. `~` alone and a
+/// bare `~user` that we can't resolve fall back to the literal text.
+fn expand_tilde(p: &str) -> std::path::PathBuf {
+    if p == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    std::path::PathBuf::from(p)
+}
+
 /// What to do with a closing tab's worktree, decided by the close dialog.
 /// `Plain` covers tabs with nothing to merge/keep/discard — a shell tab, or
 /// a direct-mode (non-isolated) agent tab — where closing just removes it.
@@ -77,6 +93,14 @@ impl PtApp {
                         ui.small("not a git repo — worktrees unavailable");
                     }
                 }
+                // Per-tab working directory: blank = the workspace's dir. Lets
+                // one workspace hold tabs rooted at different dirs (the team
+                // layout) without a worktree. Disabled when isolating, since a
+                // worktree chooses the cwd itself.
+                ui.add_enabled_ui(!(draft.isolate && !draft.shell), |ui| {
+                    ui.label("working directory (optional, default = workspace):");
+                    ui.text_edit_singleline(&mut draft.cwd);
+                });
                 ui.horizontal(|ui| {
                     if ui.button("Open").clicked() {
                         open_now = true;
@@ -296,8 +320,17 @@ impl PtApp {
         let Some(ws) = self.workspaces.get_mut(ws_index) else { return };
         let repo = ws.meta.repo_path.clone();
 
+        // A per-tab working directory from the dialog (blank → the workspace
+        // dir). `~`/`~/…` expands to the home dir. Drives `cwd_override` for an
+        // agent tab and the shell's root for a shell tab.
+        let cwd_override: Option<std::path::PathBuf> = {
+            let t = draft.cwd.trim();
+            if t.is_empty() { None } else { Some(expand_tilde(t)) }
+        };
+
         let result = if draft.shell {
-            term::spawn_shell(ctx, id, &repo)
+            let shell_cwd = cwd_override.clone().unwrap_or_else(|| repo.clone());
+            term::spawn_shell(ctx, id, &shell_cwd)
         } else {
             // shared.md + gitignore entry + per-agent README, once per
             // workspace. Gitignore ruling (user-approved pre-flight
@@ -358,6 +391,7 @@ impl PtApp {
                     title: Some(title),
                     worktree: None,
                     launch_profile: None,
+                    cwd_override: cwd_override.clone(),
                 },
             )
         };

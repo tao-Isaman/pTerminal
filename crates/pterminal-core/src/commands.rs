@@ -24,10 +24,17 @@ pub struct ResumeCmd {
     pub provider: crate::provider::AgentProvider,
     pub session_id: String,
     pub dir: PathBuf,
+    /// The workspace to resume INTO (its `repo_path`), created if none matches.
+    /// `None` → the workspace IS `dir` (the original behaviour). When set, the
+    /// tab lives in this workspace but runs in `dir` (as its `cwd_override`),
+    /// so a script can resume several sessions into ONE workspace each rooted
+    /// at its own dir. `#[serde(default)]` for commands written before the flag.
+    #[serde(default)]
+    pub workspace: Option<PathBuf>,
 }
 
 fn usage() -> String {
-    "usage: pterminal resume --id <session-id> [--dir <path>] [--provider claude|codex]".to_string()
+    "usage: pterminal resume --id <session-id> [--dir <path>] [--workspace <path>] [--provider claude|codex]".to_string()
 }
 
 /// Session ids are UUID-shaped (hyphens + hex): an allowlist of ASCII
@@ -59,6 +66,7 @@ pub fn parse_args(args: &[String]) -> Option<Result<ResumeCmd, String>> {
     let mut provider = crate::provider::AgentProvider::default();
     let mut id: Option<String> = None;
     let mut dir: Option<PathBuf> = None;
+    let mut workspace: Option<PathBuf> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -77,6 +85,11 @@ pub fn parse_args(args: &[String]) -> Option<Result<ResumeCmd, String>> {
             "--dir" => {
                 let Some(v) = args.get(i + 1) else { return Some(Err(usage())) };
                 dir = Some(PathBuf::from(v));
+                i += 2;
+            }
+            "--workspace" => {
+                let Some(v) = args.get(i + 1) else { return Some(Err(usage())) };
+                workspace = Some(PathBuf::from(v));
                 i += 2;
             }
             other => return Some(Err(format!("unknown flag: {other}\n{}", usage()))),
@@ -110,7 +123,21 @@ pub fn parse_args(args: &[String]) -> Option<Result<ResumeCmd, String>> {
         },
     };
 
-    Some(Ok(ResumeCmd { provider, session_id: id, dir }))
+    // Absolutize `--workspace` the same way as `--dir` (relative against the
+    // invoking cwd), so the running instance matches it against stored
+    // `repo_path`s unambiguously.
+    let workspace = match workspace {
+        None => None,
+        Some(w) if w.is_absolute() => Some(w),
+        Some(w) => match std::env::current_dir() {
+            Ok(cwd) => Some(cwd.join(w)),
+            Err(e) => {
+                return Some(Err(format!("--workspace is relative and could not determine current directory: {e}")));
+            }
+        },
+    };
+
+    Some(Ok(ResumeCmd { provider, session_id: id, dir, workspace }))
 }
 
 /// Where command files live for the real app: `<state base>/commands/`.
@@ -241,6 +268,7 @@ mod tests {
 
     // An absolute path on the platform under test (`C:\…` is relative on Unix).
     const SOME_PATH: &str = if cfg!(windows) { "C:\\some\\path" } else { "/some/path" };
+    const OTHER_PATH: &str = if cfg!(windows) { "C:\\team\\ws" } else { "/team/ws" };
     const ABSOLUTE_PATH: &str = if cfg!(windows) { "C:\\absolute\\path" } else { "/absolute/path" };
 
     #[test]
@@ -252,6 +280,20 @@ mod tests {
         ];
         let cmd = parse_args(&args).expect("Some").expect("Ok");
         assert_eq!(cmd.dir, PathBuf::from(SOME_PATH));
+        assert_eq!(cmd.workspace, None, "no --workspace → None (workspace is the dir)");
+    }
+
+    #[test]
+    fn resume_with_workspace_is_parsed_separately_from_dir() {
+        let args = vec![
+            "pterminal".into(), "resume".into(),
+            "--id".into(), "abc123".into(),
+            "--dir".into(), SOME_PATH.into(),
+            "--workspace".into(), OTHER_PATH.into(),
+        ];
+        let cmd = parse_args(&args).expect("Some").expect("Ok");
+        assert_eq!(cmd.dir, PathBuf::from(SOME_PATH));
+        assert_eq!(cmd.workspace, Some(PathBuf::from(OTHER_PATH)), "the tab's dir and its workspace are independent");
     }
 
     #[test]
@@ -376,10 +418,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("commands");
 
-        let cmd1 = ResumeCmd { provider: crate::provider::AgentProvider::Claude, session_id: "aaa111".into(), dir: PathBuf::from("C:\\repo1") };
+        let cmd1 = ResumeCmd { provider: crate::provider::AgentProvider::Claude, session_id: "aaa111".into(), dir: PathBuf::from("C:\\repo1"), workspace: None };
         write_command_in(&cmd1, &dir).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let cmd2 = ResumeCmd { provider: crate::provider::AgentProvider::Claude, session_id: "bbb222".into(), dir: PathBuf::from("C:\\repo2") };
+        let cmd2 = ResumeCmd { provider: crate::provider::AgentProvider::Claude, session_id: "bbb222".into(), dir: PathBuf::from("C:\\repo2"), workspace: None };
         write_command_in(&cmd2, &dir).unwrap();
 
         std::fs::write(dir.join("resume-malformed.json"), "not valid json {{{").unwrap();
@@ -409,11 +451,11 @@ mod tests {
         let dir = tmp.path().join("commands");
 
         // Write a valid command
-        let cmd_valid = ResumeCmd { provider: crate::provider::AgentProvider::Claude, session_id: "valid-id-123".into(), dir: PathBuf::from("C:\\repo1") };
+        let cmd_valid = ResumeCmd { provider: crate::provider::AgentProvider::Claude, session_id: "valid-id-123".into(), dir: PathBuf::from("C:\\repo1"), workspace: None };
         write_command_in(&cmd_valid, &dir).unwrap();
 
         // Write a command with an invalid session id (contains `&`)
-        let cmd_invalid = ResumeCmd { provider: crate::provider::AgentProvider::Claude, session_id: "invalid&id".into(), dir: PathBuf::from("C:\\repo2") };
+        let cmd_invalid = ResumeCmd { provider: crate::provider::AgentProvider::Claude, session_id: "invalid&id".into(), dir: PathBuf::from("C:\\repo2"), workspace: None };
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

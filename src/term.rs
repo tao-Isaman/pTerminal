@@ -75,6 +75,14 @@ pub struct SpawnSpec {
     /// fresh open leaves it `None` and `spawn_agent` seeds it from the cwd map
     /// in `launch-profiles.json` (`state::launch_profile_for_cwd`).
     pub launch_profile: Option<crate::provider::LaunchProfile>,
+    /// The directory a DIRECT-mode (non-worktree) tab runs in, when it differs
+    /// from `workspace_repo`. `None` → the tab runs in `workspace_repo` (the
+    /// old behaviour). Lets ONE workspace hold several agent tabs each rooted
+    /// at its own cwd (the team layout: `~/zerem-team/{zero,zeed,…}` + Zerem's
+    /// `/home/isaman`) WITHOUT a worktree. Ignored for an isolate/worktree
+    /// spawn, which is rooted at its worktree; `workspace_repo` still drives
+    /// git coordination (shared.md / worktree creation) regardless.
+    pub cwd_override: Option<PathBuf>,
 }
 
 /// A virtual child tab for one subagent invocation (Claude Code's `Task`
@@ -319,6 +327,14 @@ pub fn unique_title(base: &str, taken: &[String]) -> String {
 /// worktree (`spec.worktree`) have nothing of their own to roll back — a
 /// resume failure must never delete the worktree an earlier, successful
 /// spawn created.
+/// The directory a DIRECT-mode (non-worktree) tab runs in: its own
+/// `cwd_override` when set, else the workspace repo. A worktree/isolate spawn
+/// ignores both and runs in its worktree; this only decides the direct case.
+/// Split out so the choice is unit-testable without spawning a real agent.
+pub(crate) fn direct_tab_cwd(cwd_override: Option<&Path>, workspace_repo: &Path) -> PathBuf {
+    cwd_override.map(Path::to_path_buf).unwrap_or_else(|| workspace_repo.to_path_buf())
+}
+
 pub fn spawn_agent(
     ctx: &eframe::egui::Context,
     id: u64,
@@ -340,7 +356,14 @@ pub fn spawn_agent(
                 let wt = git::worktree_add(&spec.workspace_repo, &slug)?;
                 (wt.path.clone(), Some(wt), true)
             }
-            None => (spec.workspace_repo.clone(), None, false),
+            None => (
+                // Direct mode: the tab's own cwd when it has one, else the
+                // workspace repo (unchanged for every pre-existing caller,
+                // which passes `cwd_override: None`).
+                direct_tab_cwd(spec.cwd_override.as_deref(), &spec.workspace_repo),
+                None,
+                false,
+            ),
         };
 
     // Everything past this point can fail after the worktree already exists
@@ -369,7 +392,12 @@ pub fn spawn_agent(
         // (wrong `DISCORD_STATE_DIR` → the wrong Discord bot).
         let launch_profile = match &spec.launch_profile {
             Some(p) => Some(p.clone()),
-            None => crate::state::launch_profile_for_cwd(&crate::state::default_base(), &cwd)?,
+            // Seed a fresh tab from the cwd map, but honour a `resume_only`
+            // profile's gate: a directory shared with blank tabs (e.g.
+            // `/home/isaman`) hands its profile only to a resume/transfer,
+            // never to a brand-new tab opened there.
+            None => crate::state::launch_profile_for_cwd(&crate::state::default_base(), &cwd)?
+                .filter(|p| p.seeds_on(spec.resume_session.is_some())),
         };
         let launch = spec.provider.launch(&crate::provider::LaunchSpec {
             tab_id: id,
@@ -781,6 +809,16 @@ pub fn next_status_and_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_tab_cwd_prefers_override_else_workspace() {
+        let repo = Path::new("/ws/repo");
+        let own = Path::new("/home/isaman");
+        // No override → workspace repo (every pre-existing caller).
+        assert_eq!(direct_tab_cwd(None, repo), repo);
+        // Override → the tab's own dir (team layout: one workspace, many cwds).
+        assert_eq!(direct_tab_cwd(Some(own), repo), own);
+    }
     use std::time::{Duration, Instant};
 
     const TIMEOUT: Duration = Duration::from_secs(15);

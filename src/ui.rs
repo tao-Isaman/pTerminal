@@ -476,6 +476,7 @@ impl PtApp {
                             prompt: String::new(),
                             isolate,
                             shell: false,
+                            cwd: String::new(),
                         });
                     }
                     // Task 1: `+file` beside `+` — opens the native file

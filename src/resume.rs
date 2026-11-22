@@ -117,7 +117,17 @@ impl PtApp {
             return;
         }
 
-        let ws_index = match self.workspaces.iter().position(|ws| paths_match(&ws.meta.repo_path, &cmd.dir)) {
+        // The workspace to resume INTO: `--workspace` when given (so a script
+        // can gather several sessions, each in its own `--dir`, into ONE
+        // workspace), else the tab's dir (the original one-workspace-per-dir
+        // behaviour). The tab always runs in `cmd.dir` via `cwd_override`.
+        let workspace_root = cmd.workspace.clone().unwrap_or_else(|| cmd.dir.clone());
+        if !workspace_root.is_dir() {
+            self.error = Some(format!("resume: workspace directory does not exist: {}", workspace_root.display()));
+            return;
+        }
+
+        let ws_index = match self.workspaces.iter().position(|ws| paths_match(&ws.meta.repo_path, &workspace_root)) {
             // Final-review finding 5: never resume INTO the reserved
             // orchestrator workspace — its tabs are unclosable by construction,
             // so a `pterminal resume --dir <orch dir>` would otherwise graft a
@@ -129,7 +139,7 @@ impl PtApp {
             }
             Some(i) => i,
             None => {
-                self.finish_add_workspace(cmd.dir.clone());
+                self.finish_add_workspace(workspace_root.clone());
                 self.workspaces.len() - 1
             }
         };
@@ -194,7 +204,11 @@ impl PtApp {
                 resume_session: Some(cmd.session_id.clone()),
                 title: Some(title),
                 worktree: None,
-                launch_profile: None, // seeded from cwd by spawn_agent
+                launch_profile: None, // seeded from cwd by spawn_agent (resume → resume_only profiles apply)
+                // The tab runs in cmd.dir even when it lives in a different
+                // `--workspace`. With no `--workspace`, cmd.dir == the
+                // workspace repo, so this is unchanged from before.
+                cwd_override: Some(cmd.dir.clone()),
             },
         );
 
@@ -371,7 +385,7 @@ mod tests {
         app.handle_resume_command(
             &ctx,
             commands::ResumeCmd {
-        provider: crate::provider::AgentProvider::Claude, session_id: "abc12345".to_string(), dir: missing.clone() },
+        provider: crate::provider::AgentProvider::Claude, session_id: "abc12345".to_string(), dir: missing.clone(), workspace: None },
         );
 
         assert_eq!(app.workspaces.len(), 1, "must not create a workspace for a nonexistent --dir");

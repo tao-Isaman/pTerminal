@@ -157,6 +157,10 @@ impl PtApp {
                                     // tab — the autostart-restore guarantee: a
                                     // bot resumes with its OWN channels/env.
                                     launch_profile: saved.launch_profile.clone(),
+                                    // Resume at the tab's OWN cwd (not the
+                                    // workspace repo) so one workspace can hold
+                                    // several agent tabs each in its own dir.
+                                    cwd_override: Some(saved.cwd.clone()),
                                 },
                             )
                         }
@@ -480,6 +484,7 @@ impl PtApp {
                         title: Some(title),
                         worktree: None, // fresh: no worktree
                         launch_profile: None, // re-seeded from cwd by spawn_agent
+                        cwd_override: None,
                     },
                 )
             }

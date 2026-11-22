@@ -57,6 +57,11 @@ pub struct NewTabDraft {
     pub prompt: String,
     pub isolate: bool,
     pub shell: bool,
+    /// Optional working directory for this tab, as typed in the dialog. Empty
+    /// → the tab runs in the workspace's repo dir (the old behaviour). A
+    /// leading `~/` is expanded to the home dir. Lets one workspace hold agent
+    /// tabs rooted at different dirs without a worktree (`SpawnSpec::cwd_override`).
+    pub cwd: String,
 }
 
 /// Draft state for the "close tab" confirmation. Populated here, consumed
@@ -586,6 +591,7 @@ impl PtApp {
                 prompt: String::new(),
                 isolate: ws.meta.default_isolate && ws.meta.is_git,
                 shell: false,
+                cwd: String::new(),
             });
         }
         // Task 2 (editor-orchestrator): Ctrl+W must not be able to do what
