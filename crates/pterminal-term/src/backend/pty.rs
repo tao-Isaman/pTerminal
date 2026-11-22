@@ -59,6 +59,7 @@ pub(super) fn pty_options(
     shell: String,
     args: Vec<String>,
     working_directory: Option<PathBuf>,
+    env: Vec<(String, String)>,
 ) -> tty::Options {
     // pTerminal delta: `tty::Options::default()` leaves `escape_args` false, so on
     // Windows a multi-word arg (e.g. an agent's initial prompt) is written into the
@@ -71,12 +72,14 @@ pub(super) fn pty_options(
         shell: Some(tty::Shell::new(shell, args)),
         working_directory,
         escape_args: true,
+        env: env.into_iter().collect(),
         ..tty::Options::default()
     };
     #[cfg(not(target_os = "windows"))]
     let pty_config = tty::Options {
         shell: Some(tty::Shell::new(shell, args)),
         working_directory,
+        env: env.into_iter().collect(),
         ..tty::Options::default()
     };
     pty_config

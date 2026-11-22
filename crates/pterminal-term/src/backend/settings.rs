@@ -11,6 +11,11 @@ pub struct BackendSettings {
     pub args: Vec<String>,
     pub working_directory: Option<PathBuf>,
     pub scrolling_history: usize,
+    /// Extra environment variables set on the child, ON TOP of the inherited
+    /// environment (ordered pairs; nothing is cleared). Empty for shells and
+    /// plain agent tabs; a launch profile's `env` (e.g. `DISCORD_STATE_DIR`)
+    /// for a bot tab. Fed to `tty::Options::env` in `pty_options`.
+    pub env: Vec<(String, String)>,
 }
 
 impl Default for BackendSettings {
@@ -21,6 +26,7 @@ impl Default for BackendSettings {
             working_directory: None,
             // Same value alacritty_terminal's `term::Config` defaults to.
             scrolling_history: 10_000,
+            env: vec![],
         }
     }
 }

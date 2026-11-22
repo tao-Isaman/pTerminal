@@ -25,6 +25,12 @@ pub struct SavedTab {
     pub worktree: Option<WorktreeInfo>,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// This tab's [`crate::provider::LaunchProfile`] when it has one — the
+    /// extra args, env and settings-merge it is relaunched with on every
+    /// resume. `#[serde(default)]` (→ `None`) so a `state.json` written before
+    /// launch profiles existed still loads, and a plain tab stores nothing.
+    #[serde(default)]
+    pub launch_profile: Option<crate::provider::LaunchProfile>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -77,6 +83,44 @@ pub fn default_base() -> PathBuf {
 }
 
 fn state_file(base: &Path) -> PathBuf { base.join("state.json") }
+
+/// Where the optional launch-profiles seed file lives: next to `state.json`
+/// under [`default_base`] (`~/.config/pterminal/launch-profiles.json`). It
+/// maps an agent tab's absolute working directory to the
+/// [`crate::provider::LaunchProfile`] a FRESH tab opened there should carry
+/// (`by_cwd`), so a Discord bot session started in its own directory
+/// automatically gets its channel plugin, its private `DISCORD_STATE_DIR` and
+/// its settings with no per-tab UI. Once a tab is open the profile is
+/// persisted on its [`SavedTab`], so a later edit to this file affects only
+/// newly-opened tabs, never resumed ones.
+pub fn launch_profiles_file(base: &Path) -> PathBuf { base.join("launch-profiles.json") }
+
+#[derive(serde::Deserialize, Default)]
+struct LaunchProfiles {
+    #[serde(default)]
+    by_cwd: std::collections::BTreeMap<PathBuf, crate::provider::LaunchProfile>,
+}
+
+/// The seeded profile for a fresh agent tab at `cwd`, from
+/// [`launch_profiles_file`]. `Ok(None)` when the file is absent or holds no
+/// (non-empty) entry for this exact directory; `Err` when the file EXISTS but
+/// cannot be read or parsed — a bot tab launching without its profile (wrong
+/// `DISCORD_STATE_DIR` → the wrong bot, someone else's DMs) is exactly the
+/// misconfiguration to fail a spawn loudly on, not swallow.
+pub fn launch_profile_for_cwd(
+    base: &Path,
+    cwd: &Path,
+) -> anyhow::Result<Option<crate::provider::LaunchProfile>> {
+    let file = launch_profiles_file(base);
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", file.display())),
+    };
+    let profiles: LaunchProfiles = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("parsing {}: {e}", file.display()))?;
+    Ok(profiles.by_cwd.get(cwd).filter(|p| !p.is_empty()).cloned())
+}
 
 pub fn load(base: &Path) -> (AppState, Option<String>) {
     let file = state_file(base);
@@ -185,6 +229,72 @@ pub fn save(base: &Path, s: &AppState) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// The task's core guarantee at the persistence layer: a tab's
+    /// `launch_profile` survives `save` → `load` of `state.json` byte-for-byte,
+    /// so a resume relaunches the bot with the SAME args/env/settings.
+    #[test]
+    fn launch_profile_survives_save_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let profile = crate::provider::LaunchProfile {
+            extra_args: vec!["--channels".into(), "plugin:discord@x".into()],
+            env: vec![("DISCORD_STATE_DIR".into(), "/home/x/.claude/channels/discord-zero".into())],
+            merge_settings: Some("/home/x/.claude/zero-settings.json".into()),
+        };
+        let st = AppState {
+            workspaces: vec![Workspace {
+                name: "ws".into(),
+                repo_path: "/home/x/zero".into(),
+                is_git: false,
+                default_isolate: false,
+                kept_worktrees: vec![],
+                saved_tabs: vec![SavedTab {
+                    provider: crate::provider::AgentProvider::Claude,
+                    tab_id: 1,
+                    kind: SavedTabKind::Agent,
+                    title: "zero".into(),
+                    cwd: "/home/x/zero".into(),
+                    worktree: None,
+                    session_id: Some("sid-1".into()),
+                    launch_profile: Some(profile.clone()),
+                }],
+                active_tab: 0,
+                msg_offset: 0,
+                saved_editors: vec![],
+                is_orchestrator: false,
+            }],
+            next_tab_id: 2,
+            active_ws: 0,
+        };
+        save(base, &st).unwrap();
+        let (loaded, err) = load(base);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(loaded.workspaces[0].saved_tabs[0].launch_profile, Some(profile));
+    }
+
+    #[test]
+    fn launch_profile_for_cwd_loads_matches_and_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        // No file at all → no profile, no error.
+        assert_eq!(launch_profile_for_cwd(base, Path::new("/home/x")).unwrap(), None);
+        // A file with an entry for the exact cwd → that profile.
+        std::fs::write(
+            launch_profiles_file(base),
+            r#"{"by_cwd":{"/home/x/zero":{"extra_args":["--channels","p"],
+               "env":[["DISCORD_STATE_DIR","/home/x/.claude/channels/discord-zero"]]}}}"#,
+        )
+        .unwrap();
+        let p = launch_profile_for_cwd(base, Path::new("/home/x/zero")).unwrap().unwrap();
+        assert_eq!(p.extra_args, ["--channels", "p"]);
+        assert_eq!(p.env, [("DISCORD_STATE_DIR".to_string(), "/home/x/.claude/channels/discord-zero".to_string())]);
+        // A directory with no entry → None.
+        assert_eq!(launch_profile_for_cwd(base, Path::new("/home/x/other")).unwrap(), None);
+        // A present-but-malformed file → Err (never a silent empty profile).
+        std::fs::write(launch_profiles_file(base), "{not json").unwrap();
+        assert!(launch_profile_for_cwd(base, Path::new("/home/x/zero")).is_err());
+    }
+
     #[test]
     fn saved_provider_is_backward_compatible_and_round_trips() {
         let mut tab: SavedTab = serde_json::from_str(
@@ -215,6 +325,7 @@ mod tests {
                         cwd: "D:\\projectx".into(),
                         worktree: Some(WorktreeInfo { path: "D:\\projectx-wt\\fix".into(), branch: "pt/fix".into() }),
                         session_id: Some("session-123".into()),
+                        launch_profile: None,
                     },
                     SavedTab {
                         provider: crate::provider::AgentProvider::Claude,
@@ -224,6 +335,7 @@ mod tests {
                         cwd: "D:\\projectx".into(),
                         worktree: None,
                         session_id: None,
+                        launch_profile: None,
                     },
                 ],
                 active_tab: 0,

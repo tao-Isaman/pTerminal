@@ -178,6 +178,7 @@ impl PtApp {
                     cwd: t.missing_dir.clone().unwrap_or_else(|| t.cwd.clone()),
                     worktree: t.worktree.clone(),
                     session_id: t.session_id.clone(),
+                    launch_profile: t.launch_profile.clone(),
                 })
                 .collect();
             // Task 1: mirror live editor tabs the same way, so a relaunch's

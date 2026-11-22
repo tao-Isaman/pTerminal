@@ -1,0 +1,21 @@
+{
+  "by_cwd": {
+    "/home/isaman/zerem-team/zero": {
+      "extra_args": ["--channels", "plugin:discord@claude-plugins-official"],
+      "env": [["DISCORD_STATE_DIR", "/home/isaman/.claude/channels/discord-zero"]],
+      "merge_settings": "/home/isaman/.claude/zero-settings.json"
+    },
+    "/home/isaman/zerem-team/zeed": {
+      "extra_args": ["--channels", "plugin:discord@claude-plugins-official"],
+      "env": [["DISCORD_STATE_DIR", "/home/isaman/.claude/channels/discord-zeed"]]
+    },
+    "/home/isaman/zerem-team/zelot": {
+      "extra_args": ["--channels", "plugin:discord@claude-plugins-official"],
+      "env": [["DISCORD_STATE_DIR", "/home/isaman/.claude/channels/discord-zelot"]]
+    },
+    "/home/isaman/zerem-team/zeno": {
+      "extra_args": ["--channels", "plugin:discord@claude-plugins-official"],
+      "env": [["DISCORD_STATE_DIR", "/home/isaman/.claude/channels/discord-zeno"]]
+    }
+  }
+}

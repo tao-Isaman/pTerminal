@@ -103,7 +103,7 @@ impl TerminalBackend {
         // cloned before `working_directory` moves into the PTY options.
         let spawn_cwd = settings.working_directory.clone();
         let pty_config =
-            pty::pty_options(settings.shell, settings.args, settings.working_directory);
+            pty::pty_options(settings.shell, settings.args, settings.working_directory, settings.env);
         // pTerminal delta: scrollback size comes from `BackendSettings` instead of
         // alacritty_terminal's hardcoded default. Every terminal here is fed by
         // ConPTY, so growing the window must not pull scrollback into view
@@ -450,6 +450,7 @@ mod tests {
                 args,
                 working_directory: None,
                 scrolling_history: 1000,
+                env: vec![],
             },
             Arc::new(AtomicBool::new(true)),
         )

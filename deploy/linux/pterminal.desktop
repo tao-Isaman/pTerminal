@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=pTerminal (zerem team)
+Comment=Launch pTerminal at login; it restores the sisters' agent tabs itself
+Exec=/home/isaman/.local/bin/pterminal
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=20

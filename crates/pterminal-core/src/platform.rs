@@ -182,9 +182,66 @@ pub fn posix_locale_to_bcp47(s: &str) -> String {
     base.replace('_', "-")
 }
 
+/// True for an environment variable that identifies the Claude Code *session*
+/// which happened to launch pTerminal — its session id, messaging socket,
+/// child/bridge ids, pid, and the `CLAUDECODE` marker. pTerminal is not a
+/// Claude session; if it lets these reach an agent tab it spawns, that tab
+/// looks like a CHILD of the launching session (it surfaces on that session's
+/// Remote Control and messaging socket) instead of the independent root
+/// session each bot must be. Matches the `CLAUDE_CODE_*` family plus the exact
+/// names `CLAUDECODE` and `CLAUDE_PID`. Deliberately NOT `CLAUDE_CONFIG_DIR`
+/// or other `CLAUDE_*` settings a child legitimately needs.
+pub fn is_inherited_session_var(name: &str) -> bool {
+    name.starts_with("CLAUDE_CODE_") || name == "CLAUDECODE" || name == "CLAUDE_PID"
+}
+
+/// Removes every [`is_inherited_session_var`] from THIS process's environment,
+/// so nothing pTerminal spawns (agent tabs, shells) inherits the launching
+/// Claude session's identity. A no-op when pTerminal was launched from a clean
+/// environment (e.g. the autostart `.desktop`, or `env -u CLAUDE_CODE_*`).
+///
+/// # Safety / ordering
+/// Must be called at the very top of `main`, before any thread starts and
+/// before anything reads the environment: `std::env::remove_var` is `unsafe`
+/// in edition 2024 because concurrent env access is a data race, and here the
+/// program is still single-threaded.
+pub fn scrub_inherited_session_env() {
+    let doomed: Vec<String> = std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| is_inherited_session_var(k))
+        .collect();
+    for k in doomed {
+        unsafe { std::env::remove_var(&k) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inherited_session_vars_are_the_claude_session_family_only() {
+        for v in [
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_BRIDGE_SESSION_ID",
+            "CLAUDE_CODE_ANYTHING_ELSE",
+            "CLAUDECODE",
+            "CLAUDE_PID",
+        ] {
+            assert!(is_inherited_session_var(v), "{v} must be scrubbed");
+        }
+        for v in [
+            "PATH", "HOME", "DISCORD_STATE_DIR",
+            "CLAUDE_CONFIG_DIR",   // a child legitimately needs this
+            "CLAUDECODEX",         // not the exact marker
+            "CLAUDE_PIDFILE",      // not the exact name
+            "MY_CLAUDE_CODE_VAR",  // prefix must be at the start
+        ] {
+            assert!(!is_inherited_session_var(v), "{v} must be kept");
+        }
+    }
 
     #[test]
     fn npm_cli_runs_through_cmd_only_on_windows() {

@@ -194,6 +194,7 @@ impl PtApp {
                 resume_session: Some(cmd.session_id.clone()),
                 title: Some(title),
                 worktree: None,
+                launch_profile: None, // seeded from cwd by spawn_agent
             },
         );
 

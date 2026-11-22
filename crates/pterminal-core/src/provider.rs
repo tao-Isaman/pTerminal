@@ -57,6 +57,55 @@ pub struct AgentContext {
     pub agent_readme: Option<PathBuf>,
 }
 
+/// A per-tab launch profile: the extra argv, environment and settings-merge
+/// a specific agent tab is always launched with, so a Discord-channel bot
+/// keeps its OWN bot-state directory, channel plugin and auto-mode settings
+/// across every fresh spawn, restart and resume. Persisted on
+/// [`crate::state::SavedTab`] (unlike [`AgentContext`], which is recomputed)
+/// because it is the user's intent for the tab, not something derivable from
+/// the workspace. `Default` (all empty / `None`) means "no profile",
+/// indistinguishable at launch from a plain tab.
+///
+/// The three parts exist because a Discord bot needs all three and each
+/// rides a different launch channel: `--channels <plugin>` is a bare CLI arg
+/// (`extra_args`), the bot's private state dir is an environment variable
+/// (`env`, read by the Discord plugin, never an arg), and its extra Claude
+/// settings must fold into the ONE `--settings` file pTerminal already
+/// passes (`merge_settings`) rather than become a second, conflicting one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchProfile {
+    /// Extra arguments inserted into a Claude launch right after the per-tab
+    /// `--settings <file>` pair and before the prompt / `--resume` — e.g.
+    /// `["--channels", "plugin:discord@claude-plugins-official"]`. Claude
+    /// only: Codex launches ignore them (channels/settings are Claude-Code
+    /// concepts), so a profile on a Codex tab changes only its `env`.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+    /// Environment variables set on the child, on TOP of the inherited
+    /// environment (nothing is cleared) — e.g. `DISCORD_STATE_DIR` so a bot
+    /// tab uses its own Discord state directory and never the default shared
+    /// one. Ordered pairs (not a map) so `state.json` and the argv/env tests
+    /// stay deterministic.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// A settings JSON file whose contents are deep-merged UNDER pTerminal's
+    /// own per-tab hook settings before the single `--settings` file is
+    /// written ([`crate::hooks::write_tab_settings`]). Lets a tab carry extra
+    /// Claude settings (e.g. `autoMode`) without a second, conflicting
+    /// `--settings` argument; pTerminal's `hooks` win on any key both define.
+    #[serde(default)]
+    pub merge_settings: Option<PathBuf>,
+}
+
+impl LaunchProfile {
+    /// Whether this profile would change nothing about a launch — the
+    /// `Default` value. Used to store `None` rather than an empty profile on
+    /// a plain tab so `state.json` stays clean.
+    pub fn is_empty(&self) -> bool {
+        self.extra_args.is_empty() && self.env.is_empty() && self.merge_settings.is_none()
+    }
+}
+
 /// The inputs a provider needs to build one launch. Borrowed rather than
 /// owned because both callers (`term::spawn_agent`, `Tab::respawn`) already
 /// hold everything and the struct lives for one call.
@@ -80,6 +129,12 @@ pub struct LaunchSpec<'a> {
     /// where [`AgentProvider::launch`] looks for the pre-A4 per-checkout hook
     /// entries to strip (`hooks::forget_checkout_hooks`).
     pub cwd: &'a Path,
+    /// This tab's [`LaunchProfile`] when it has one: its `extra_args` join the
+    /// Claude argv and its `merge_settings` folds into the per-tab settings
+    /// file. `env` is NOT applied here — it is set on the child at spawn time
+    /// (`TabTerm::spawn_with_env`), outside the argv this type builds — so it
+    /// is read from the profile by the spawn caller, not from this field.
+    pub launch_profile: Option<&'a LaunchProfile>,
 }
 
 /// A resolved launch: what `TabTerm::spawn` runs.
@@ -146,6 +201,7 @@ impl AgentProvider {
                     agent_readme: spec.context.agent_readme.as_deref(),
                     agent_name: spec.title,
                     hook_helper: spec.hook_helper,
+                    merge_settings: spec.launch_profile.and_then(|p| p.merge_settings.as_deref()),
                 })?;
                 crate::platform::npm_cli("claude").program
             }
@@ -180,8 +236,9 @@ impl AgentProvider {
         hook_helper: Option<&Path>,
         cwd: &Path,
         resume_session: Option<&str>,
+        launch_profile: Option<&LaunchProfile>,
     ) -> anyhow::Result<Launch> {
-        self.launch(&relaunch_spec(tab_id, title, context, hook_helper, cwd, resume_session))
+        self.launch(&relaunch_spec(tab_id, title, context, hook_helper, cwd, resume_session, launch_profile))
     }
 
     /// The argv half of [`relaunch`](Self::relaunch), with no side effects
@@ -200,16 +257,18 @@ impl AgentProvider {
         hook_helper: Option<&Path>,
         cwd: &Path,
         resume_session: Option<&str>,
+        launch_profile: Option<&LaunchProfile>,
     ) -> Vec<String> {
-        self.launch_args(&relaunch_spec(tab_id, title, context, hook_helper, cwd, resume_session))
+        self.launch_args(&relaunch_spec(tab_id, title, context, hook_helper, cwd, resume_session, launch_profile))
     }
 
     /// Pure argv half of [`Self::launch`]: no disk access, only path
     /// arithmetic (`hooks::tab_settings_file`, `hooks::events_file` are
     /// functions of the tab id).
     pub fn launch_args(self, spec: &LaunchSpec) -> Vec<String> {
+        let extra_args = spec.launch_profile.map(|p| p.extra_args.as_slice()).unwrap_or(&[]);
         match self {
-            Self::Claude => claude_args(&hooks::tab_settings_file(spec.tab_id), spec.prompt, spec.resume_session),
+            Self::Claude => claude_args(&hooks::tab_settings_file(spec.tab_id), spec.prompt, spec.resume_session, extra_args),
             Self::Codex => codex_args(
                 spec.tab_id,
                 spec.title,
@@ -293,15 +352,22 @@ fn relaunch_spec<'a>(
     hook_helper: Option<&'a Path>,
     cwd: &'a Path,
     resume_session: Option<&'a str>,
+    launch_profile: Option<&'a LaunchProfile>,
 ) -> LaunchSpec<'a> {
-    LaunchSpec { tab_id, title, prompt: "", resume_session, context, hook_helper, cwd }
+    LaunchSpec { tab_id, title, prompt: "", resume_session, context, hook_helper, cwd, launch_profile }
 }
 
-pub fn claude_args(settings: &Path, prompt: &str, resume: Option<&str>) -> Vec<String> {
+/// Claude's argv after the npm prefix: `--settings <file>`, then the
+/// profile's `extra_args` (empty for a plain tab), then either `--resume
+/// <sid>` or the prompt. `extra_args` sits ahead of the prompt so a trailing
+/// positional prompt stays last, and ahead of `--resume` for symmetry — both
+/// are flags Claude accepts in any order.
+pub fn claude_args(settings: &Path, prompt: &str, resume: Option<&str>, extra_args: &[String]) -> Vec<String> {
     // `cmd.exe /c claude` on Windows (npm shim), `claude` itself elsewhere:
     // the program comes from `platform::npm_cli`, these are what follow it.
     let mut args: Vec<String> = crate::platform::npm_cli("claude").args;
     args.extend(["--settings".into(), settings.to_string_lossy().into_owned()]);
+    args.extend(extra_args.iter().cloned());
     match resume {
         Some(sid) => {
             args.push("--resume".into());
@@ -515,20 +581,56 @@ mod tests {
 
     #[test]
     fn claude_args_prompt_path_strips_quotes_unchanged() {
-        let args = claude_args(Path::new(SETTINGS), "say \"hi\" now", None);
+        let args = claude_args(Path::new(SETTINGS), "say \"hi\" now", None, &[]);
         assert_eq!(after_claude_prefix(&args), vec!["--settings", SETTINGS, "say hi now"]);
     }
 
     #[test]
     fn claude_args_empty_prompt_omits_trailing_arg() {
-        let args = claude_args(Path::new(SETTINGS), "", None);
+        let args = claude_args(Path::new(SETTINGS), "", None, &[]);
         assert_eq!(after_claude_prefix(&args), vec!["--settings", SETTINGS]);
     }
 
     #[test]
     fn claude_args_resume_ignores_prompt() {
-        let args = claude_args(Path::new(SETTINGS), "ignored prompt entirely", Some("sess-123"));
+        let args = claude_args(Path::new(SETTINGS), "ignored prompt entirely", Some("sess-123"), &[]);
         assert_eq!(after_claude_prefix(&args), vec!["--settings", SETTINGS, "--resume", "sess-123"]);
+    }
+
+    /// A profile's `extra_args` land right after the `--settings` pair and
+    /// before the prompt (fresh) or `--resume <sid>` (resume) — the Discord
+    /// bot case: `--channels <plugin>` always present, `--resume` still last.
+    #[test]
+    fn claude_args_extra_args_sit_after_settings_and_before_prompt_and_resume() {
+        let extra = vec!["--channels".to_string(), "plugin:discord@x".to_string()];
+        let fresh = claude_args(Path::new(SETTINGS), "go now", None, &extra);
+        assert_eq!(
+            after_claude_prefix(&fresh),
+            vec!["--settings", SETTINGS, "--channels", "plugin:discord@x", "go now"]
+        );
+        let resumed = claude_args(Path::new(SETTINGS), "ignored", Some("sid-9"), &extra);
+        assert_eq!(
+            after_claude_prefix(&resumed),
+            vec!["--settings", SETTINGS, "--channels", "plugin:discord@x", "--resume", "sid-9"]
+        );
+    }
+
+    /// A profile threaded through `launch_args` reaches the Claude argv (the
+    /// whole-launch path, not just the bare `claude_args`): `--channels` is
+    /// present for a profiled tab and absent for a plain one.
+    #[test]
+    fn launch_args_apply_profile_extra_args_for_claude() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = ctx();
+        let profile = LaunchProfile {
+            extra_args: vec!["--channels".into(), "plugin:discord@x".into()],
+            ..Default::default()
+        };
+        let spec = LaunchSpec { launch_profile: Some(&profile), ..spec7(&context, "go", None, dir.path()) };
+        let args = AgentProvider::Claude.launch_args(&spec);
+        assert!(args.windows(2).any(|w| w == ["--channels", "plugin:discord@x"]), "{args:?}");
+        let plain = spec7(&context, "go", None, dir.path());
+        assert!(!AgentProvider::Claude.launch_args(&plain).iter().any(|a| a == "--channels"));
     }
 
     // --- A3: the abstraction ------------------------------------------------
@@ -571,6 +673,7 @@ mod tests {
             context,
             hook_helper: Some(Path::new(HELPER)),
             cwd,
+            launch_profile: None,
         }
     }
 
@@ -643,7 +746,7 @@ mod tests {
     fn claude_relaunch_without_session_matches_old_respawn() {
         let dir = tempfile::tempdir().unwrap();
         let launch = AgentProvider::Claude
-            .relaunch(7, "fix \"login\"", &ctx(), Some(Path::new(HELPER)), dir.path(), None)
+            .relaunch(7, "fix \"login\"", &ctx(), Some(Path::new(HELPER)), dir.path(), None, None)
             .unwrap();
         assert_eq!(launch.program, crate::platform::npm_cli("claude").program);
         assert_eq!(
@@ -659,7 +762,7 @@ mod tests {
     fn claude_relaunch_with_session_resumes_it() {
         let dir = tempfile::tempdir().unwrap();
         let launch = AgentProvider::Claude
-            .relaunch(7, "fix \"login\"", &ctx(), Some(Path::new(HELPER)), dir.path(), Some("sess-crashed"))
+            .relaunch(7, "fix \"login\"", &ctx(), Some(Path::new(HELPER)), dir.path(), Some("sess-crashed"), None)
             .unwrap();
         assert_eq!(launch.program, crate::platform::npm_cli("claude").program);
         assert_eq!(
@@ -718,7 +821,7 @@ mod tests {
     fn codex_relaunch_args_match_old_respawn() {
         let context = ctx();
         assert_eq!(
-            AgentProvider::Codex.relaunch_args(7, "fix \"login\"", &context, Some(Path::new(HELPER)), Path::new("D:\\repo"), None),
+            AgentProvider::Codex.relaunch_args(7, "fix \"login\"", &context, Some(Path::new(HELPER)), Path::new("D:\\repo"), None, None),
             vec![
                 "--no-alt-screen".to_string(),
                 "-c".into(),
@@ -743,6 +846,7 @@ mod tests {
             Some(Path::new(HELPER)),
             Path::new("D:\\repo"),
             Some("abc-123"),
+            None,
         );
         assert_eq!(&args[args.len() - 2..], ["resume", "abc-123"]);
         assert!(!args.iter().any(|a| a == "--"), "a resume carries no prompt");
@@ -762,6 +866,7 @@ mod tests {
             context: &context,
             hook_helper: None,
             cwd: Path::new("D:\\repo"),
+            launch_profile: None,
         };
         assert_eq!(
             AgentProvider::Codex.launch_args(&spec),
@@ -792,7 +897,7 @@ mod tests {
             for resume in [None, Some("sess-xyz")] {
                 let spec = spec7(&context, "", resume, dir.path());
                 assert_eq!(
-                    provider.relaunch_args(7, "fix \"login\"", &context, Some(Path::new(HELPER)), dir.path(), resume),
+                    provider.relaunch_args(7, "fix \"login\"", &context, Some(Path::new(HELPER)), dir.path(), resume, None),
                     provider.launch_args(&spec),
                     "{provider:?} resume={resume:?}"
                 );

@@ -283,6 +283,12 @@ pub struct HookSetup<'a> {
     /// [`pterm_hook_exe`] result. `None` selects the `cmd /c echo` fallback
     /// (see [`event_command`]).
     pub hook_helper: Option<&'a Path>,
+    /// A profile's `merge_settings` file: its JSON is the BASE the per-tab
+    /// hook settings ([`hook_settings`]) are merged on top of before writing,
+    /// so a tab gets ONE `--settings` file carrying both pTerminal's hooks and
+    /// the profile's own settings (e.g. `autoMode`). `None` → hooks only, the
+    /// pre-profile behaviour. See [`write_tab_settings`].
+    pub merge_settings: Option<&'a Path>,
 }
 
 /// Where tab `tab_id`'s Claude Code settings file lives: next to its events
@@ -345,8 +351,48 @@ pub fn hook_settings(setup: &HookSetup) -> serde_json::Value {
 pub fn write_tab_settings(setup: &HookSetup) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(events_dir())?;
     let file = tab_settings_file(setup.tab_id);
-    std::fs::write(&file, serde_json::to_string_pretty(&hook_settings(setup))?)?;
+    // The profile's settings file (if any) is the BASE; pTerminal's own hooks
+    // are merged ON TOP so they win on any shared key. A missing or malformed
+    // merge file fails the launch deliberately: a bot tab silently losing its
+    // `autoMode`/channel settings is the kind of misconfiguration that is far
+    // better caught at spawn than discovered live (the same stance
+    // `forget_checkout_hooks` takes on an unreadable settings file).
+    let mut value = match setup.merge_settings {
+        Some(extra) => {
+            let text = std::fs::read_to_string(extra).map_err(|e| {
+                anyhow::anyhow!("reading profile settings {}: {e}", extra.display())
+            })?;
+            serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+                anyhow::anyhow!("parsing profile settings {}: {e}", extra.display())
+            })?
+        }
+        None => serde_json::Value::Object(Default::default()),
+    };
+    merge_json(&mut value, hook_settings(setup));
+    std::fs::write(&file, serde_json::to_string_pretty(&value)?)?;
     Ok(file)
+}
+
+/// Deep-merges `overlay` INTO `base`: for a key both hold as JSON objects,
+/// recurse so neither side's sibling keys are lost; for any other pairing the
+/// `overlay` value replaces `base`'s. pTerminal passes its own hook settings
+/// as `overlay`, so on a key a profile's `merge_settings` file also defines
+/// (e.g. `hooks`) pTerminal wins — its status capture can never be clobbered
+/// — while the file's other keys (`autoMode`, `permissions`, …) survive.
+fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+            for (k, v) in o {
+                match b.get_mut(&k) {
+                    Some(bv) => merge_json(bv, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (b, o) => *b = o,
+    }
 }
 
 /// Migration (A4): removes every hook command pTerminal itself wrote into
@@ -495,7 +541,46 @@ mod tests {
     // --- A4: the per-tab settings file ----------------------------------
 
     fn setup<'a>(tab_id: u64, name: &'a str, helper: Option<&'a Path>) -> HookSetup<'a> {
-        HookSetup { tab_id, shared_md: None, agent_readme: None, agent_name: name, hook_helper: helper }
+        HookSetup { tab_id, shared_md: None, agent_readme: None, agent_name: name, hook_helper: helper, merge_settings: None }
+    }
+
+    /// `write_tab_settings` with a profile `merge_settings` file writes ONE
+    /// settings file holding BOTH the profile's own keys (here `autoMode`)
+    /// and pTerminal's `hooks` — the single-`--settings` contract. pTerminal's
+    /// `hooks` win if the file also had one; the file's other keys survive.
+    #[test]
+    fn write_tab_settings_merges_profile_file_under_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let extra = dir.path().join("zero-settings.json");
+        std::fs::write(
+            &extra,
+            r#"{"autoMode":{"allow":["x"]},"hooks":{"Stop":[{"hooks":[{"command":"user-stop"}]}]}}"#,
+        )
+        .unwrap();
+        let id = 990_201;
+        let mut s = setup(id, "zero", None);
+        s.merge_settings = Some(&extra);
+        let file = write_tab_settings(&s).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        // profile key preserved
+        assert_eq!(v["autoMode"]["allow"][0], "x");
+        // pTerminal's hooks win over the file's (status capture intact)
+        let stop = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert_ne!(stop, "user-stop", "pTerminal's Stop hook must win");
+        assert!(v["hooks"]["SessionStart"].is_array(), "pTerminal hooks present: {v}");
+        let _ = std::fs::remove_file(file);
+    }
+
+    /// A merge file that cannot be read/parsed fails the launch rather than
+    /// silently dropping the profile's settings.
+    #[test]
+    fn write_tab_settings_errors_on_missing_merge_file() {
+        let id = 990_202;
+        let missing = std::path::PathBuf::from("/no/such/zero-settings.json");
+        let mut s = setup(id, "zero", None);
+        s.merge_settings = Some(&missing);
+        assert!(write_tab_settings(&s).is_err());
     }
 
     /// Every event key is present, each command names THIS tab's events
@@ -583,6 +668,7 @@ mod tests {
             agent_readme: Some(readme),
             agent_name: "bravo",
             hook_helper: None,
+            merge_settings: None,
         });
         let cmds = v["hooks"]["SessionStart"][0]["hooks"].as_array().unwrap();
         assert_eq!(cmds.len(), 2); // inject + event append
