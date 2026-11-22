@@ -153,6 +153,10 @@ impl PtApp {
                                     resume_session: saved.session_id.clone(),
                                     title: Some(saved.title.clone()),
                                     worktree: saved.worktree.clone(),
+                                    // The saved profile comes back with the
+                                    // tab — the autostart-restore guarantee: a
+                                    // bot resumes with its OWN channels/env.
+                                    launch_profile: saved.launch_profile.clone(),
                                 },
                             )
                         }
@@ -475,6 +479,7 @@ impl PtApp {
                         resume_session: None, // fresh session, no resume
                         title: Some(title),
                         worktree: None, // fresh: no worktree
+                        launch_profile: None, // re-seeded from cwd by spawn_agent
                     },
                 )
             }
@@ -562,6 +567,7 @@ mod tests {
             cwd,
             worktree: None,
             session_id,
+            launch_profile: None,
         };
         let meta = state::Workspace {
             name: "test-ws".to_string(),
@@ -631,6 +637,7 @@ mod tests {
             cwd: repo.clone(),
             worktree: Some(wt.clone()),
             session_id: Some("sess-keep-me".to_string()),
+            launch_profile: None,
         };
         let mut app = app_with_tabs(dir.path().to_path_buf(), repo.clone(), vec![]);
         app.workspaces[0].meta.saved_tabs = vec![saved];

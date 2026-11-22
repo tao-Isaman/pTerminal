@@ -77,7 +77,7 @@ impl PtApp {
             provider, workspace_repo: repo.clone(), main_repo_shared_md: None,
             agent_readme: agent_readme_for_spawn(true, false, &repo),
             prompt: String::new(), isolate: false, resume_session: None,
-            title: Some("orchestrator".into()), worktree: None,
+            title: Some("orchestrator".into()), worktree: None, launch_profile: None,
         });
         match result {
             Ok(tab) => {
@@ -159,6 +159,7 @@ impl PtApp {
                 // Reused when present (`SpawnSpec` docs): the new session
                 // works in the same directory the old one did.
                 worktree,
+                launch_profile: None, // re-seeded from cwd by spawn_agent
             },
         );
         match result {

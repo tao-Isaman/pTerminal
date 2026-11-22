@@ -70,6 +70,11 @@ pub struct SpawnSpec {
     /// fresh spawn unless its path happens to exist and `resume_session` is
     /// also `Some` — see the struct doc above.
     pub worktree: Option<WorktreeInfo>,
+    /// An explicit launch profile for this tab. A RESUME passes the saved
+    /// profile here so the tab comes back with the same args/env/settings. A
+    /// fresh open leaves it `None` and `spawn_agent` seeds it from the cwd map
+    /// in `launch-profiles.json` (`state::launch_profile_for_cwd`).
+    pub launch_profile: Option<crate::provider::LaunchProfile>,
 }
 
 /// A virtual child tab for one subagent invocation (Claude Code's `Task`
@@ -95,6 +100,13 @@ pub struct Tab {
     /// shell tab used to carry too). Populated for every agent tab whatever
     /// its provider; `Default` for shells and dead placeholders.
     pub agent_ctx: crate::provider::AgentContext,
+    /// This tab's launch profile (extra args, env, settings-merge), kept so
+    /// [`Tab::respawn`] relaunches with the SAME profile and `PtApp::persist`
+    /// can write it to `state::SavedTab`. `None` for a plain tab, every shell
+    /// and every dead placeholder. Resolved once at spawn — from the caller's
+    /// `SpawnSpec` (a resume carries the saved profile) or, for a fresh tab,
+    /// the cwd seed in `state::launch_profile_for_cwd`.
+    pub launch_profile: Option<crate::provider::LaunchProfile>,
     pub provider: crate::provider::AgentProvider,
     pub id: u64,
     pub title: String,
@@ -350,6 +362,15 @@ pub fn spawn_agent(
             shared_md: spec.main_repo_shared_md.clone(),
             agent_readme: spec.agent_readme.clone(),
         };
+        // Resolve the tab's launch profile: an explicit one from the caller
+        // (a resume hands back the saved profile) wins; otherwise a fresh tab
+        // is seeded from the cwd map in `launch-profiles.json`. A malformed
+        // seed file fails the spawn rather than launch a bot mis-configured
+        // (wrong `DISCORD_STATE_DIR` → the wrong Discord bot).
+        let launch_profile = match &spec.launch_profile {
+            Some(p) => Some(p.clone()),
+            None => crate::state::launch_profile_for_cwd(&crate::state::default_base(), &cwd)?,
+        };
         let launch = spec.provider.launch(&crate::provider::LaunchSpec {
             tab_id: id,
             title: &title,
@@ -358,10 +379,13 @@ pub fn spawn_agent(
             context: &agent_ctx,
             hook_helper: hooks::pterm_hook_exe().as_deref(),
             cwd: &cwd,
+            launch_profile: launch_profile.as_ref(),
         })?;
-        let term = TabTerm::spawn(ctx, id, &launch.program, &launch.args, &cwd)?;
+        let env = launch_profile.as_ref().map(|p| p.env.as_slice()).unwrap_or(&[]);
+        let term = TabTerm::spawn_with_env(ctx, id, &launch.program, &launch.args, &cwd, env)?;
         Ok(Tab {
             agent_ctx,
+            launch_profile,
             id,
             title: title.clone(),
             kind: TabKind::Agent,
@@ -422,6 +446,7 @@ pub fn spawn_shell(
     let term = TabTerm::spawn(ctx, id, &sh.program, &sh.args, cwd)?;
     Ok(Tab {
         agent_ctx: Default::default(),
+        launch_profile: None,
         id,
         title: "shell".into(),
         kind: TabKind::Shell,
@@ -494,6 +519,10 @@ pub fn spawn_dead_tab(
     let term = TabTerm::spawn(ctx, saved.tab_id, &banner.program, &banner.args, repo_root)?;
     Ok(Tab {
         agent_ctx: Default::default(),
+        // Carry the saved profile onto the placeholder like every other saved
+        // field, so a later `persist()` writes the SAME `SavedTab` back and a
+        // failed resume never loses the tab's launch profile.
+        launch_profile: saved.launch_profile.clone(),
         id: saved.tab_id,
         title: saved.title.clone(),
         provider: saved.provider,
@@ -685,8 +714,13 @@ impl Tab {
                     hooks::pterm_hook_exe().as_deref(),
                     &self.cwd,
                     self.session_id.as_deref(),
+                    self.launch_profile.as_ref(),
                 )?;
-                TabTerm::spawn(ctx, self.id, &launch.program, &launch.args, &self.cwd)?
+                // A restart re-applies the SAME profile env (the Discord bot's
+                // own state dir), so a resumed bot never falls back to the
+                // shared default one.
+                let env = self.launch_profile.as_ref().map(|p| p.env.as_slice()).unwrap_or(&[]);
+                TabTerm::spawn_with_env(ctx, self.id, &launch.program, &launch.args, &self.cwd, env)?
             }
             TabKind::Shell => {
                 let sh = pterminal_core::platform::shell();
@@ -787,6 +821,7 @@ mod tests {
             cwd: missing.clone(),
             worktree: Some(wt.clone()),
             session_id: Some("sess-1".to_string()),
+            launch_profile: None,
         };
         let mut tab = spawn_dead_tab(
             &ctx,
@@ -836,6 +871,7 @@ mod tests {
             cwd: existing.clone(),
             worktree: None,
             session_id: None,
+            launch_profile: None,
         };
         let mut tab = spawn_dead_tab(&ctx, &saved, Path::new("C:\\"), "resume failed: boom".to_string())
             .expect("spawn placeholder");

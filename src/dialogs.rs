@@ -357,6 +357,7 @@ impl PtApp {
                     resume_session: None,
                     title: Some(title),
                     worktree: None,
+                    launch_profile: None,
                 },
             )
         };

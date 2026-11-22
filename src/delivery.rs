@@ -407,6 +407,7 @@ mod tests {
             cwd: PathBuf::from("D:\\pterminal-test-missing-dir-does-not-exist"),
             worktree: None,
             session_id: Some("sess-x".to_string()),
+            launch_profile: None,
         };
         let placeholder =
             term::spawn_dead_tab(&ctx, &saved, &repo, "saved directory missing".to_string())

@@ -119,6 +119,7 @@ fn new_orchestrator_workspace() -> state::Workspace {
             cwd: orch_dir,
             worktree: None,
             session_id: None,
+            launch_profile: None,
         }],
         active_tab: 0,
         msg_offset: 0,

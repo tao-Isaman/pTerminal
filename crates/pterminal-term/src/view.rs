@@ -2561,6 +2561,7 @@ mod shift_enter_event_path_tests {
                 args: vec![],
                 working_directory: Some(dir),
                 scrolling_history: 200,
+                env: vec![],
             },
             Arc::new(AtomicBool::new(true)),
         )
@@ -2637,6 +2638,7 @@ mod thai_composer_probe {
                 args: vec!["/c".to_string(), "claude".to_string()],
                 working_directory: Some(dir),
                 scrolling_history: 200,
+                env: vec![],
             },
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         )

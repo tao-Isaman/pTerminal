@@ -63,6 +63,22 @@ impl TabTerm {
         args: &[String],
         cwd: &Path,
     ) -> anyhow::Result<TabTerm> {
+        Self::spawn_with_env(ctx, id, program, args, cwd, &[])
+    }
+
+    /// Like [`TabTerm::spawn`] but sets `env` on the child ON TOP of the
+    /// inherited environment (nothing is cleared) — the launch-profile path,
+    /// so a bot tab's `DISCORD_STATE_DIR` reaches the child and it uses its
+    /// own Discord bot/state rather than the shared default. [`TabTerm::spawn`]
+    /// is exactly this with no extra env.
+    pub fn spawn_with_env(
+        ctx: &egui::Context,
+        id: u64,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+    ) -> anyhow::Result<TabTerm> {
         let (pty_tx, pty_rx) = mpsc::channel();
         let visible = Arc::new(AtomicBool::new(true));
         let backend = TerminalBackend::new(
@@ -74,6 +90,7 @@ impl TabTerm {
                 args: args.to_vec(),
                 working_directory: Some(cwd.to_path_buf()),
                 scrolling_history: SCROLLBACK_LINES,
+                env: env.to_vec(),
             },
             visible.clone(),
         )?;
@@ -397,6 +414,37 @@ mod tests {
         panic!("egui context never settled");
     }
 
+    /// A launch profile's `env` reaches the child end to end: a shell started
+    /// via [`TabTerm::spawn_with_env`] sees `DISCORD_STATE_DIR` and writes it
+    /// out. This is the headless proof behind the whole feature — a bot tab
+    /// gets its OWN Discord state dir, not the inherited default.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_with_env_passes_vars_to_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("envdump");
+        let want = "/home/x/.claude/channels/discord-zero";
+        let ctx = egui::Context::default();
+        let script = format!("printf '%s' \"$DISCORD_STATE_DIR\" > '{}'; exit 0", out.display());
+        let mut term = TabTerm::spawn_with_env(
+            &ctx,
+            90_801,
+            "/bin/sh",
+            &["-c".to_string(), script],
+            dir.path(),
+            &[("DISCORD_STATE_DIR".to_string(), want.to_string())],
+        )
+        .unwrap();
+        assert!(
+            wait_for(|| {
+                term.poll();
+                term.exited().is_some()
+            }),
+            "child never exited"
+        );
+        assert_eq!(std::fs::read_to_string(&out).unwrap_or_default(), want);
+    }
+
     /// The PTY pipeline must not depend on rendering: `ui()` is never called
     /// here, only `poll()`, and the child's exit code still arrives.
     #[test]
@@ -548,6 +596,7 @@ mod tests {
                 context: &context,
                 hook_helper: Some(&helper),
                 cwd,
+                launch_profile: None,
             })
             .unwrap();
         eprintln!("launch: {} {:?}", launch.program, launch.args);
