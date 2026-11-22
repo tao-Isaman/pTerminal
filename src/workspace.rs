@@ -315,7 +315,7 @@ mod tests {
         let mut app = bare_app(base.path().to_path_buf(), vec![ws0, ws1, ws2], 2);
         app.selected_child = Some((1, 0));
         app.pending_claim = Some(PendingClaim { ws_index: 2, tab_id: 1, before: HashSet::new() });
-        app.new_tab = Some(NewTabDraft { provider: crate::provider::AgentProvider::Claude, ws_index: 2, prompt: String::new(), isolate: false, shell: false });
+        app.new_tab = Some(NewTabDraft { provider: crate::provider::AgentProvider::Claude, ws_index: 2, prompt: String::new(), isolate: false, shell: false, cwd: String::new() });
         app.closing = Some(CloseDraft { ws_index: 2, tab_id: 1, dirty: false, confirm_discard: false });
         app.closing_ws = Some(CloseWsDraft { ws_index: 2, name: "ws2".to_string() });
         app.roster_written.insert(2, 0xDEAD_BEEF); // stale fingerprint
@@ -364,7 +364,7 @@ mod tests {
         let base = tempfile::tempdir().expect("tempdir");
         let ws0 = ws_with_name(base.path().join("ws0"), "ws0");
         let mut app = bare_app(base.path().to_path_buf(), vec![ws0], 0);
-        app.new_tab = Some(NewTabDraft { provider: crate::provider::AgentProvider::Claude, ws_index: 0, prompt: "keep-me".to_string(), isolate: false, shell: false });
+        app.new_tab = Some(NewTabDraft { provider: crate::provider::AgentProvider::Claude, ws_index: 0, prompt: "keep-me".to_string(), isolate: false, shell: false, cwd: String::new() });
 
         app.close_workspace(5);
 
@@ -387,7 +387,7 @@ mod tests {
         orch.meta.is_orchestrator = true;
         let ws0 = ws_with_name(base.path().join("real0"), "real0");
         let mut app = bare_app(base.path().to_path_buf(), vec![orch, ws0], 0);
-        app.new_tab = Some(NewTabDraft { provider: crate::provider::AgentProvider::Claude, ws_index: 0, prompt: "keep-me".to_string(), isolate: false, shell: false });
+        app.new_tab = Some(NewTabDraft { provider: crate::provider::AgentProvider::Claude, ws_index: 0, prompt: "keep-me".to_string(), isolate: false, shell: false, cwd: String::new() });
 
         app.close_workspace(0);
 

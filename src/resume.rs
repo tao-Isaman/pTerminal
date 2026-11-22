@@ -195,6 +195,7 @@ impl PtApp {
                 title: Some(title),
                 worktree: None,
                 launch_profile: None, // seeded from cwd by spawn_agent
+                cwd_override: None, // repo already equals cmd.dir here
             },
         );
 

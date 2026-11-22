@@ -240,6 +240,7 @@ mod tests {
             extra_args: vec!["--channels".into(), "plugin:discord@x".into()],
             env: vec![("DISCORD_STATE_DIR".into(), "/home/x/.claude/channels/discord-zero".into())],
             merge_settings: Some("/home/x/.claude/zero-settings.json".into()),
+            resume_only: false,
         };
         let st = AppState {
             workspaces: vec![Workspace {

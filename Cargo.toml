@@ -49,6 +49,7 @@ pterminal-term = { path = "crates/pterminal-term" }
 pterminal-core.workspace = true
 pterminal-term.workspace = true
 anyhow.workspace = true
+dirs.workspace = true
 eframe = "0.31.1"
 egui.workspace = true
 notify.workspace = true

@@ -95,14 +95,33 @@ pub struct LaunchProfile {
     /// `--settings` argument; pTerminal's `hooks` win on any key both define.
     #[serde(default)]
     pub merge_settings: Option<PathBuf>,
+    /// When `true`, the cwd seed (`state::launch_profile_for_cwd`) hands this
+    /// profile to a tab ONLY when it is a resume / session transfer (the spawn
+    /// carries a `resume_session`), never to a brand-new blank tab opened at
+    /// that directory. The guard for a profile keyed on a *shared* directory
+    /// like `/home/isaman`: the intended session (resumed by id) gets the
+    /// profile, but a stray fresh agent tab opened in the home dir does not
+    /// inherit its channels/chrome/bot. A profile already saved on a tab (in
+    /// `state::SavedTab`) is always reused on resume regardless of this flag —
+    /// it only gates the first, cwd-seeded acquisition.
+    #[serde(default)]
+    pub resume_only: bool,
 }
 
 impl LaunchProfile {
-    /// Whether this profile would change nothing about a launch — the
-    /// `Default` value. Used to store `None` rather than an empty profile on
-    /// a plain tab so `state.json` stays clean.
+    /// Whether this profile would change a launch at all — the `Default`
+    /// value (ignoring `resume_only`, a gate that does nothing on its own).
+    /// Used to store `None` rather than an empty profile on a plain tab so
+    /// `state.json` stays clean.
     pub fn is_empty(&self) -> bool {
         self.extra_args.is_empty() && self.env.is_empty() && self.merge_settings.is_none()
+    }
+
+    /// Whether the cwd seed should hand this profile to a spawn. Always true
+    /// unless [`Self::resume_only`] is set and the spawn is a fresh one
+    /// (`is_resume == false`). See `resume_only`.
+    pub fn seeds_on(&self, is_resume: bool) -> bool {
+        !self.resume_only || is_resume
     }
 }
 
@@ -631,6 +650,27 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--channels", "plugin:discord@x"]), "{args:?}");
         let plain = spec7(&context, "go", None, dir.path());
         assert!(!AgentProvider::Claude.launch_args(&plain).iter().any(|a| a == "--channels"));
+    }
+
+    /// `resume_only` gates only the fresh cwd-seed: a resume gets the profile,
+    /// a brand-new tab does not; a normal profile seeds on both.
+    #[test]
+    fn resume_only_profile_seeds_on_resume_but_not_fresh() {
+        let guarded = LaunchProfile { resume_only: true, ..Default::default() };
+        assert!(guarded.seeds_on(true), "resume must get it");
+        assert!(!guarded.seeds_on(false), "a fresh tab must not");
+        let normal = LaunchProfile::default();
+        assert!(normal.seeds_on(true) && normal.seeds_on(false));
+    }
+
+    /// `resume_only` round-trips through serde and defaults to false for an
+    /// older profile JSON that predates the field.
+    #[test]
+    fn resume_only_serde_default_false() {
+        let p: LaunchProfile = serde_json::from_str(r#"{"extra_args":["--chrome"]}"#).unwrap();
+        assert!(!p.resume_only);
+        let p2: LaunchProfile = serde_json::from_str(r#"{"resume_only":true}"#).unwrap();
+        assert!(p2.resume_only);
     }
 
     // --- A3: the abstraction ------------------------------------------------
