@@ -28,6 +28,14 @@ use pterminal_core::{
 };
 
 fn main() -> eframe::Result<()> {
+    // Shed the launching Claude session's identity BEFORE anything else (still
+    // single-threaded, nothing has read the environment yet): pTerminal is not
+    // a Claude session, and if a tab it spawns inherited CLAUDE_CODE_* /
+    // CLAUDECODE / CLAUDE_PID it would attach to the launcher's session —
+    // surfacing on its Remote Control and messaging socket instead of being an
+    // independent root session. No-op when launched from a clean environment.
+    pterminal_core::platform::scrub_inherited_session_env();
+
     let argv: Vec<String> = std::env::args().collect();
     // `pterminal remote …`: talk to another machine's pTerminal over the
     // tailnet (pterminal_core::remote). A CLI only; never starts the GUI.
